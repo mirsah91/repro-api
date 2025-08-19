@@ -60,7 +60,6 @@ export class ViewerService {
         // optional response diffs (grouped by normalized key)
         let respDiffs: any = undefined;
         if (opts?.includeRespDiffs) {
-            console.log('includeRespDiffs !!!')
             const byKey: Record<string, any[]> = {};
             for (const r of reqs) {
                 const key =
@@ -97,12 +96,9 @@ export class ViewerService {
                         });
                     }
                 }
-                console.log('diffs !!!', diffs)
 
                 if (diffs.length) groups.push({ key, calls, diffs });
             }
-
-            console.log('groups !!!', groups)
 
             if (groups.length) respDiffs = groups;
         }
