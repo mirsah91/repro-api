@@ -12,3 +12,5 @@ export class RrwebChunk {
 }
 export type RrwebChunkDocument = HydratedDocument<RrwebChunk>;
 export const RrwebChunkSchema = SchemaFactory.createForClass(RrwebChunk);
+RrwebChunkSchema.index({ sessionId: 1, seq: 1 }, { unique: true });
+

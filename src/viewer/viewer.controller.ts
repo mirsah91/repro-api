@@ -25,6 +25,7 @@ export class ViewerController {
         @Param('sid') sid: string,
         @Query('include') include?: string, // e.g., "rrweb"
     ) {
-        return this.svc.full(sid, { includeRrweb: include?.includes('rrweb') });
+        const inc = (include || '').split(',').map(s => s.trim().toLowerCase());
+        return this.svc.full(sid, { includeRrweb: inc?.includes('rrweb') });
     }
 }

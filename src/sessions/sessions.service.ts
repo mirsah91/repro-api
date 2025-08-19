@@ -27,16 +27,56 @@ export class SessionsService {
     async appendEvents(sessionId: string, body: any) {
         for (const ev of body.events ?? []) {
             if (ev.type === 'rrweb') {
-                await this.chunks.create({ sessionId, seq: body.seq ?? ev.t, tFirst: ev.t, tLast: ev.t, data: Buffer.from(ev.chunk ?? '') });
+                await this.chunks.create({
+                    sessionId,
+                    seq: body.seq ?? ev.t,
+                    tFirst: ev.t,
+                    tLast: ev.t,
+                    data: Buffer.from(ev.chunk ?? ''),
+                });
             } else if (ev.type === 'action') {
+                // Use $setOnInsert ONLY for fields that never appear in $set
+                const setOnInsert: any = {
+                    sessionId,
+                    actionId: ev.aid,
+                    tStart: ev.tStart ?? Date.now(),
+                    ui: ev.ui ?? {},
+                    // no label/hasReq/hasDb/error/tEnd here → avoid conflicts
+                };
+
+                // Put mutable/flag fields in $set (conditionally)
+                const set: any = {};
+                if (ev.label != null) set.label = ev.label;          // update label only when provided
+                if (ev.tEnd != null)  set.tEnd  = ev.tEnd;           // close/extend window
+                if (ev.hasReq)        set.hasReq = true;             // set true once
+                if (ev.hasDb)         set.hasDb  = true;
+                if (ev.error)         set.error  = true;
+
                 await this.actions.updateOne(
                     { sessionId, actionId: ev.aid },
-                    { $set: { sessionId, actionId: ev.aid, label: ev.label ?? ev.kind, tStart: ev.tStart, tEnd: ev.tEnd,
-                            hasReq: !!ev.hasReq, hasDb: !!ev.hasDb, error: !!ev.error, ui: ev.ui ?? {} } },
+                    { $setOnInsert: setOnInsert, ...(Object.keys(set).length ? { $set: set } : {}) },
                     { upsert: true }
                 );
             } else if (ev.type === 'net') {
-                await this.requests.create({ sessionId, actionId: ev.aid, rid: ev.rid, method: ev.method, url: ev.url, status: ev.status, durMs: ev.durMs, t: ev.t, headers: ev.headers ?? {} });
+                await this.requests.updateOne(
+                    { sessionId, rid: ev.rid },
+                    {
+                        $set: {
+                            sessionId,
+                            actionId: ev.aid ?? null,
+                            rid: ev.rid,
+                            method: ev.method,
+                            url: ev.url,
+                            status: ev.status,
+                            durMs: ev.durMs,
+                            t: ev.t,
+                            headers: ev.headers ?? {},
+                            key: ev.key ?? null,
+                            respBody: ev.respBody ?? undefined, // may be undefined if not JSON
+                        },
+                    },
+                    { upsert: true }
+                );
             }
         }
         return { ok: true };

@@ -16,4 +16,4 @@ export class Action {
 export type ActionDocument = HydratedDocument<Action>;
 export const ActionSchema = SchemaFactory.createForClass(Action);
 
-ActionSchema.index({ sessionId: 1, actionId: 1 }, { unique: true });
+ActionSchema.index({ sessionId: 1, actionId: 1 },  { unique: true, name: 'uniq_session_action' });
