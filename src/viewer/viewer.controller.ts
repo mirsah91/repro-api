@@ -23,9 +23,16 @@ export class ViewerController {
     @Get('sessions/:sid/full')
     full(
         @Param('sid') sid: string,
-        @Query('include') include?: string, // e.g., "rrweb"
+        @Query('include') include?: string, // e.g., "rrweb,respdiffs"
     ) {
-        const inc = (include || '').split(',').map(s => s.trim().toLowerCase());
-        return this.svc.full(sid, { includeRrweb: inc?.includes('rrweb') });
+        const inc = (include || '')
+            .split(',')
+            .map(s => s.trim().toLowerCase())
+            .filter(Boolean);
+
+        return this.svc.full(sid, {
+            includeRrweb: inc.includes('rrweb'),
+            includeRespDiffs: inc.includes('respdiffs') || inc.includes('resp-diffs') || inc.includes('responses'),
+        });
     }
 }

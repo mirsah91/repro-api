@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
+import { HydratedDocument, SchemaTypes } from 'mongoose';
 
 @Schema({ collection: 'requests' })
 export class RequestEvt {
@@ -12,6 +12,12 @@ export class RequestEvt {
     @Prop() durMs: number;
     @Prop() t: number;
     @Prop({ type: Object }) headers?: Record<string, any>;
+    @Prop() key?: string;                          // normalized endpoint key
+    @Prop({ type: SchemaTypes.Mixed }) respBody?: any; // captured JSON response (truncated if needed)
 }
+
 export type RequestEvtDocument = HydratedDocument<RequestEvt>;
 export const RequestEvtSchema = SchemaFactory.createForClass(RequestEvt);
+
+RequestEvtSchema.index({ sessionId: 1, t: 1 });
+RequestEvtSchema.index({ sessionId: 1, key: 1, t: 1 });

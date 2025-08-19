@@ -84,11 +84,21 @@ export class SessionsService {
 
     async ingestBackend(sessionId: string, body: any) {
         for (const e of body.entries ?? []) {
-            if (e.request) {
+            const req = e.request;
+            if (req) {
+
                 await this.requests.create({
-                    sessionId, actionId: e.actionId, rid: e.request.rid,
-                    method: e.request.method, url: e.request.path || e.request.url,
-                    status: e.request.status, durMs: e.request.durMs, t: e.t, headers: e.request.headers ?? {},
+                    sessionId,
+                    actionId: e.actionId,
+                    rid: req.rid,
+                    method: req.method,
+                    url: req.url || req.path,      // preserve original
+                    status: req.status,
+                    durMs: req.durMs,
+                    t: e.t,
+                    headers: req.headers ?? {},
+                    key: req.key,                  // <-- new
+                    respBody: req.respBody,        // <-- new
                 });
             }
             for (const d of e.db ?? []) {
