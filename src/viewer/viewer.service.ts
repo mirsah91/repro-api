@@ -6,6 +6,7 @@ import { Action } from '../sessions/schemas/action.schema';
 import { RequestEvt } from '../sessions/schemas/request.schema';
 import { DbChange } from '../sessions/schemas/db-change.schema';
 import {RrwebChunk} from "../sessions/schemas/rrweb-chunk.schema";
+import {FullResponseDto} from "./viewer.dto";
 
 @Injectable()
 export class ViewerService {
@@ -16,103 +17,6 @@ export class ViewerService {
         @InjectModel(DbChange.name) private changes: Model<DbChange>,
         @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
     ) {}
-
-    async full(
-        sessionId: string,
-        opts?: { includeRrweb?: boolean; includeRespDiffs?: boolean }
-    ) {
-        const s = await this.sessions.findById(sessionId).lean();
-
-        const [acts, reqs, dbs] = await Promise.all([
-            this.actions.find({ sessionId }).sort({ tStart: 1 }).lean(),
-            this.requests.find({ sessionId }).sort({ t: 1 }).lean(), // sorted -> groups keep order
-            this.changes.find({ sessionId }).sort({ t: 1 }).lean(),
-        ]);
-
-        // group by actionId
-        const reqBy: Record<string, any[]> = {};
-        const dbBy: Record<string, any[]> = {};
-        for (const r of reqs) (reqBy[r.actionId] ||= []).push(r);
-        for (const d of dbs) (dbBy[d.actionId] ||= []).push(d);
-
-        const actions = acts.map(a => ({
-            actionId: a.actionId,
-            label: a.label,
-            tStart: a.tStart,
-            tEnd: a.tEnd,
-            hasReq: a.hasReq,
-            hasDb: a.hasDb,
-            error: a.error,
-            ui: a.ui ?? {},
-            requests: reqBy[a.actionId] || [],
-            db: dbBy[a.actionId] || [],
-        }));
-
-        // optional rrweb meta
-        let rrweb: any = undefined;
-        if (opts?.includeRrweb) {
-            const [first] = await this.chunks.find({ sessionId }).sort({ seq: 1 }).limit(1).lean();
-            const [last]  = await this.chunks.find({ sessionId }).sort({ seq: -1 }).limit(1).lean();
-            const count   = await this.chunks.countDocuments({ sessionId });
-            rrweb = { chunks: count, firstSeq: first?.seq ?? null, lastSeq: last?.seq ?? null };
-        }
-
-        // optional response diffs (grouped by normalized key)
-        let respDiffs: any = undefined;
-        if (opts?.includeRespDiffs) {
-            const byKey: Record<string, any[]> = {};
-            for (const r of reqs) {
-                const key =
-                    r.key ||
-                    `${String(r.method || 'GET').toUpperCase()} ${String(r.url || '/').split('?')[0]}`;
-                (byKey[key] ||= []).push(r);
-            }
-
-            const groups: any[] = [];
-            for (const [key, arr] of Object.entries(byKey)) {
-                const arrWithBodies = arr.filter(r => typeof (r as any).respBody !== 'undefined');
-                if (arrWithBodies.length < 2) continue;
-
-                const calls = arrWithBodies.map(r => ({
-                    rid: r.rid,
-                    t: r.t,
-                    status: r.status,
-                    durMs: r.durMs,
-                }));
-
-                const diffs: any[] = [];
-                for (let i = 1; i < arrWithBodies.length; i++) {
-                    const prev = arrWithBodies[i - 1] as any;
-                    const curr = arrWithBodies[i] as any;
-                    const d = this.jsonDiff(prev.respBody, curr.respBody);
-                    if (d.hasChanges) {
-                        diffs.push({
-                            fromRid: prev.rid,
-                            toRid: curr.rid,
-                            tFrom: prev.t,
-                            tTo: curr.t,
-                            summary: { added: d.addedCount, removed: d.removedCount, changed: d.changedCount },
-                            changes: d.changes, // [{ path, type, from?, to? }]
-                        });
-                    }
-                }
-
-                if (diffs.length) groups.push({ key, calls, diffs });
-            }
-
-            if (groups.length) respDiffs = groups;
-        }
-
-        return {
-            sessionId,
-            appId: s?.appId,
-            startedAt: s?.startedAt,
-            finishedAt: s?.finishedAt,
-            rrweb,     // only when include=rrweb
-            actions,   // unchanged
-            respDiffs, // only when include=respdiffs
-        };
-    }
 
     /** ---- tiny JSON diff helper (MVP) ---- */
     private isObjectLike(v: any) {
@@ -225,5 +129,102 @@ export class ViewerService {
         const reqs = await this.requests.find({ sessionId, actionId }).sort({ t: 1 }).lean();
         const db = await this.changes.find({ sessionId, actionId }).sort({ t: 1 }).lean();
         return { ui: a?.ui ?? {}, requests: reqs, db };
+    }
+
+    async full(
+        sessionId: string,
+        opts?: { includeRrweb?: boolean; includeRespDiffs?: boolean }
+    ): Promise<FullResponseDto> {
+        const s = await this.sessions.findById(sessionId).lean();
+
+        const [acts, reqs, dbs] = await Promise.all([
+            this.actions.find({ sessionId }).sort({ tStart: 1 }).lean(),
+            this.requests.find({ sessionId }).sort({ t: 1 }).lean(), // sorted -> groups keep order
+            this.changes.find({ sessionId }).sort({ t: 1 }).lean(),
+        ]);
+
+        // group by actionId
+        const reqBy: Record<string, any[]> = {};
+        const dbBy: Record<string, any[]> = {};
+        for (const r of reqs) (reqBy[r.actionId] ||= []).push(r);
+        for (const d of dbs) (dbBy[d.actionId] ||= []).push(d);
+
+        const actions = acts.map(a => ({
+            actionId: a.actionId ?? null,
+            label: a.label ?? null,
+            tStart: a.tStart ?? null,
+            tEnd: a.tEnd ?? null,
+            hasReq: a.hasReq ?? null,
+            hasDb: a.hasDb ?? null,
+            error: a.error ?? null,
+            ui: a.ui ?? {},
+            requests: reqBy[a.actionId] || [],
+            db: dbBy[a.actionId] || [],
+        }));
+
+        // optional rrweb meta
+        let rrweb: any = undefined;
+        if (opts?.includeRrweb) {
+            const [first] = await this.chunks.find({ sessionId }).sort({ seq: 1 }).limit(1).lean();
+            const [last]  = await this.chunks.find({ sessionId }).sort({ seq: -1 }).limit(1).lean();
+            const count   = await this.chunks.countDocuments({ sessionId });
+            rrweb = { chunks: count, firstSeq: first?.seq ?? null, lastSeq: last?.seq ?? null };
+        }
+
+        // optional response diffs (grouped by normalized key)
+        let respDiffs: any = undefined;
+        if (opts?.includeRespDiffs) {
+            const byKey: Record<string, any[]> = {};
+            for (const r of reqs) {
+                const key =
+                    r.key ||
+                    `${String(r.method || 'GET').toUpperCase()} ${String(r.url || '/').split('?')[0]}`;
+                (byKey[key] ||= []).push(r);
+            }
+
+            const groups: any[] = [];
+            for (const [key, arr] of Object.entries(byKey)) {
+                const arrWithBodies = arr.filter(r => typeof (r as any).respBody !== 'undefined');
+                if (arrWithBodies.length < 2) continue;
+
+                const calls = arrWithBodies.map(r => ({
+                    rid: r.rid,
+                    t: r.t,
+                    status: r.status,
+                    durMs: r.durMs,
+                }));
+
+                const diffs: any[] = [];
+                for (let i = 1; i < arrWithBodies.length; i++) {
+                    const prev = arrWithBodies[i - 1] as any;
+                    const curr = arrWithBodies[i] as any;
+                    const d = this.jsonDiff(prev.respBody, curr.respBody);
+                    if (d.hasChanges) {
+                        diffs.push({
+                            fromRid: prev.rid,
+                            toRid: curr.rid,
+                            tFrom: prev.t,
+                            tTo: curr.t,
+                            summary: { added: d.addedCount, removed: d.removedCount, changed: d.changedCount },
+                            changes: d.changes, // [{ path, type, from?, to? }]
+                        });
+                    }
+                }
+
+                if (diffs.length) groups.push({ key, calls, diffs });
+            }
+
+            if (groups.length) respDiffs = groups;
+        }
+
+        return {
+            sessionId,
+            appId: s?.appId,
+            startedAt: s?.startedAt,
+            finishedAt: s?.finishedAt,
+            rrweb,     // only when include=rrweb
+            actions,   // unchanged
+            respDiffs, // only when include=respdiffs
+        };
     }
 }

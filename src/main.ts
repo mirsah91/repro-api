@@ -12,9 +12,11 @@ async function bootstrap() {
       .addApiKey({ type: 'apiKey', name: 'x-app-id', in: 'header' }, 'appId')
       .addApiKey({ type: 'apiKey', name: 'x-app-secret', in: 'header' }, 'appSecret')
       .build();
+
   const doc = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup('docs', app, doc, { swaggerOptions: { persistAuthorization: true } });
 
   await app.listen(process.env.PORT || 4000);
 }
+
 bootstrap();

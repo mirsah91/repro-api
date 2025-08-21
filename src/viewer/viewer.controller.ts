@@ -1,5 +1,5 @@
 import { ApiOkResponse, ApiParam, ApiTags } from '@nestjs/swagger';
-import { ActionDetailsRespDto, SummaryRespDto } from '../docs/dto/viewer.dto';
+import { ActionDetailsRespDto, SummaryRespDto, FullResponseDto } from '../docs/dto/viewer.dto';
 import {Controller, Get, Param, Query} from "@nestjs/common";
 import {ViewerService} from "./viewer.service";
 
@@ -21,10 +21,11 @@ export class ViewerController {
 
 
     @Get('sessions/:sid/full')
+    @ApiOkResponse({ type: FullResponseDto })
     full(
         @Param('sid') sid: string,
         @Query('include') include?: string, // e.g., "rrweb,respdiffs"
-    ) {
+    ): Promise<FullResponseDto> {
         const inc = (include || '')
             .split(',')
             .map(s => s.trim().toLowerCase())

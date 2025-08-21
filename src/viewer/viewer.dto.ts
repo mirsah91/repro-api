@@ -1,7 +1,7 @@
-
-import { ApiExtraModels, ApiProperty } from '@nestjs/swagger';
+// api/src/viewer/dto/viewer.dto.ts
+import { ApiExtraModels, ApiProperty, getSchemaPath } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsArray, IsBoolean, IsEnum, IsNumber, IsObject, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsDate, IsEnum, IsNumber, IsObject, IsOptional, IsString, ValidateNested } from 'class-validator';
 
 export class UiInfoDto {
     @ApiProperty({ required: false, example: 'click' })
@@ -16,26 +16,26 @@ export class UiInfoDto {
 
 export class ActionBaseDto {
     @ApiProperty() @IsString()
-    actionId!: string | null;
+    actionId: string | null;
 
     @ApiProperty()
     @IsString()
-    label!: string | null;
+    label: string | null;
 
     @ApiProperty({ description: 'ms since epoch' }) @IsNumber()
-    tStart!: number | null;
+    tStart: number | null;
 
     @ApiProperty({ description: 'ms since epoch' }) @IsNumber()
-    tEnd!: number | null;
+    tEnd: number | null;
 
     @ApiProperty() @IsBoolean()
-    hasReq!: boolean | null;
+    hasReq: boolean | null;
 
     @ApiProperty() @IsBoolean()
-    hasDb!: boolean | null;
+    hasDb: boolean | null;
 
     @ApiProperty() @IsBoolean()
-    error!: boolean | null;
+    error: boolean | null;
 
     @ApiProperty({ type: UiInfoDto, required: false })
     @IsOptional() @ValidateNested() @Type(() => UiInfoDto)
@@ -293,29 +293,3 @@ export class FullQueryDto {
     @IsOptional() @IsString()
     include?: string;
 }
-
-
-export class ActionDto {
-    @ApiProperty({ example: 'S_...' }) sessionId!: string;
-    @ApiProperty({ example: 'A1' }) actionId!: string;
-    @ApiProperty({ example: 'Click • Apply' }) label?: string;
-    @ApiProperty({ example: 1710000000200 }) tStart?: number;
-    @ApiProperty({ example: 1710000000300 }) tEnd?: number;
-    @ApiProperty({ example: true }) hasReq!: boolean;
-    @ApiProperty({ example: true }) hasDb!: boolean;
-    @ApiProperty({ example: false }) error!: boolean;
-    @ApiProperty({ example: { kind: 'click', target: '#btn' } }) ui?: Record<string, any>;
-}
-export class SummaryRespDto {
-    @ApiProperty({ example: 'S_...' }) sessionId!: string;
-    @ApiProperty({ example: 'APP_...' }) appId?: string;
-    @ApiProperty({ type: [ActionDto] }) actions!: ActionDto[];
-    @ApiProperty({ example: {} }) env!: Record<string, any>;
-}
-
-export class ActionDetailsRespDto {
-    @ApiProperty({ example: { kind: 'click', target: '#btn' } }) ui!: Record<string, any>;
-    @ApiProperty({ type: [RequestEvtDto] }) requests!: RequestEvtDto[];
-    @ApiProperty({ type: [DbChangeDto] }) db!: DbChangeDto[];
-}
-
