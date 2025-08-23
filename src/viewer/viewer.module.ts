@@ -7,6 +7,7 @@ import { Action, ActionSchema } from '../sessions/schemas/action.schema';
 import { RequestEvt, RequestEvtSchema } from '../sessions/schemas/request.schema';
 import { DbChange, DbChangeSchema } from '../sessions/schemas/db-change.schema';
 import {RrwebChunk} from "../sessions/schemas/rrweb-chunk.schema";
+import {EmailEvt, EmailEvtSchema} from "../sessions/schemas/emails.schema";
 
 @Module({
     imports: [
@@ -16,7 +17,7 @@ import {RrwebChunk} from "../sessions/schemas/rrweb-chunk.schema";
             { name: RequestEvt.name, schema: RequestEvtSchema },
             { name: DbChange.name, schema: DbChangeSchema },
             { name: RrwebChunk.name, schema: RrwebChunk },
-
+            { name: EmailEvt.name, schema: EmailEvtSchema }
         ]),
     ],
     controllers: [ViewerController],

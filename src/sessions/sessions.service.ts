@@ -7,6 +7,7 @@ import { Action } from './schemas/action.schema';
 import { RequestEvt } from './schemas/request.schema';
 import { DbChange } from './schemas/db-change.schema';
 import { RrwebChunk } from './schemas/rrweb-chunk.schema';
+import {EmailEvt} from "./schemas/emails.schema";
 
 @Injectable()
 export class SessionsService {
@@ -16,6 +17,7 @@ export class SessionsService {
         @InjectModel(RequestEvt.name) private requests: Model<RequestEvt>,
         @InjectModel(DbChange.name) private changes: Model<DbChange>,
         @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
+        @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     ) {}
 
     async startSession(appId: string, clientTime?: number) {
@@ -83,29 +85,81 @@ export class SessionsService {
     }
 
     async ingestBackend(sessionId: string, body: any) {
-        for (const e of body.entries ?? []) {
-            const req = e.request;
-            if (req) {
+        const entries = body?.entries ?? [];
+        for (const e of entries) {
+            try {
+                // ---- REQUEST ----
+                const req = e.request;
+                if (req) {
+                    await this.requests.updateOne(
+                        { sessionId, rid: req.rid },
+                        {
+                            $set: {
+                                sessionId,
+                                actionId: e.actionId ?? null,
+                                rid: String(req.rid),
+                                method: req.method,
+                                url: req.url || req.path,           // keep original
+                                status: req.status,
+                                durMs: req.durMs,
+                                t: e.t,
+                                headers: req.headers ?? {},
+                                key: req.key ?? null,
+                                respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
+                            }
+                        },
+                        { upsert: true }
+                    );
+                }
 
-                await this.requests.create({
-                    sessionId,
-                    actionId: e.actionId,
-                    rid: req.rid,
-                    method: req.method,
-                    url: req.url || req.path,      // preserve original
-                    status: req.status,
-                    durMs: req.durMs,
-                    t: e.t,
-                    headers: req.headers ?? {},
-                    key: req.key,                  // <-- new
-                    respBody: req.respBody,        // <-- new
-                });
-            }
-            for (const d of e.db ?? []) {
-                await this.changes.create({
-                    sessionId, actionId: e.actionId, collection: d.collection, pk: d.pk,
-                    before: d.before ?? null, after: d.after ?? null, op: d.op ?? 'update', t: e.t,
-                });
+                // ---- EMAIL ----
+                const mail = e.email;
+                if (mail) {
+                    const norm = (v: any) => {
+                        if (!v) return [];
+                        return Array.isArray(v) ? v : [v];
+                    };
+
+                    await this.emails.create({
+                        sessionId,
+                        actionId: e.actionId ?? null,
+                        provider: mail.provider || 'sendgrid',
+                        kind: mail.kind || 'send',
+                        from: mail.from ?? null,
+                        to: norm(mail.to),
+                        cc: norm(mail.cc),
+                        bcc: norm(mail.bcc),
+                        subject: mail.subject ?? '',
+                        text: mail.text ?? null,
+                        html: mail.html ?? null,
+                        templateId: mail.templateId ?? null,
+                        dynamicTemplateData: mail.dynamicTemplateData ?? null,
+                        categories: Array.isArray(mail.categories) ? mail.categories : [],
+                        customArgs: mail.customArgs ?? null,
+                        attachmentsMeta: Array.isArray(mail.attachmentsMeta) ? mail.attachmentsMeta : [],
+                        statusCode: typeof mail.statusCode === 'number' ? mail.statusCode : null,
+                        durMs: typeof mail.durMs === 'number' ? mail.durMs : null,
+                        headers: mail.headers ?? {},
+                        t: e.t,
+                    });
+                }
+
+                // ---- DB CHANGES ----
+                for (const d of e.db ?? []) {
+                    await this.changes.create({
+                        sessionId,
+                        actionId: e.actionId ?? null,
+                        collection: d.collection,
+                        pk: d.pk,
+                        before: d.before ?? null,
+                        after: d.after ?? null,
+                        op: d.op ?? 'update',
+                        t: e.t,
+                    });
+                }
+            } catch (err) {
+                // isolate failures to a single entry
+                // optionally log to your logger here
             }
         }
         return { ok: true };

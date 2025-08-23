@@ -9,6 +9,7 @@ import { DbChange, DbChangeSchema } from './schemas/db-change.schema';
 import { RrwebChunk, RrwebChunkSchema } from './schemas/rrweb-chunk.schema';
 import { SdkToken, SdkTokenSchema } from '../sdk/schemas/sdk-token.schema';
 import { App, AppSchema } from '../apps/schemas/app.schema';
+import {EmailEvt, EmailEvtSchema} from "./schemas/emails.schema";
 
 @Module({
     imports: [
@@ -20,6 +21,7 @@ import { App, AppSchema } from '../apps/schemas/app.schema';
             { name: RrwebChunk.name, schema: RrwebChunkSchema },
             { name: SdkToken.name, schema: SdkTokenSchema },
             { name: App.name, schema: AppSchema },
+            { name: EmailEvt.name, schema: EmailEvtSchema }
         ]),
     ],
     controllers: [SessionsController],
