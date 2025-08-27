@@ -7,6 +7,7 @@ import { RequestEvt } from '../sessions/schemas/request.schema';
 import { DbChange } from '../sessions/schemas/db-change.schema';
 import {RrwebChunk} from "../sessions/schemas/rrweb-chunk.schema";
 import {FullResponseDto} from "./viewer.dto";
+import {EmailEvt} from "../sessions/schemas/emails.schema";
 
 @Injectable()
 export class ViewerService {
@@ -16,6 +17,7 @@ export class ViewerService {
         @InjectModel(RequestEvt.name) private requests: Model<RequestEvt>,
         @InjectModel(DbChange.name) private changes: Model<DbChange>,
         @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
+        @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     ) {}
 
     /** ---- tiny JSON diff helper (MVP) ---- */
@@ -137,11 +139,16 @@ export class ViewerService {
     ): Promise<FullResponseDto> {
         const s = await this.sessions.findById(sessionId).lean();
 
-        const [acts, reqs, dbs] = await Promise.all([
+        const [acts, reqs, dbs, mails] = await Promise.all([
             this.actions.find({ sessionId }).sort({ tStart: 1 }).lean(),
-            this.requests.find({ sessionId }).sort({ t: 1 }).lean(), // sorted -> groups keep order
+            this.requests.find({ sessionId }).sort({ t: 1 }).lean(),
             this.changes.find({ sessionId }).sort({ t: 1 }).lean(),
+            this.emails.find({ sessionId }).sort({ t: 1 }).lean(),   // <-- new
         ]);
+
+        const mailBy: Record<string, any[]> = {};
+        for (const m of mails) (mailBy[m.actionId || ''] ||= []).push(m);
+
 
         // group by actionId
         const reqBy: Record<string, any[]> = {};
@@ -160,7 +167,9 @@ export class ViewerService {
             ui: a.ui ?? {},
             requests: reqBy[a.actionId] || [],
             db: dbBy[a.actionId] || [],
+            emails: mailBy[a.actionId] || [],     // <-- add to payload
         }));
+
 
         // optional rrweb meta
         let rrweb: any = undefined;
