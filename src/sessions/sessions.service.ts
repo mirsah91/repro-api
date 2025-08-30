@@ -155,6 +155,11 @@ export class SessionsService {
                         after: d.after ?? null,
                         op: d.op ?? 'update',
                         t: e.t,
+                        // NEW: persist query capture
+                        query: d.query ?? undefined,
+                        resultMeta: d.resultMeta ?? undefined,
+                        durMs: d.durMs ?? undefined,
+                        error: d.error ?? undefined,
                     });
                 }
             } catch (err) {
