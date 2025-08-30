@@ -156,19 +156,30 @@ export class ViewerService {
         for (const r of reqs) (reqBy[r.actionId] ||= []).push(r);
         for (const d of dbs) (dbBy[d.actionId] ||= []).push(d);
 
-        const actions = acts.map(a => ({
-            actionId: a.actionId ?? null,
-            label: a.label ?? null,
-            tStart: a.tStart ?? null,
-            tEnd: a.tEnd ?? null,
-            hasReq: a.hasReq ?? null,
-            hasDb: a.hasDb ?? null,
-            error: a.error ?? null,
-            ui: a.ui ?? {},
-            requests: reqBy[a.actionId] || [],
-            db: dbBy[a.actionId] || [],
-            emails: mailBy[a.actionId] || [],     // <-- add to payload
-        }));
+        const actions = acts.map(a => {
+
+            const sanitizedEmails = (mailBy[a.actionId] || []).map(e => {
+                return {
+                    ...e,
+                    // in the Viewer client use atob to decode the html.
+                    html: Buffer.from(this.sanitizeEmailHtml(e?.html) || '', 'utf8').toString('base64')
+                }
+            })
+
+            return {
+                actionId: a.actionId ?? null,
+                label: a.label ?? null,
+                tStart: a.tStart ?? null,
+                tEnd: a.tEnd ?? null,
+                hasReq: a.hasReq ?? null,
+                hasDb: a.hasDb ?? null,
+                error: a.error ?? null,
+                ui: a.ui ?? {},
+                requests: reqBy[a.actionId] || [],
+                db: dbBy[a.actionId] || [],
+                emails: sanitizedEmails || [],     // <-- add to payload
+            }
+        });
 
 
         // optional rrweb meta
@@ -235,5 +246,28 @@ export class ViewerService {
             actions,   // unchanged
             respDiffs, // only when include=respdiffs
         };
+    }
+
+    private sanitizeEmailHtml(raw: string): string {
+        if (!raw) return raw;
+
+        let s = raw.replace(/^\uFEFF/, '');          // drop BOM if present
+
+        // 1) Remove one or more leading comment blocks before the doctype
+        s = s.replace(/^(?:\s*<!--[\s\S]*?-->\s*)+/m, '');
+
+        // 2) Ensure we start with a doctype
+        if (!/^<!DOCTYPE\s+/i.test(s)) {
+            s = '<!DOCTYPE html>\n' + s;
+        }
+
+        // (Optional) If you still need to be extra strict for XML tools,
+        // you could also remove conditional comments or normalize bad comment sequences.
+        // But usually removing the top comment is enough.
+
+        return s
+            .replace(/[\n\r\t]/gm, "")
+            .replace(/<\!--.*?-->/g, "")
+            .replace(/\\"/g, '"');
     }
 }
