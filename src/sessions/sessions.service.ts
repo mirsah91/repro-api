@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import {Injectable, NotFoundException} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { randomUUID } from 'crypto';
 import { Model } from 'mongoose';
@@ -200,5 +200,92 @@ export class SessionsService {
     async finishSession(sessionId: string, notes?: string) {
         await this.sessions.updateOne({ _id: sessionId }, { $set: { finishedAt: new Date(), notes: notes ?? '' } });
         return { viewerUrl: `${process.env.APP_URL ?? 'https://repro.app'}/s/${sessionId}` };
+    }
+
+    async getRrwebChunksPaged(sessionId: string, afterSeq: number, limit: number) {
+        return this.chunks
+            .find({ sessionId, seq: { $gt: afterSeq } })
+            .sort({ seq: 1 })
+            .limit(limit)
+            .lean()
+            .exec();
+    }
+
+    async getTimeline(sessionId: string) {
+        const [actions, requests, db, emails] = await Promise.all([
+            this.actions.find({ sessionId }).lean().exec(),
+            this.requests.find({ sessionId }).lean().exec(),
+            this.changes.find({ sessionId }).lean().exec(),
+            this.emails.find({ sessionId }).lean().exec(),
+        ]);
+
+        // Flatten everything into “ticks” with a common `t` (ms, server time)
+        const ticks: any[] = [];
+
+        for (const a of actions) {
+            ticks.push({
+                kind: 'action',
+                actionId: a.actionId,
+                label: a.label,
+                tStart: a.tStart,
+                tEnd: a.tEnd ?? a.tStart,
+            });
+        }
+        for (const r of requests) {
+            ticks.push({
+                kind: 'request',
+                actionId: r.actionId ?? null,
+                t: r.t,
+                meta: {
+                    key: r.key,
+                    method: r.method,
+                    url: r.url,
+                    status: r.status,
+                    durMs: r.durMs,
+                },
+            });
+        }
+        for (const d of db) {
+            ticks.push({
+                kind: 'db',
+                actionId: d.actionId ?? null,
+                t: d.t,
+                meta: {
+                    collection: d.collection,
+                    op: d.op,
+                    query: d.query,
+                    resultMeta: d.resultMeta,
+                    durMs: d.durMs,
+                },
+            });
+        }
+        for (const m of emails) {
+            ticks.push({
+                kind: 'email',
+                actionId: m.actionId ?? null,
+                t: m.t,
+                meta: {
+                    subject: m.subject,
+                    to: m.to,
+                    statusCode: m.statusCode,
+                    durMs: m.durMs,
+                },
+            });
+        }
+
+        ticks.sort((a, b) => (a.t ?? a.tStart) - (b.t ?? b.tStart));
+        return { sessionId, ticks };
+    }
+
+    async getChunk(sessionId: string, seqStr: string, ) {
+        const seq = Number(seqStr);
+        if (!Number.isFinite(seq)) throw new NotFoundException('bad seq');
+
+        const doc = await this.chunks.findOne({ sessionId, seq }).lean();
+        if (!doc) throw new NotFoundException('chunk not found');
+
+        // data is a Buffer; return base64 for the frontend to decode
+        const base64 = (doc as any).data?.toString('base64') || '';
+        return { base64, tFirst: doc.tFirst, tLast: doc.tLast, seq: doc.seq };
     }
 }
