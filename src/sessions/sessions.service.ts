@@ -22,11 +22,34 @@ export class SessionsService {
 
     async startSession(appId: string, clientTime?: number) {
         const sessionId = 'S_' + randomUUID();
-        await this.sessions.create({ _id: sessionId, appId, startedAt: new Date(clientTime ?? Date.now()) });
-        return { sessionId, clockOffsetMs: 0 };
+        const serverNow = Date.now();
+        const client = typeof clientTime === 'number' ? clientTime : serverNow;
+        const clockOffsetMs = serverNow - client; // client adds this to align
+
+        // was: new Date(client)
+        await this.sessions.create({ _id: sessionId, appId, startedAt: new Date(serverNow) });
+
+        return { sessionId, clockOffsetMs };
     }
 
     async appendEvents(sessionId: string, body: any) {
+        if (body?.type === 'rrweb' && Array.isArray(body.events)) {
+            const seq    = Number(body.seq ?? 0);
+            const tFirst = Number(body.tFirst ?? Date.now());
+            const tLast  = Number(body.tLast ?? tFirst);
+            const payload = JSON.stringify(body.events);
+
+            await this.chunks.create({
+                sessionId,
+                seq,
+                tFirst,
+                tLast,
+                data: Buffer.from(payload, 'utf8'),
+            });
+
+            return { ok: true }; // done; nothing else to process in this POST
+        }
+
         for (const ev of body.events ?? []) {
             if (ev.type === 'rrweb') {
                 await this.chunks.create({
@@ -34,8 +57,12 @@ export class SessionsService {
                     seq: body.seq ?? ev.t,
                     tFirst: ev.t,
                     tLast: ev.t,
-                    data: Buffer.from(ev.chunk ?? ''),
+                    data: Buffer.from(
+                        typeof ev.chunk === 'string' ? ev.chunk : JSON.stringify(ev),
+                        'utf8'
+                    ),
                 });
+                continue;
             } else if (ev.type === 'action') {
                 // Use $setOnInsert ONLY for fields that never appear in $set
                 const setOnInsert: any = {
