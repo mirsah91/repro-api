@@ -113,6 +113,8 @@ export class SessionsService {
 
     async ingestBackend(sessionId: string, body: any) {
         const entries = body?.entries ?? [];
+
+        console.log('entries --->', JSON.stringify(entries, null, 2))
         for (const e of entries) {
             try {
                 // ---- REQUEST ----
@@ -133,6 +135,7 @@ export class SessionsService {
                                 headers: req.headers ?? {},
                                 key: req.key ?? null,
                                 respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
+                                trace: typeof req.trace === 'string' ? JSON.parse(req.trace) : null
                             }
                         },
                         { upsert: true }
