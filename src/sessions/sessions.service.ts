@@ -120,7 +120,7 @@ export class SessionsService {
                 // ---- REQUEST ----
                 const req = e.request;
                 if (req) {
-                    await this.requests.updateOne(
+                    const resp = await this.requests.updateOne(
                         { sessionId, rid: req.rid },
                         {
                             $set: {
@@ -135,7 +135,7 @@ export class SessionsService {
                                 headers: req.headers ?? {},
                                 key: req.key ?? null,
                                 respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
-                                trace: typeof req.trace === 'string' ? JSON.parse(req.trace) : null
+                                trace: req.trace //typeof req.trace === 'string' ? JSON.parse(req.trace) : null
                             }
                         },
                         { upsert: true }
@@ -195,6 +195,7 @@ export class SessionsService {
             } catch (err) {
                 // isolate failures to a single entry
                 // optionally log to your logger here
+                console.log('error --->', err)
             }
         }
         return { ok: true };
