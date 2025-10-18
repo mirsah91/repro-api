@@ -1,0 +1,13 @@
+{
+  "name": "ingest-backend",
+  "version": "1.0.0",
+  "description": "Ingestion backend service for managing requests and traces.",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongoose": "^8.4.0"
+  }
+}
