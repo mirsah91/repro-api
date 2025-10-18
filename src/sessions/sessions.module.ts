@@ -10,6 +10,7 @@ import { RrwebChunk, RrwebChunkSchema } from './schemas/rrweb-chunk.schema';
 import { SdkToken, SdkTokenSchema } from '../sdk/schemas/sdk-token.schema';
 import { App, AppSchema } from '../apps/schemas/app.schema';
 import {EmailEvt, EmailEvtSchema} from "./schemas/emails.schema";
+import { TraceEvt, TraceEvtSchema } from './schemas/trace.schema';
 
 @Module({
     imports: [
@@ -21,7 +22,8 @@ import {EmailEvt, EmailEvtSchema} from "./schemas/emails.schema";
             { name: RrwebChunk.name, schema: RrwebChunkSchema },
             { name: SdkToken.name, schema: SdkTokenSchema },
             { name: App.name, schema: AppSchema },
-            { name: EmailEvt.name, schema: EmailEvtSchema }
+            { name: EmailEvt.name, schema: EmailEvtSchema },
+            { name: TraceEvt.name, schema: TraceEvtSchema }
         ]),
     ],
     controllers: [SessionsController],

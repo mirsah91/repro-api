@@ -78,6 +78,11 @@ export class SessionsController {
         return this.svc.getTimeline(sessionId);
     }
 
+    @Get('sessions/:sessionId/traces')
+    async getTraces(@Param('sessionId') sessionId: string) {
+        return this.svc.getTracesBySession(sessionId);
+    }
+
     @Get(':sessionId/rrweb/chunk')
     async getChunk(
         @Param('sessionId') sessionId: string,

@@ -8,6 +8,7 @@ import { RequestEvt } from './schemas/request.schema';
 import { DbChange } from './schemas/db-change.schema';
 import { RrwebChunk } from './schemas/rrweb-chunk.schema';
 import {EmailEvt} from "./schemas/emails.schema";
+import { TraceEvt } from './schemas/trace.schema';
 
 @Injectable()
 export class SessionsService {
@@ -18,6 +19,7 @@ export class SessionsService {
         @InjectModel(DbChange.name) private changes: Model<DbChange>,
         @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
         @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
+        @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
     async startSession(appId: string, clientTime?: number) {
@@ -120,13 +122,14 @@ export class SessionsService {
                 // ---- REQUEST ----
                 const req = e.request;
                 if (req) {
-                    const resp = await this.requests.updateOne(
-                        { sessionId, rid: req.rid },
+                    const normalizedRid = String(req.rid);
+                    const requestDoc = await this.requests.findOneAndUpdate(
+                        { sessionId, rid: normalizedRid },
                         {
                             $set: {
                                 sessionId,
                                 actionId: e.actionId ?? null,
-                                rid: String(req.rid),
+                                rid: normalizedRid,
                                 method: req.method,
                                 url: req.url || req.path,           // keep original
                                 status: req.status,
@@ -135,11 +138,34 @@ export class SessionsService {
                                 headers: req.headers ?? {},
                                 key: req.key ?? null,
                                 respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
-                                trace: req.trace //typeof req.trace === 'string' ? JSON.parse(req.trace) : null
                             }
                         },
-                        { upsert: true }
+                        { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
+
+                    if (req.trace) {
+                        let tracePayload: any = req.trace;
+                        if (typeof req.trace === 'string') {
+                            try {
+                                tracePayload = JSON.parse(req.trace);
+                            } catch (err) {
+                                tracePayload = req.trace;
+                            }
+                        }
+
+                        await this.traces.findOneAndUpdate(
+                            { sessionId, requestRid: normalizedRid },
+                            {
+                                $set: {
+                                    sessionId,
+                                    requestRid: normalizedRid,
+                                    request: requestDoc?._id,
+                                    data: tracePayload,
+                                }
+                            },
+                            { upsert: true, setDefaultsOnInsert: true }
+                        );
+                    }
                 }
 
                 // ---- EMAIL ----
@@ -279,6 +305,45 @@ export class SessionsService {
 
         ticks.sort((a, b) => (a.t ?? a.tStart) - (b.t ?? b.tStart));
         return { sessionId, ticks };
+    }
+
+    async getTracesBySession(sessionId: string) {
+        const NULL_KEY = '__trace_null_key__';
+        const traces = await this.traces
+            .find({ sessionId })
+            .populate({ path: 'request', select: 'key durMs status' })
+            .lean()
+            .exec();
+
+        const grouped = new Map<string, { key: string | null; traces: any[] }>();
+
+        for (const trace of traces) {
+            const request = (trace as any).request as any | undefined;
+            const key = request?.key ?? null;
+            const mapKey = key ?? NULL_KEY;
+
+            if (!grouped.has(mapKey)) {
+                grouped.set(mapKey, { key, traces: [] });
+            }
+
+            grouped.get(mapKey)!.traces.push({
+                traceId: String(trace._id),
+                requestRid: trace.requestRid,
+                trace: trace.data ?? null,
+                request: request
+                    ? {
+                        key: request.key ?? null,
+                        durMs: request.durMs ?? null,
+                        status: request.status ?? null,
+                    }
+                    : null,
+            });
+        }
+
+        return {
+            sessionId,
+            items: Array.from(grouped.values()),
+        };
     }
 
     async getChunk(sessionId: string, seqStr: string, ) {
