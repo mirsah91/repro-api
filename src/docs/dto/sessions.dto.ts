@@ -61,9 +61,22 @@ export class BackendDbChangeDto {
     @ApiProperty({ example: { status: 'FAILED' }, nullable: true }) after?: Record<string, any> | null;
     @ApiProperty({ example: 'update', enum: ['insert', 'update', 'delete'] }) op!: 'insert'|'update'|'delete';
 }
+export class BackendTraceBatchDto {
+    @ApiProperty({ example: 'R12' }) rid!: string;
+    @ApiProperty({ example: 0 }) index!: number;
+    @ApiPropertyOptional({ example: 3 }) total?: number;
+}
+
 export class BackendEntryDto {
     @ApiProperty({ example: 'A1' }) actionId!: string;
     @ApiPropertyOptional({ type: BackendRequestDto }) request?: BackendRequestDto;
+    @ApiPropertyOptional({
+        description: 'Trace events captured for the batch (stringified JSON or object)',
+        example: '[{"t":0,"type":"enter"}]',
+    })
+    trace?: any;
+    @ApiPropertyOptional({ type: BackendTraceBatchDto })
+    traceBatch?: BackendTraceBatchDto;
     @ApiPropertyOptional({ type: [BackendDbChangeDto] }) db?: BackendDbChangeDto[];
     @ApiProperty({ example: 1710000000285 }) t!: number;
 }

@@ -8,6 +8,7 @@ import { RequestEvt } from './schemas/request.schema';
 import { DbChange } from './schemas/db-change.schema';
 import { RrwebChunk } from './schemas/rrweb-chunk.schema';
 import {EmailEvt} from "./schemas/emails.schema";
+import { TraceEvt } from './schemas/trace.schema';
 
 @Injectable()
 export class SessionsService {
@@ -18,6 +19,7 @@ export class SessionsService {
         @InjectModel(DbChange.name) private changes: Model<DbChange>,
         @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
         @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
+        @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
     async startSession(appId: string, clientTime?: number) {
@@ -112,34 +114,140 @@ export class SessionsService {
     }
 
     async ingestBackend(sessionId: string, body: any) {
-        const entries = body?.entries ?? [];
+        console.log('body?.entries --->', JSON.stringify(body?.entries, null, 2))
+        const entries = Array.isArray(body?.entries) ? body.entries : [];
 
-        console.log('entries --->', JSON.stringify(entries, null, 2))
         for (const e of entries) {
             try {
-                // ---- REQUEST ----
                 const req = e.request;
-                if (req) {
-                    const resp = await this.requests.updateOne(
-                        { sessionId, rid: req.rid },
-                        {
-                            $set: {
-                                sessionId,
-                                actionId: e.actionId ?? null,
-                                rid: String(req.rid),
-                                method: req.method,
-                                url: req.url || req.path,           // keep original
-                                status: req.status,
-                                durMs: req.durMs,
-                                t: e.t,
-                                headers: req.headers ?? {},
-                                key: req.key ?? null,
-                                respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
-                                trace: req.trace //typeof req.trace === 'string' ? JSON.parse(req.trace) : null
-                            }
-                        },
-                        { upsert: true }
+
+                const ridCandidates = [
+                    req?.rid,
+                    req?.requestRid,
+                    req?.requestId,
+                    e?.requestRid,
+                    e?.rid,
+                    e?.traceBatch?.rid,
+                ];
+
+                let resolvedRid: string | null = null;
+                for (const candidate of ridCandidates) {
+                    if (candidate === undefined || candidate === null) {
+                        continue;
+                    }
+
+                    const asString = String(candidate).trim();
+                    if (asString.length) {
+                        resolvedRid = asString;
+                        break;
+                    }
+                }
+
+                // ---- REQUEST ----
+                if (req && resolvedRid) {
+                    const set: Record<string, any> = {
+                        sessionId,
+                        rid: resolvedRid,
+                    };
+
+                    if (typeof e.actionId !== 'undefined') {
+                        set.actionId = e.actionId ?? null;
+                    }
+
+                    if (typeof e.t === 'number') {
+                        set.t = e.t;
+                    }
+
+                    if (typeof req.method !== 'undefined') {
+                        set.method = req.method;
+                    }
+
+                    const urlCandidate = typeof req.url !== 'undefined' ? req.url : req.path;
+                    if (typeof urlCandidate !== 'undefined') {
+                        set.url = urlCandidate;
+                    }
+
+                    if (typeof req.status === 'number') {
+                        set.status = req.status;
+                    }
+
+                    if (typeof req.durMs === 'number') {
+                        set.durMs = req.durMs;
+                    }
+
+                    if (typeof req.headers !== 'undefined') {
+                        set.headers = req.headers ?? {};
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(req, 'key')) {
+                        set.key = req.key ?? null;
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(req, 'respBody')) {
+                        set.respBody = req.respBody;
+                    }
+
+                    const requestDoc = await this.requests.findOneAndUpdate(
+                        { sessionId, rid: resolvedRid },
+                        { $set: set },
+                        { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
+
+                    if (requestDoc?._id) {
+                        await this.traces.updateMany(
+                            {
+                                sessionId,
+                                requestRid: resolvedRid,
+                                $or: [
+                                    { request: { $exists: false } },
+                                    { request: null },
+                                ],
+                            },
+                            { $set: { request: requestDoc._id } }
+                        ).exec();
+                    }
+                }
+
+                // ---- TRACE BATCH ----
+                if (e.trace && e.traceBatch) {
+                    const batchRid = e.traceBatch?.rid ?? resolvedRid;
+                    if (batchRid) {
+                        let tracePayload: any = e.trace;
+                        if (typeof tracePayload !== 'string') {
+                            try {
+                                tracePayload = JSON.stringify(tracePayload);
+                            } catch {
+                                tracePayload = e.trace;
+                            }
+                        }
+
+                        const indexValue = Number(e.traceBatch.index);
+                        const batchIndex = Number.isFinite(indexValue) ? indexValue : 0;
+                        const totalValue = Number(e.traceBatch.total);
+                        const hasTotal = Number.isFinite(totalValue);
+
+                        const existingRequest = await this.requests
+                            .findOne({ sessionId, rid: batchRid }, { _id: 1 })
+                            .lean()
+                            .exec();
+
+                        const setPayload: Record<string, any> = {
+                            sessionId,
+                            requestRid: batchRid,
+                            batchIndex,
+                            data: hasTotal ? { events: tracePayload, total: totalValue } : tracePayload,
+                        };
+
+                        if (existingRequest?._id) {
+                            setPayload.request = existingRequest._id;
+                        }
+
+                        await this.traces.updateOne(
+                            { sessionId, requestRid: batchRid, batchIndex },
+                            { $set: setPayload },
+                            { upsert: true }
+                        );
+                    }
                 }
 
                 // ---- EMAIL ----
@@ -279,6 +387,62 @@ export class SessionsService {
 
         ticks.sort((a, b) => (a.t ?? a.tStart) - (b.t ?? b.tStart));
         return { sessionId, ticks };
+    }
+
+    async getTracesBySession(sessionId: string) {
+        const NULL_KEY = '__trace_null_key__';
+        const traceDocs = await this.traces
+            .find({ sessionId })
+            .sort({ requestRid: 1, batchIndex: 1 })
+            .populate({ path: 'request', select: 'key durMs status' })
+            .lean()
+            .exec();
+
+        const grouped = new Map<string, { key: string | null; traces: Map<string, { requestRid: string; request: any; batches: Array<{ traceId: string; batchIndex: number; trace: any }> }> }>();
+
+        for (const trace of traceDocs) {
+            const request = (trace as any).request as any | undefined;
+            const key = request?.key ?? null;
+            const mapKey = key ?? NULL_KEY;
+
+            if (!grouped.has(mapKey)) {
+                grouped.set(mapKey, { key, traces: new Map() });
+            }
+
+            const group = grouped.get(mapKey)!;
+            const requestKey = trace.requestRid;
+
+            if (!group.traces.has(requestKey)) {
+                group.traces.set(requestKey, {
+                    requestRid: trace.requestRid,
+                    request: request
+                        ? {
+                            key: request.key ?? null,
+                            durMs: request.durMs ?? null,
+                            status: request.status ?? null,
+                        }
+                        : null,
+                    batches: [],
+                });
+            }
+
+            group.traces.get(requestKey)!.batches.push({
+                traceId: String(trace._id),
+                batchIndex: Number(trace.batchIndex ?? 0),
+                trace: trace.data ?? null,
+            });
+        }
+
+        return {
+            sessionId,
+            items: Array.from(grouped.values()).map(group => ({
+                key: group.key,
+                traces: Array.from(group.traces.values()).map(entry => ({
+                    ...entry,
+                    batches: entry.batches.sort((a, b) => a.batchIndex - b.batchIndex),
+                })),
+            })),
+        };
     }
 
     async getChunk(sessionId: string, seqStr: string, ) {
