@@ -22,6 +22,17 @@ export class SessionsService {
         @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
+    private readonly requestMetadataFields = [
+        'method',
+        'url',
+        'path',
+        'status',
+        'durMs',
+        'headers',
+        'key',
+        'respBody',
+    ];
+
     private parseTraceData(raw: any) {
         if (typeof raw !== 'string') {
             return raw;
@@ -109,6 +120,44 @@ export class SessionsService {
         }
 
         return deduped;
+    }
+
+    private shouldPersistRequestPayload(payload: any) {
+        if (!payload || typeof payload !== 'object') {
+            return false;
+        }
+
+        return this.requestMetadataFields.some(field =>
+            Object.prototype.hasOwnProperty.call(payload, field)
+        );
+    }
+
+    private resolveRequestRid(entry: any, request?: any): string | null {
+        const candidates = [
+            request?.rid,
+            request?.requestRid,
+            request?.requestId,
+            entry?.requestRid,
+            entry?.request_id,
+            entry?.requestId,
+            entry?.rid,
+            entry?.traceRid,
+            entry?.reqRid,
+            entry?.request?.rid,
+        ];
+
+        for (const candidate of candidates) {
+            if (candidate === undefined || candidate === null) {
+                continue;
+            }
+
+            const asString = String(candidate);
+            if (asString.trim().length > 0) {
+                return asString;
+            }
+        }
+
+        return null;
     }
 
     async startSession(appId: string, clientTime?: number) {
@@ -209,9 +258,11 @@ export class SessionsService {
             try {
                 // ---- REQUEST ----
                 const req = e.request;
-                if (req) {
-                    const normalizedRid = String(req.rid);
+                const normalizedRid = this.resolveRequestRid(e, req);
 
+                let requestDoc: RequestEvt | null = null;
+
+                if (req && normalizedRid && this.shouldPersistRequestPayload(req)) {
                     const setOnInsert: Record<string, any> = {
                         sessionId,
                         rid: normalizedRid,
@@ -269,28 +320,98 @@ export class SessionsService {
                         update.$set = set;
                     }
 
-                    const requestDoc = await this.requests.findOneAndUpdate(
+                    requestDoc = await this.requests.findOneAndUpdate(
                         { sessionId, rid: normalizedRid },
                         update,
                         { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
 
-                    const traceBatches = this.extractTraceBatches(req);
+                    if (requestDoc?._id) {
+                        await this.traces.updateMany(
+                            {
+                                sessionId,
+                                requestRid: normalizedRid,
+                                $or: [
+                                    { request: { $exists: false } },
+                                    { request: null },
+                                ],
+                            },
+                            { $set: { request: requestDoc._id } }
+                        ).exec();
+                    }
+                }
 
-                    for (const batch of traceBatches) {
+                const requestIdCache = new Map<string, any>();
+                if (requestDoc?._id && normalizedRid) {
+                    requestIdCache.set(normalizedRid, requestDoc._id);
+                }
+
+                const ensureRequestId = async (rid: string) => {
+                    if (requestIdCache.has(rid)) {
+                        return requestIdCache.get(rid);
+                    }
+
+                    const existing = await this.requests
+                        .findOne({ sessionId, rid }, { _id: 1 })
+                        .lean()
+                        .exec();
+
+                    const existingId = existing?._id;
+                    if (existingId) {
+                        requestIdCache.set(rid, existingId);
+                    }
+
+                    return existingId;
+                };
+
+                const traceSources = new Map<string, Array<{ batchIndex: number; data: any }>>();
+
+                if (req && normalizedRid) {
+                    const traceBatches = this.extractTraceBatches(req);
+                    if (traceBatches.length) {
+                        traceSources.set(normalizedRid, traceBatches);
+                    }
+                }
+
+                const entryLevelRid = normalizedRid ?? this.resolveRequestRid(e, req);
+                if (entryLevelRid) {
+                    const entryTraceBatches = this.extractTraceBatches(e);
+                    if (entryTraceBatches.length) {
+                        const existing = traceSources.get(entryLevelRid) ?? [];
+                        traceSources.set(entryLevelRid, existing.concat(entryTraceBatches));
+                    }
+                }
+
+                for (const [rid, batches] of traceSources) {
+                    if (!rid) {
+                        continue;
+                    }
+
+                    const requestObjectId = await ensureRequestId(rid);
+
+                    const batchesByIndex = new Map<number, { batchIndex: number; data: any }>();
+                    for (const batch of batches) {
+                        batchesByIndex.set(batch.batchIndex, batch);
+                    }
+
+                    const orderedBatches = Array.from(batchesByIndex.values()).sort(
+                        (a, b) => a.batchIndex - b.batchIndex,
+                    );
+
+                    for (const batch of orderedBatches) {
                         const setPayload: any = {
                             sessionId,
-                            requestRid: normalizedRid,
+                            requestRid: rid,
                             batchIndex: batch.batchIndex,
                             data: batch.data,
                         };
 
-                        if (requestDoc?._id) {
-                            setPayload.request = requestDoc._id;
+                        if (requestObjectId) {
+                            setPayload.request = requestObjectId;
                         }
 
                         await this.traces.findOneAndUpdate(
-                            { sessionId, requestRid: normalizedRid, batchIndex: batch.batchIndex },
+                            { sessionId, requestRid: rid, batchIndex: batch.batchIndex },
                             {
                                 $set: setPayload,
                             },
