@@ -22,6 +22,44 @@ export class SessionsService {
         @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
+    private ensureTraceIndexPromise?: Promise<void>;
+
+    private ensureTraceBatchIndex(): Promise<void> {
+        if (!this.ensureTraceIndexPromise) {
+            this.ensureTraceIndexPromise = (async () => {
+                const legacyIndexName = 'sessionId_1_requestRid_1';
+                try {
+                    await this.traces.collection.dropIndex(legacyIndexName);
+                } catch (dropErr: any) {
+                    if (dropErr?.codeName !== 'IndexNotFound') {
+                        // rethrow unexpected drop failures to avoid masking them
+                        throw dropErr;
+                    }
+                }
+
+                try {
+                    await this.traces.collection.createIndex(
+                        { sessionId: 1, requestRid: 1, batchIndex: 1 },
+                        {
+                            unique: true,
+                            background: true,
+                            name: 'sessionId_1_requestRid_1_batchIndex_1',
+                        }
+                    );
+                } catch (createErr: any) {
+                    if (createErr?.codeName !== 'IndexOptionsConflict') {
+                        throw createErr;
+                    }
+                }
+            })().catch(err => {
+                this.ensureTraceIndexPromise = undefined;
+                throw err;
+            });
+        }
+
+        return this.ensureTraceIndexPromise;
+    }
+
     async startSession(appId: string, clientTime?: number) {
         const sessionId = 'S_' + randomUUID();
         const serverNow = Date.now();
@@ -114,7 +152,6 @@ export class SessionsService {
     }
 
     async ingestBackend(sessionId: string, body: any) {
-        console.log('body?.entries --->', JSON.stringify(body?.entries, null, 2))
         const entries = Array.isArray(body?.entries) ? body.entries : [];
 
         for (const e of entries) {
@@ -256,10 +293,13 @@ export class SessionsService {
                                 err?.keyPattern?.sessionId === 1 &&
                                 err?.keyPattern?.requestRid === 1
                             ) {
+                                await this.ensureTraceBatchIndex();
+
                                 await this.traces
                                     .updateOne(
-                                        { sessionId, requestRid: batchRid },
-                                        { $set: setPayload }
+                                        { sessionId, requestRid: batchRid, batchIndex },
+                                        { $set: setPayload },
+                                        { upsert: true }
                                     )
                                     .exec();
                             } else {
