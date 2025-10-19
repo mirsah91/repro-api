@@ -114,6 +114,7 @@ export class SessionsService {
     }
 
     async ingestBackend(sessionId: string, body: any) {
+        console.log('body?.entries --->', JSON.stringify(body?.entries, null, 2))
         const entries = Array.isArray(body?.entries) ? body.entries : [];
 
         for (const e of entries) {
@@ -212,9 +213,9 @@ export class SessionsService {
                     const batchRid = e.traceBatch?.rid ?? resolvedRid;
                     if (batchRid) {
                         let tracePayload: any = e.trace;
-                        if (typeof tracePayload === 'string') {
+                        if (typeof tracePayload !== 'string') {
                             try {
-                                tracePayload = JSON.parse(tracePayload);
+                                tracePayload = JSON.stringify(tracePayload);
                             } catch {
                                 tracePayload = e.trace;
                             }
