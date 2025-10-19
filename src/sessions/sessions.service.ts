@@ -242,11 +242,30 @@ export class SessionsService {
                             setPayload.request = existingRequest._id;
                         }
 
-                        await this.traces.updateOne(
-                            { sessionId, requestRid: batchRid, batchIndex },
-                            { $set: setPayload },
-                            { upsert: true }
-                        );
+                        try {
+                            await this.traces
+                                .updateOne(
+                                    { sessionId, requestRid: batchRid, batchIndex },
+                                    { $set: setPayload },
+                                    { upsert: true }
+                                )
+                                .exec();
+                        } catch (err: any) {
+                            if (
+                                err?.code === 11000 &&
+                                err?.keyPattern?.sessionId === 1 &&
+                                err?.keyPattern?.requestRid === 1
+                            ) {
+                                await this.traces
+                                    .updateOne(
+                                        { sessionId, requestRid: batchRid },
+                                        { $set: setPayload }
+                                    )
+                                    .exec();
+                            } else {
+                                throw err;
+                            }
+                        }
                     }
                 }
 
