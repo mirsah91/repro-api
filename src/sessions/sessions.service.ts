@@ -80,7 +80,14 @@ export class SessionsService {
         }
 
         if (traceSource.trace !== undefined && traceSource.trace !== null) {
-            const explicitIndex = traceSource.traceBatchIndex ?? traceSource.traceIndex ?? traceSource.traceSeq ?? traceSource.traceOrder;
+            const explicitIndex =
+                traceSource.traceBatchIndex ??
+                traceSource.traceIndex ??
+                traceSource.traceSeq ??
+                traceSource.traceOrder ??
+                traceSource.batchIndex ??
+                traceSource.batch ??
+                traceSource.index;
             const fallbackIndex = batches.length ? computeNextIndex() : this.normalizeTraceBatchIndex(explicitIndex, 0);
             pushBatch(explicitIndex, traceSource.trace, fallbackIndex);
         }
@@ -204,23 +211,67 @@ export class SessionsService {
                 const req = e.request;
                 if (req) {
                     const normalizedRid = String(req.rid);
+
+                    const setOnInsert: Record<string, any> = {
+                        sessionId,
+                        rid: normalizedRid,
+                    };
+
+                    if (typeof e.actionId !== 'undefined') {
+                        setOnInsert.actionId = e.actionId ?? null;
+                    }
+
+                    if (typeof e.t === 'number') {
+                        setOnInsert.t = e.t;
+                    }
+
+                    const set: Record<string, any> = {};
+
+                    if (typeof e.actionId !== 'undefined') {
+                        set.actionId = e.actionId ?? null;
+                    }
+
+                    if (typeof e.t === 'number') {
+                        set.t = e.t;
+                    }
+
+                    if (typeof req.method !== 'undefined') {
+                        set.method = req.method;
+                    }
+
+                    const urlCandidate = typeof req.url !== 'undefined' ? req.url : req.path;
+                    if (typeof urlCandidate !== 'undefined') {
+                        set.url = urlCandidate;
+                    }
+
+                    if (typeof req.status === 'number') {
+                        set.status = req.status;
+                    }
+
+                    if (typeof req.durMs === 'number') {
+                        set.durMs = req.durMs;
+                    }
+
+                    if (typeof req.headers !== 'undefined') {
+                        set.headers = req.headers ?? {};
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(req, 'key')) {
+                        set.key = req.key ?? null;
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(req, 'respBody')) {
+                        set.respBody = req.respBody;
+                    }
+
+                    const update: Record<string, any> = { $setOnInsert: setOnInsert };
+                    if (Object.keys(set).length > 0) {
+                        update.$set = set;
+                    }
+
                     const requestDoc = await this.requests.findOneAndUpdate(
                         { sessionId, rid: normalizedRid },
-                        {
-                            $set: {
-                                sessionId,
-                                actionId: e.actionId ?? null,
-                                rid: normalizedRid,
-                                method: req.method,
-                                url: req.url || req.path,           // keep original
-                                status: req.status,
-                                durMs: req.durMs,
-                                t: e.t,
-                                headers: req.headers ?? {},
-                                key: req.key ?? null,
-                                respBody: typeof req.respBody === 'undefined' ? undefined : req.respBody,
-                            }
-                        },
+                        update,
                         { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
 
