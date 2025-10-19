@@ -22,6 +22,88 @@ export class SessionsService {
         @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
+    private parseTraceData(raw: any) {
+        if (typeof raw !== 'string') {
+            return raw;
+        }
+
+        try {
+            return JSON.parse(raw);
+        } catch {
+            return raw;
+        }
+    }
+
+    private normalizeTraceBatchIndex(candidate: any, fallback: number) {
+        const num = Number(candidate);
+        return Number.isFinite(num) ? num : fallback;
+    }
+
+    private extractTraceBatches(traceSource: any): Array<{ batchIndex: number; data: any }> {
+        if (!traceSource) {
+            return [];
+        }
+
+        const batches: Array<{ batchIndex: number; data: any }> = [];
+
+        const pushBatch = (indexCandidate: any, rawData: any, fallbackIndex: number) => {
+            if (rawData === undefined || rawData === null) {
+                return;
+            }
+
+            const index = this.normalizeTraceBatchIndex(indexCandidate, fallbackIndex);
+            const data = this.parseTraceData(rawData);
+            batches.push({ batchIndex: index, data });
+        };
+
+        const computeNextIndex = () => (batches.length ? batches[batches.length - 1].batchIndex + 1 : 0);
+
+        const handleBatchLike = (batch: any, fallbackIndex: number) => {
+            if (batch === undefined || batch === null) {
+                return;
+            }
+
+            const payload = batch?.events ?? batch?.data ?? batch?.trace ?? batch?.payload ?? batch;
+            const indexCandidate = batch?.batchIndex ?? batch?.index ?? batch?.seq ?? batch?.batch ?? batch?.order;
+            pushBatch(indexCandidate, payload, fallbackIndex);
+        };
+
+        if (Array.isArray(traceSource.traceBatches)) {
+            traceSource.traceBatches.forEach((batch: any, idx: number) => {
+                const fallbackIndex = batches.length ? computeNextIndex() : idx;
+                handleBatchLike(batch, fallbackIndex);
+            });
+        }
+
+        if (traceSource.traceBatch !== undefined && traceSource.traceBatch !== null) {
+            handleBatchLike(traceSource.traceBatch, computeNextIndex());
+        }
+
+        if (traceSource.trace !== undefined && traceSource.trace !== null) {
+            const explicitIndex = traceSource.traceBatchIndex ?? traceSource.traceIndex ?? traceSource.traceSeq ?? traceSource.traceOrder;
+            const fallbackIndex = batches.length ? computeNextIndex() : this.normalizeTraceBatchIndex(explicitIndex, 0);
+            pushBatch(explicitIndex, traceSource.trace, fallbackIndex);
+        }
+
+        batches.sort((a, b) => a.batchIndex - b.batchIndex);
+
+        const deduped: Array<{ batchIndex: number; data: any }> = [];
+        const seen = new Set<number>();
+        for (const batch of batches) {
+            if (seen.has(batch.batchIndex)) {
+                const idx = deduped.findIndex(item => item.batchIndex === batch.batchIndex);
+                if (idx >= 0) {
+                    deduped[idx] = batch;
+                }
+            } else {
+                seen.add(batch.batchIndex);
+                deduped.push(batch);
+            }
+        }
+
+        return deduped;
+    }
+
     async startSession(appId: string, clientTime?: number) {
         const sessionId = 'S_' + randomUUID();
         const serverNow = Date.now();
@@ -116,7 +198,6 @@ export class SessionsService {
     async ingestBackend(sessionId: string, body: any) {
         const entries = body?.entries ?? [];
 
-        console.log('entries --->', JSON.stringify(entries, null, 2))
         for (const e of entries) {
             try {
                 // ---- REQUEST ----
@@ -143,25 +224,24 @@ export class SessionsService {
                         { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
 
-                    if (req.trace) {
-                        let tracePayload: any = req.trace;
-                        if (typeof req.trace === 'string') {
-                            try {
-                                tracePayload = JSON.parse(req.trace);
-                            } catch (err) {
-                                tracePayload = req.trace;
-                            }
+                    const traceBatches = this.extractTraceBatches(req);
+
+                    for (const batch of traceBatches) {
+                        const setPayload: any = {
+                            sessionId,
+                            requestRid: normalizedRid,
+                            batchIndex: batch.batchIndex,
+                            data: batch.data,
+                        };
+
+                        if (requestDoc?._id) {
+                            setPayload.request = requestDoc._id;
                         }
 
                         await this.traces.findOneAndUpdate(
-                            { sessionId, requestRid: normalizedRid },
+                            { sessionId, requestRid: normalizedRid, batchIndex: batch.batchIndex },
                             {
-                                $set: {
-                                    sessionId,
-                                    requestRid: normalizedRid,
-                                    request: requestDoc?._id,
-                                    data: tracePayload,
-                                }
+                                $set: setPayload,
                             },
                             { upsert: true, setDefaultsOnInsert: true }
                         );
@@ -309,40 +389,57 @@ export class SessionsService {
 
     async getTracesBySession(sessionId: string) {
         const NULL_KEY = '__trace_null_key__';
-        const traces = await this.traces
+        const traceDocs = await this.traces
             .find({ sessionId })
+            .sort({ requestRid: 1, batchIndex: 1 })
             .populate({ path: 'request', select: 'key durMs status' })
             .lean()
             .exec();
 
-        const grouped = new Map<string, { key: string | null; traces: any[] }>();
+        const grouped = new Map<string, { key: string | null; traces: Map<string, { requestRid: string; request: any; batches: Array<{ traceId: string; batchIndex: number; trace: any }> }> }>();
 
-        for (const trace of traces) {
+        for (const trace of traceDocs) {
             const request = (trace as any).request as any | undefined;
             const key = request?.key ?? null;
             const mapKey = key ?? NULL_KEY;
 
             if (!grouped.has(mapKey)) {
-                grouped.set(mapKey, { key, traces: [] });
+                grouped.set(mapKey, { key, traces: new Map() });
             }
 
-            grouped.get(mapKey)!.traces.push({
+            const group = grouped.get(mapKey)!;
+            const requestKey = trace.requestRid;
+
+            if (!group.traces.has(requestKey)) {
+                group.traces.set(requestKey, {
+                    requestRid: trace.requestRid,
+                    request: request
+                        ? {
+                            key: request.key ?? null,
+                            durMs: request.durMs ?? null,
+                            status: request.status ?? null,
+                        }
+                        : null,
+                    batches: [],
+                });
+            }
+
+            group.traces.get(requestKey)!.batches.push({
                 traceId: String(trace._id),
-                requestRid: trace.requestRid,
+                batchIndex: Number(trace.batchIndex ?? 0),
                 trace: trace.data ?? null,
-                request: request
-                    ? {
-                        key: request.key ?? null,
-                        durMs: request.durMs ?? null,
-                        status: request.status ?? null,
-                    }
-                    : null,
             });
         }
 
         return {
             sessionId,
-            items: Array.from(grouped.values()),
+            items: Array.from(grouped.values()).map(group => ({
+                key: group.key,
+                traces: Array.from(group.traces.values()).map(entry => ({
+                    ...entry,
+                    batches: entry.batches.sort((a, b) => a.batchIndex - b.batchIndex),
+                })),
+            })),
         };
     }
 

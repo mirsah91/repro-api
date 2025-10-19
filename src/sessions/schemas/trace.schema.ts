@@ -10,6 +10,9 @@ export class TraceEvt {
     @Prop({ required: true })
     requestRid!: string;
 
+    @Prop({ required: true })
+    batchIndex!: number;
+
     @Prop({ type: SchemaTypes.ObjectId, ref: RequestEvt.name })
     request?: Types.ObjectId;
 
@@ -20,5 +23,6 @@ export class TraceEvt {
 export type TraceEvtDocument = HydratedDocument<TraceEvt>;
 export const TraceEvtSchema = SchemaFactory.createForClass(TraceEvt);
 
-TraceEvtSchema.index({ sessionId: 1, requestRid: 1 }, { unique: true });
+TraceEvtSchema.index({ sessionId: 1, requestRid: 1, batchIndex: 1 }, { unique: true });
+TraceEvtSchema.index({ sessionId: 1, requestRid: 1 });
 TraceEvtSchema.index({ sessionId: 1 });
