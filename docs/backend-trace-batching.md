@@ -3,9 +3,9 @@
 Backend instrumentation can stream large traces in deterministic batches
 instead of buffering the entire payload in memory. The ingestion endpoint
 accepts one batch per POST request as long as each payload includes a request
-identifier and monotonically increasing `traceBatchIndex` values. Trace batches
-can arrive alongside the matching request metadata **or** independently as
-"trace-only" entries when the request data has already been ingested.
+identifier and a batch index. Trace batches can arrive alongside the matching
+request metadata **or** independently as "trace-only" entries when the request
+data has already been ingested.
 
 ## Streaming from `reproMiddleware`
 
@@ -20,28 +20,7 @@ function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: strin
     return function handler(req: Request, res: Response, next: NextFunction) {
         // ... existing header parsing omitted for brevity ...
 
-        type TraceEventPayload = {
-            t: number;
-            type: 'enter' | 'exit';
-            functionType?: string | null;
-            fn?: string;
-            file?: string;
-            line?: number | null;
-            depth?: number;
-            args?: any;
-            returnValue?: any;
-            threw?: boolean;
-            error?: any;
-        };
-
-        const normalizeEvent = (ev: any): TraceEventPayload | null => {
-            // reuse the existing filtering + sanitizing logic from the current middleware
-            // and return `null` for dropped events.
-            return ev as TraceEventPayload;
-        };
-
-        const events: TraceEventPayload[] = [];
-
+        const events: any[] = [];
         let batchIndex = 0;
 
         const flush = () => {
@@ -49,15 +28,11 @@ function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: strin
             post(cfg.apiBase, cfg.appId, cfg.appSecret, sid, {
                 entries: [{
                     actionId: aid,
-                    request: {
+                    trace: JSON.stringify(events),
+                    traceBatch: {
                         rid,
-                        method: req.method,
-                        url,
-                        status: res.statusCode,
-                        durMs: Date.now() - t0,
-                        key,
-                        trace: JSON.stringify(events),
-                        traceBatchIndex: batchIndex++,
+                        index: batchIndex++,
+                        total: undefined,
                     },
                     t: Date.now(),
                 }],
@@ -72,17 +47,13 @@ function reproMiddleware(cfg: { appId: string; appSecret: string; apiBase: strin
         };
 
         unsubscribe = __TRACER__.tracer.on((ev: any) => {
-            const evt = normalizeEvent(ev);
-            if (!evt) {
-                return;
-            }
-            events.push(evt);
+            events.push(ev);
             maybeFlush();
         });
 
         res.on('finish', () => {
             flush();
-            // ... existing payload handling ...
+            // ... existing request payload handling can post separately ...
         });
 
         next();
@@ -96,8 +67,8 @@ without overriding previously stored fields when a subsequent batch omits them.
 ## Trace-only batches
 
 If your instrumentation emits request metadata separately from the trace
-payloads, post the trace batches on their own. Provide the request identifier at
-the entry level and omit the `request` object entirely:
+payloads, post the trace batches on their own. Provide the request identifier in
+`traceBatch.rid` and omit the `request` object entirely:
 
 ```json
 {
@@ -112,31 +83,41 @@ the entry level and omit the `request` object entirely:
         "durMs": 140
       },
       "t": 1710000000200
-    },
+    }
+  ]
+}
+```
+
+Later, send each trace batch as its own entry:
+
+```json
+{
+  "entries": [
     {
       "actionId": "A1",
-      "requestRid": "R12",
       "trace": "[{\"t\":0,\"type\":\"enter\"}]",
-      "traceBatchIndex": 1,
+      "traceBatch": {
+        "rid": "R12",
+        "index": 1,
+        "total": 4
+      },
       "t": 1710000000205
     }
   ]
 }
 ```
 
-Each trace-only entry may include either a raw `trace` payload or the
-`traceBatch`/`traceBatches` wrappers shown earlier. The server associates the
-batch with the existing request document using `requestRid` (or the legacy
-`rid`/`traceRid` aliases).
+Each trace-only entry sends the serialized trace plus metadata describing the
+batch. The server associates the batch with the existing request document using
+`traceBatch.rid` (or the legacy `requestRid` fallback).
 
 ## Payload expectations
 
-- Every batch must include a `request.rid` value so it can be attached to the
-  right request document.
-- Provide a numeric `traceBatchIndex` (starting at zero) to preserve ordering.
+- Every request payload must include a `request.rid` value so it can be attached
+  to the right request document.
+- Provide a numeric `traceBatch.index` (starting at zero) to preserve ordering.
 - Additional request properties (such as status or duration) are optional after
-  the initial batch. Missing fields no longer clear previous values on the
-  server.
+  the initial batch.
 - Trace batches can be uploaded without a `request` payload by including
-  `requestRid` (or `rid`) at the entry level.
+  `traceBatch.rid` (or `requestRid`) at the entry level.
 

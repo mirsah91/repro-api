@@ -61,32 +61,22 @@ export class BackendDbChangeDto {
     @ApiProperty({ example: { status: 'FAILED' }, nullable: true }) after?: Record<string, any> | null;
     @ApiProperty({ example: 'update', enum: ['insert', 'update', 'delete'] }) op!: 'insert'|'update'|'delete';
 }
+export class BackendTraceBatchDto {
+    @ApiProperty({ example: 'R12' }) rid!: string;
+    @ApiProperty({ example: 0 }) index!: number;
+    @ApiPropertyOptional({ example: 3 }) total?: number;
+}
+
 export class BackendEntryDto {
     @ApiProperty({ example: 'A1' }) actionId!: string;
     @ApiPropertyOptional({ type: BackendRequestDto }) request?: BackendRequestDto;
-    @ApiPropertyOptional({ example: 'R12', description: 'Request identifier when sending trace-only batches' })
-    requestRid?: string;
     @ApiPropertyOptional({
-        description: 'Single trace batch payload (stringified JSON or object)',
+        description: 'Trace events captured for the batch (stringified JSON or object)',
         example: '[{"t":0,"type":"enter"}]',
     })
     trace?: any;
-    @ApiPropertyOptional({
-        description: 'Wrapper for a single trace batch with metadata',
-        example: { batchIndex: 0, events: [] },
-        type: 'object',
-    } as any)
-    traceBatch?: Record<string, any>;
-    @ApiPropertyOptional({
-        description: 'Array of trace batches to ingest together',
-        type: 'array',
-        items: { type: 'object' },
-        example: [
-            { batchIndex: 0, events: [] },
-            { batchIndex: 1, events: [] },
-        ],
-    } as any)
-    traceBatches?: Array<Record<string, any>>;
+    @ApiPropertyOptional({ type: BackendTraceBatchDto })
+    traceBatch?: BackendTraceBatchDto;
     @ApiPropertyOptional({ type: [BackendDbChangeDto] }) db?: BackendDbChangeDto[];
     @ApiProperty({ example: 1710000000285 }) t!: number;
 }

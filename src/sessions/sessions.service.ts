@@ -22,144 +22,6 @@ export class SessionsService {
         @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     ) {}
 
-    private readonly requestMetadataFields = [
-        'method',
-        'url',
-        'path',
-        'status',
-        'durMs',
-        'headers',
-        'key',
-        'respBody',
-    ];
-
-    private parseTraceData(raw: any) {
-        if (typeof raw !== 'string') {
-            return raw;
-        }
-
-        try {
-            return JSON.parse(raw);
-        } catch {
-            return raw;
-        }
-    }
-
-    private normalizeTraceBatchIndex(candidate: any, fallback: number) {
-        const num = Number(candidate);
-        return Number.isFinite(num) ? num : fallback;
-    }
-
-    private extractTraceBatches(traceSource: any): Array<{ batchIndex: number; data: any }> {
-        if (!traceSource) {
-            return [];
-        }
-
-        const batches: Array<{ batchIndex: number; data: any }> = [];
-
-        const pushBatch = (indexCandidate: any, rawData: any, fallbackIndex: number) => {
-            if (rawData === undefined || rawData === null) {
-                return;
-            }
-
-            const index = this.normalizeTraceBatchIndex(indexCandidate, fallbackIndex);
-            const data = this.parseTraceData(rawData);
-            batches.push({ batchIndex: index, data });
-        };
-
-        const computeNextIndex = () => (batches.length ? batches[batches.length - 1].batchIndex + 1 : 0);
-
-        const handleBatchLike = (batch: any, fallbackIndex: number) => {
-            if (batch === undefined || batch === null) {
-                return;
-            }
-
-            const payload = batch?.events ?? batch?.data ?? batch?.trace ?? batch?.payload ?? batch;
-            const indexCandidate = batch?.batchIndex ?? batch?.index ?? batch?.seq ?? batch?.batch ?? batch?.order;
-            pushBatch(indexCandidate, payload, fallbackIndex);
-        };
-
-        if (Array.isArray(traceSource.traceBatches)) {
-            traceSource.traceBatches.forEach((batch: any, idx: number) => {
-                const fallbackIndex = batches.length ? computeNextIndex() : idx;
-                handleBatchLike(batch, fallbackIndex);
-            });
-        }
-
-        if (traceSource.traceBatch !== undefined && traceSource.traceBatch !== null) {
-            handleBatchLike(traceSource.traceBatch, computeNextIndex());
-        }
-
-        if (traceSource.trace !== undefined && traceSource.trace !== null) {
-            const explicitIndex =
-                traceSource.traceBatchIndex ??
-                traceSource.traceIndex ??
-                traceSource.traceSeq ??
-                traceSource.traceOrder ??
-                traceSource.batchIndex ??
-                traceSource.batch ??
-                traceSource.index;
-            const fallbackIndex = batches.length ? computeNextIndex() : this.normalizeTraceBatchIndex(explicitIndex, 0);
-            pushBatch(explicitIndex, traceSource.trace, fallbackIndex);
-        }
-
-        batches.sort((a, b) => a.batchIndex - b.batchIndex);
-
-        const deduped: Array<{ batchIndex: number; data: any }> = [];
-        const seen = new Set<number>();
-        for (const batch of batches) {
-            if (seen.has(batch.batchIndex)) {
-                const idx = deduped.findIndex(item => item.batchIndex === batch.batchIndex);
-                if (idx >= 0) {
-                    deduped[idx] = batch;
-                }
-            } else {
-                seen.add(batch.batchIndex);
-                deduped.push(batch);
-            }
-        }
-
-        return deduped;
-    }
-
-    private shouldPersistRequestPayload(payload: any) {
-        if (!payload || typeof payload !== 'object') {
-            return false;
-        }
-
-        return this.requestMetadataFields.some(field =>
-            Object.prototype.hasOwnProperty.call(payload, field)
-        );
-    }
-
-    private resolveRequestRid(entry: any, request?: any): string | null {
-        const candidates = [
-            request?.rid,
-            request?.requestRid,
-            request?.requestId,
-            entry?.requestRid,
-            entry?.request_id,
-            entry?.requestId,
-            entry?.rid,
-            entry?.traceRid,
-            entry?.reqRid,
-            entry?.request?.rid,
-        ];
-
-        for (const candidate of candidates) {
-            if (candidate === undefined || candidate === null) {
-                continue;
-            }
-
-            const asString = String(candidate);
-            if (asString.trim().length > 0) {
-                return asString;
-            }
-        }
-
-        return null;
-    }
-
     async startSession(appId: string, clientTime?: number) {
         const sessionId = 'S_' + randomUUID();
         const serverNow = Date.now();
@@ -252,31 +114,40 @@ export class SessionsService {
     }
 
     async ingestBackend(sessionId: string, body: any) {
-        const entries = body?.entries ?? [];
+        const entries = Array.isArray(body?.entries) ? body.entries : [];
 
         for (const e of entries) {
             try {
-                // ---- REQUEST ----
                 const req = e.request;
-                const normalizedRid = this.resolveRequestRid(e, req);
 
-                let requestDoc: RequestEvt | null = null;
+                const ridCandidates = [
+                    req?.rid,
+                    req?.requestRid,
+                    req?.requestId,
+                    e?.requestRid,
+                    e?.rid,
+                    e?.traceBatch?.rid,
+                ];
 
-                if (req && normalizedRid && this.shouldPersistRequestPayload(req)) {
-                    const setOnInsert: Record<string, any> = {
+                let resolvedRid: string | null = null;
+                for (const candidate of ridCandidates) {
+                    if (candidate === undefined || candidate === null) {
+                        continue;
+                    }
+
+                    const asString = String(candidate).trim();
+                    if (asString.length) {
+                        resolvedRid = asString;
+                        break;
+                    }
+                }
+
+                // ---- REQUEST ----
+                if (req && resolvedRid) {
+                    const set: Record<string, any> = {
                         sessionId,
-                        rid: normalizedRid,
+                        rid: resolvedRid,
                     };
-
-                    if (typeof e.actionId !== 'undefined') {
-                        setOnInsert.actionId = e.actionId ?? null;
-                    }
-
-                    if (typeof e.t === 'number') {
-                        setOnInsert.t = e.t;
-                    }
-
-                    const set: Record<string, any> = {};
 
                     if (typeof e.actionId !== 'undefined') {
                         set.actionId = e.actionId ?? null;
@@ -315,14 +186,9 @@ export class SessionsService {
                         set.respBody = req.respBody;
                     }
 
-                    const update: Record<string, any> = { $setOnInsert: setOnInsert };
-                    if (Object.keys(set).length > 0) {
-                        update.$set = set;
-                    }
-
-                    requestDoc = await this.requests.findOneAndUpdate(
-                        { sessionId, rid: normalizedRid },
-                        update,
+                    const requestDoc = await this.requests.findOneAndUpdate(
+                        { sessionId, rid: resolvedRid },
+                        { $set: set },
                         { upsert: true, new: true, setDefaultsOnInsert: true }
                     );
 
@@ -330,7 +196,7 @@ export class SessionsService {
                         await this.traces.updateMany(
                             {
                                 sessionId,
-                                requestRid: normalizedRid,
+                                requestRid: resolvedRid,
                                 $or: [
                                     { request: { $exists: false } },
                                     { request: null },
@@ -341,81 +207,44 @@ export class SessionsService {
                     }
                 }
 
-                const requestIdCache = new Map<string, any>();
-                if (requestDoc?._id && normalizedRid) {
-                    requestIdCache.set(normalizedRid, requestDoc._id);
-                }
-
-                const ensureRequestId = async (rid: string) => {
-                    if (requestIdCache.has(rid)) {
-                        return requestIdCache.get(rid);
-                    }
-
-                    const existing = await this.requests
-                        .findOne({ sessionId, rid }, { _id: 1 })
-                        .lean()
-                        .exec();
-
-                    const existingId = existing?._id;
-                    if (existingId) {
-                        requestIdCache.set(rid, existingId);
-                    }
-
-                    return existingId;
-                };
-
-                const traceSources = new Map<string, Array<{ batchIndex: number; data: any }>>();
-
-                if (req && normalizedRid) {
-                    const traceBatches = this.extractTraceBatches(req);
-                    if (traceBatches.length) {
-                        traceSources.set(normalizedRid, traceBatches);
-                    }
-                }
-
-                const entryLevelRid = normalizedRid ?? this.resolveRequestRid(e, req);
-                if (entryLevelRid) {
-                    const entryTraceBatches = this.extractTraceBatches(e);
-                    if (entryTraceBatches.length) {
-                        const existing = traceSources.get(entryLevelRid) ?? [];
-                        traceSources.set(entryLevelRid, existing.concat(entryTraceBatches));
-                    }
-                }
-
-                for (const [rid, batches] of traceSources) {
-                    if (!rid) {
-                        continue;
-                    }
-
-                    const requestObjectId = await ensureRequestId(rid);
-
-                    const batchesByIndex = new Map<number, { batchIndex: number; data: any }>();
-                    for (const batch of batches) {
-                        batchesByIndex.set(batch.batchIndex, batch);
-                    }
-
-                    const orderedBatches = Array.from(batchesByIndex.values()).sort(
-                        (a, b) => a.batchIndex - b.batchIndex,
-                    );
-
-                    for (const batch of orderedBatches) {
-                        const setPayload: any = {
-                            sessionId,
-                            requestRid: rid,
-                            batchIndex: batch.batchIndex,
-                            data: batch.data,
-                        };
-
-                        if (requestObjectId) {
-                            setPayload.request = requestObjectId;
+                // ---- TRACE BATCH ----
+                if (e.trace && e.traceBatch) {
+                    const batchRid = e.traceBatch?.rid ?? resolvedRid;
+                    if (batchRid) {
+                        let tracePayload: any = e.trace;
+                        if (typeof tracePayload === 'string') {
+                            try {
+                                tracePayload = JSON.parse(tracePayload);
+                            } catch {
+                                tracePayload = e.trace;
+                            }
                         }
 
-                        await this.traces.findOneAndUpdate(
-                            { sessionId, requestRid: rid, batchIndex: batch.batchIndex },
-                            {
-                                $set: setPayload,
-                            },
-                            { upsert: true, setDefaultsOnInsert: true }
+                        const indexValue = Number(e.traceBatch.index);
+                        const batchIndex = Number.isFinite(indexValue) ? indexValue : 0;
+                        const totalValue = Number(e.traceBatch.total);
+                        const hasTotal = Number.isFinite(totalValue);
+
+                        const existingRequest = await this.requests
+                            .findOne({ sessionId, rid: batchRid }, { _id: 1 })
+                            .lean()
+                            .exec();
+
+                        const setPayload: Record<string, any> = {
+                            sessionId,
+                            requestRid: batchRid,
+                            batchIndex,
+                            data: hasTotal ? { events: tracePayload, total: totalValue } : tracePayload,
+                        };
+
+                        if (existingRequest?._id) {
+                            setPayload.request = existingRequest._id;
+                        }
+
+                        await this.traces.updateOne(
+                            { sessionId, requestRid: batchRid, batchIndex },
+                            { $set: setPayload },
+                            { upsert: true }
                         );
                     }
                 }
