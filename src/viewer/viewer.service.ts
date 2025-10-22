@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { Session } from '../sessions/schemas/session.schema';
@@ -120,13 +120,15 @@ export class ViewerService {
         }
     }
 
-    async summary(sessionId: string) {
-        const s = await this.sessions.findById(sessionId).lean();
+    async summary(sessionId: string, appId: string) {
+        const s = await this.sessions.findOne({ _id: sessionId, appId }).lean();
+        if (!s) throw new NotFoundException('Session not found');
         const actions = await this.actions.find({ sessionId }).sort({ tStart: 1 }).lean();
         return { sessionId, appId: s?.appId, actions, env: s?.env ?? {} };
     }
 
-    async actionDetails(sessionId: string, actionId: string) {
+    async actionDetails(sessionId: string, actionId: string, appId: string) {
+        await this.ensureSession(sessionId, appId);
         const a = await this.actions.findOne({ sessionId, actionId }).lean();
         const reqs = await this.requests.find({ sessionId, actionId }).sort({ t: 1 }).lean();
         const db = await this.changes.find({ sessionId, actionId }).sort({ t: 1 }).lean();
@@ -135,9 +137,12 @@ export class ViewerService {
 
     async full(
         sessionId: string,
-        opts?: { includeRrweb?: boolean; includeRespDiffs?: boolean }
+        opts?: { appId?: string; includeRrweb?: boolean; includeRespDiffs?: boolean }
     ): Promise<FullResponseDto> {
-        const s = await this.sessions.findById(sessionId).lean();
+        const appId = opts?.appId;
+        if (!appId) throw new NotFoundException('Session not found');
+        const s = await this.sessions.findOne({ _id: sessionId, appId }).lean();
+        if (!s) throw new NotFoundException('Session not found');
 
         const [acts, reqs, dbs, mails] = await Promise.all([
             this.actions.find({ sessionId }).sort({ tStart: 1 }).lean(),
@@ -269,5 +274,10 @@ export class ViewerService {
             .replace(/[\n\r\t]/gm, "")
             .replace(/<\!--.*?-->/g, "")
             .replace(/\\"/g, '"');
+    }
+
+    private async ensureSession(sessionId: string, appId: string) {
+        const exists = await this.sessions.exists({ _id: sessionId, appId });
+        if (!exists) throw new NotFoundException('Session not found');
     }
 }

@@ -60,19 +60,32 @@ export class SessionsService {
         return this.ensureTraceIndexPromise;
     }
 
-    async startSession(appId: string, clientTime?: number) {
+    async startSession(appId: string, clientTime?: number, appUser?: any) {
         const sessionId = 'S_' + randomUUID();
         const serverNow = Date.now();
         const client = typeof clientTime === 'number' ? clientTime : serverNow;
         const clockOffsetMs = serverNow - client; // client adds this to align
 
         // was: new Date(client)
-        await this.sessions.create({ _id: sessionId, appId, startedAt: new Date(serverNow) });
+        const userId = appUser
+            ? typeof appUser.id === 'string'
+                ? appUser.id
+                : appUser._id?.toHexString?.() ?? appUser._id?.toString?.() ?? undefined
+            : undefined;
+
+        await this.sessions.create({
+            _id: sessionId,
+            appId,
+            startedAt: new Date(serverNow),
+            userId,
+            userEmail: appUser?.email,
+        });
 
         return { sessionId, clockOffsetMs };
     }
 
-    async appendEvents(sessionId: string, body: any) {
+    async appendEvents(sessionId: string, appId: string, body: any) {
+        await this.ensureSessionExists(sessionId, appId);
         if (body?.type === 'rrweb' && Array.isArray(body.events)) {
             const seq    = Number(body.seq ?? 0);
             const tFirst = Number(body.tFirst ?? Date.now());
@@ -151,7 +164,8 @@ export class SessionsService {
         return { ok: true };
     }
 
-    async ingestBackend(sessionId: string, body: any) {
+    async ingestBackend(sessionId: string, appId: string, body: any) {
+        await this.ensureSessionExists(sessionId, appId);
         const entries = Array.isArray(body?.entries) ? body.entries : [];
 
         for (const e of entries) {
@@ -368,12 +382,17 @@ export class SessionsService {
         return { ok: true };
     }
 
-    async finishSession(sessionId: string, notes?: string) {
-        await this.sessions.updateOne({ _id: sessionId }, { $set: { finishedAt: new Date(), notes: notes ?? '' } });
+    async finishSession(sessionId: string, appId: string, notes?: string) {
+        const res = await this.sessions.findOneAndUpdate(
+            { _id: sessionId, appId },
+            { $set: { finishedAt: new Date(), notes: notes ?? '' } },
+        );
+        if (!res) throw new NotFoundException('Session not found');
         return { viewerUrl: `${process.env.APP_URL ?? 'https://repro.app'}/s/${sessionId}` };
     }
 
-    async getRrwebChunksPaged(sessionId: string, afterSeq: number, limit: number) {
+    async getRrwebChunksPaged(sessionId: string, appId: string, afterSeq: number, limit: number) {
+        await this.ensureSessionExists(sessionId, appId);
         return this.chunks
             .find({ sessionId, seq: { $gt: afterSeq } })
             .sort({ seq: 1 })
@@ -382,7 +401,8 @@ export class SessionsService {
             .exec();
     }
 
-    async getTimeline(sessionId: string) {
+    async getTimeline(sessionId: string, appId: string) {
+        await this.ensureSessionExists(sessionId, appId);
         const [actions, requests, db, emails] = await Promise.all([
             this.actions.find({ sessionId }).lean().exec(),
             this.requests.find({ sessionId }).lean().exec(),
@@ -448,7 +468,8 @@ export class SessionsService {
         return { sessionId, ticks };
     }
 
-    async getTracesBySession(sessionId: string) {
+    async getTracesBySession(sessionId: string, appId: string) {
+        await this.ensureSessionExists(sessionId, appId);
         const NULL_KEY = '__trace_null_key__';
         const traceDocs = await this.traces
             .find({ sessionId })
@@ -504,7 +525,8 @@ export class SessionsService {
         };
     }
 
-    async getChunk(sessionId: string, seqStr: string, ) {
+    async getChunk(sessionId: string, appId: string, seqStr: string) {
+        await this.ensureSessionExists(sessionId, appId);
         const seq = Number(seqStr);
         if (!Number.isFinite(seq)) throw new NotFoundException('bad seq');
 
@@ -514,5 +536,10 @@ export class SessionsService {
         // data is a Buffer; return base64 for the frontend to decode
         const base64 = (doc as any).data?.toString('base64') || '';
         return { base64, tFirst: doc.tFirst, tLast: doc.tLast, seq: doc.seq };
+    }
+
+    private async ensureSessionExists(sessionId: string, appId: string) {
+        const exists = await this.sessions.exists({ _id: sessionId, appId });
+        if (!exists) throw new NotFoundException('Session not found');
     }
 }

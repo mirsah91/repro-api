@@ -11,6 +11,10 @@ import { SdkToken, SdkTokenSchema } from '../sdk/schemas/sdk-token.schema';
 import { App, AppSchema } from '../apps/schemas/app.schema';
 import {EmailEvt, EmailEvtSchema} from "./schemas/emails.schema";
 import { TraceEvt, TraceEvtSchema } from './schemas/trace.schema';
+import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
+import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
+import { AppSecretGuard } from '../common/guards/app-secret.guard';
+import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 
 @Module({
     imports: [
@@ -23,11 +27,12 @@ import { TraceEvt, TraceEvtSchema } from './schemas/trace.schema';
             { name: SdkToken.name, schema: SdkTokenSchema },
             { name: App.name, schema: AppSchema },
             { name: EmailEvt.name, schema: EmailEvtSchema },
-            { name: TraceEvt.name, schema: TraceEvtSchema }
+            { name: TraceEvt.name, schema: TraceEvtSchema },
+            { name: AppUser.name, schema: AppUserSchema }
         ]),
     ],
     controllers: [SessionsController],
-    providers: [SessionsService],
+    providers: [SessionsService, SdkTokenGuard, AppSecretGuard, AppUserTokenGuard],
     exports: [MongooseModule],
 })
 export class SessionsModule {}
