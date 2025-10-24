@@ -13,6 +13,8 @@ async function bootstrap() {
       .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }, 'sdk')
       .addApiKey({ type: 'apiKey', name: 'x-app-id', in: 'header' }, 'appId')
       .addApiKey({ type: 'apiKey', name: 'x-app-secret', in: 'header' }, 'appSecret')
+      .addApiKey({ type: 'apiKey', name: 'x-app-user-token', in: 'header' }, 'appUserToken')
+      .addApiKey({ type: 'apiKey', name: 'x-admin-token', in: 'header' }, 'adminToken')
       .build();
 
   const doc = SwaggerModule.createDocument(app, config);

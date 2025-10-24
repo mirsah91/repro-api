@@ -7,6 +7,7 @@ export class App {
     @Prop() name: string;
     @Prop() appSecret: string;
     @Prop({ default: true }) enabled: boolean;
+    @Prop() adminEmail?: string;
 }
 export type AppDocument = HydratedDocument<App>;
 export const AppSchema = SchemaFactory.createForClass(App);
