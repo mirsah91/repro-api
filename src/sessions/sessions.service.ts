@@ -173,9 +173,75 @@ export class SessionsService {
     await this.ensureSessionExists(sessionId, appId);
     const entries = Array.isArray(body?.entries) ? body.entries : [];
 
+    const actionTimeCache = new Map<string, number | null>();
+    const actionTimelineCursor = new Map<string, number>();
+
+    const normalizeActionId = (value: any): string | null => {
+      if (value === undefined || value === null) return null;
+      const str = String(value).trim();
+      return str.length ? str : null;
+    };
+
+    const getActionBaseTime = async (actionId: string): Promise<number | null> => {
+      if (actionTimeCache.has(actionId)) {
+        return actionTimeCache.get(actionId)!;
+      }
+
+      const doc = await this.actions
+        .findOne({ sessionId, actionId }, { tStart: 1, tEnd: 1 })
+        .lean()
+        .exec();
+
+      const candidates = [doc?.tStart, doc?.tEnd]
+        .map((v) => (typeof v === 'number' ? v : Number(v)))
+        .filter((v): v is number => Number.isFinite(v));
+
+      const base = candidates.length
+        ? candidates.reduce((max, cur) => (cur > max ? cur : max), candidates[0])
+        : null;
+
+      actionTimeCache.set(actionId, base);
+      return base;
+    };
+
+    const alignTimeForAction = async (
+      actionId: string | null,
+      rawTime: number,
+    ): Promise<number> => {
+      let ts = Number.isFinite(rawTime) ? rawTime : Date.now();
+      if (!actionId) {
+        return ts;
+      }
+
+      let minAllowed: number | null = null;
+      const base = await getActionBaseTime(actionId);
+      if (base !== null) {
+        minAllowed = base;
+      }
+
+      if (actionTimelineCursor.has(actionId)) {
+        const last = actionTimelineCursor.get(actionId)!;
+        minAllowed = minAllowed === null ? last : Math.max(minAllowed, last);
+      }
+
+      if (minAllowed !== null && ts <= minAllowed) {
+        ts = minAllowed + 1;
+      }
+
+      actionTimelineCursor.set(actionId, ts);
+      return ts;
+    };
+
     for (const e of entries) {
       try {
         const req = e.request;
+
+        const normalizedActionId = normalizeActionId(e.actionId);
+        const rawTime = Number(e.t);
+        const alignedTime = await alignTimeForAction(
+          normalizedActionId,
+          Number.isFinite(rawTime) ? rawTime : Date.now(),
+        );
 
         const ridCandidates = [
           req?.rid,
@@ -206,13 +272,11 @@ export class SessionsService {
             rid: resolvedRid,
           };
 
-          if (typeof e.actionId !== 'undefined') {
-            set.actionId = e.actionId ?? null;
+          if (Object.prototype.hasOwnProperty.call(e, 'actionId')) {
+            set.actionId = normalizedActionId ?? null;
           }
 
-          if (typeof e.t === 'number') {
-            set.t = e.t;
-          }
+          set.t = alignedTime;
 
           if (typeof req.method !== 'undefined') {
             set.method = req.method;
@@ -245,9 +309,9 @@ export class SessionsService {
           }
 
           const requestDoc = await this.requests.findOneAndUpdate(
-            { sessionId, rid: resolvedRid },
-            { $set: set },
-            { upsert: true, new: true, setDefaultsOnInsert: true },
+                { sessionId, rid: resolvedRid },
+                { $set: set },
+                { upsert: true, new: true, setDefaultsOnInsert: true },
           );
 
           if (requestDoc?._id) {
@@ -340,7 +404,7 @@ export class SessionsService {
 
           await this.emails.create({
             sessionId,
-            actionId: e.actionId ?? null,
+            actionId: normalizedActionId ?? null,
             provider: mail.provider || 'sendgrid',
             kind: mail.kind || 'send',
             from: mail.from ?? null,
@@ -361,7 +425,7 @@ export class SessionsService {
               typeof mail.statusCode === 'number' ? mail.statusCode : null,
             durMs: typeof mail.durMs === 'number' ? mail.durMs : null,
             headers: mail.headers ?? {},
-            t: e.t,
+            t: alignedTime,
           });
         }
 
@@ -369,13 +433,13 @@ export class SessionsService {
         for (const d of e.db ?? []) {
           await this.changes.create({
             sessionId,
-            actionId: e.actionId ?? null,
+            actionId: normalizedActionId ?? null,
             collection: d.collection,
             pk: d.pk,
             before: d.before ?? null,
             after: d.after ?? null,
             op: d.op ?? 'update',
-            t: e.t,
+            t: alignedTime,
             // NEW: persist query capture
             query: d.query ?? undefined,
             resultMeta: d.resultMeta ?? undefined,
