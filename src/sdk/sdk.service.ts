@@ -7,17 +7,21 @@ import { randomUUID } from 'crypto';
 
 @Injectable()
 export class SdkService {
-    constructor(
-        @InjectModel(App.name) private appModel: Model<App>,
-        @InjectModel(SdkToken.name) private tokenModel: Model<SdkToken>,
-    ) {}
-    async bootstrap(appId: string) {
-        const app = await this.appModel.findOne({ appId, enabled: true }).lean();
-        if (!app) return { enabled: false };
-        const token = randomUUID();
-        const exp = new Date(Date.now() + 60 * 60 * 1000);
-        await this.tokenModel.create({ appId, token, exp });
-        return { enabled: true, sdkToken: token, capture: { maskSelectors: [], maxMinutes: 5 } };
-        // keep minimal for MVP
-    }
+  constructor(
+    @InjectModel(App.name) private appModel: Model<App>,
+    @InjectModel(SdkToken.name) private tokenModel: Model<SdkToken>,
+  ) {}
+  async bootstrap(appId: string) {
+    const app = await this.appModel.findOne({ appId, enabled: true }).lean();
+    if (!app) return { enabled: false };
+    const token = randomUUID();
+    const exp = new Date(Date.now() + 60 * 60 * 1000);
+    await this.tokenModel.create({ appId, token, exp });
+    return {
+      enabled: true,
+      sdkToken: token,
+      capture: { maskSelectors: [], maxMinutes: 5 },
+    };
+    // keep minimal for MVP
+  }
 }

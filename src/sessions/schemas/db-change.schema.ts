@@ -3,40 +3,40 @@ import { HydratedDocument } from 'mongoose';
 
 @Schema({ collection: 'changes' })
 export class DbChange {
-    @Prop() sessionId: string;
-    @Prop() actionId: string;
+  @Prop() sessionId: string;
+  @Prop() actionId: string;
 
-    @Prop() collection: string;
-    @Prop() op: string; // 'find', 'updateOne', 'insert', 'deleteOne', 'aggregate', 'bulkWrite', ...
+  @Prop() collection: string;
+  @Prop() op: string; // 'find', 'updateOne', 'insert', 'deleteOne', 'aggregate', 'bulkWrite', ...
 
-    // For document diffs (existing)
-    @Prop({ type: Object }) pk?: any;
-    @Prop({ type: Object }) before?: any;
-    @Prop({ type: Object }) after?: any;
+  // For document diffs (existing)
+  @Prop({ type: Object }) pk?: any;
+  @Prop({ type: Object }) before?: any;
+  @Prop({ type: Object }) after?: any;
 
-    // NEW for generic query capture
-    @Prop({ type: Object }) query?: {
-        filter?: any;
-        update?: any;
-        projection?: any;
-        options?: any;
-        pipeline?: any[];
-        bulk?: any[];
-    };
+  // NEW for generic query capture
+  @Prop({ type: Object }) query?: {
+    filter?: any;
+    update?: any;
+    projection?: any;
+    options?: any;
+    pipeline?: any[];
+    bulk?: any[];
+  };
 
-    @Prop({ type: Object }) resultMeta?: {
-        docsCount?: number;
-        matched?: number;
-        modified?: number;
-        upsertedId?: any;
-        upserted?: number;
-        deleted?: number;
-    };
+  @Prop({ type: Object }) resultMeta?: {
+    docsCount?: number;
+    matched?: number;
+    modified?: number;
+    upsertedId?: any;
+    upserted?: number;
+    deleted?: number;
+  };
 
-    @Prop() durMs?: number;
-    @Prop({ type: Object }) error?: { message?: string; code?: any };
+  @Prop() durMs?: number;
+  @Prop({ type: Object }) error?: { message?: string; code?: any };
 
-    @Prop() t: number;
+  @Prop() t: number;
 }
 
 export type DbChangeDocument = HydratedDocument<DbChange>;
