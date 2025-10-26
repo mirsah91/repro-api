@@ -28,7 +28,10 @@ describe('Apps & App Users (integration)', () => {
       await app.init();
     } catch (err) {
       shouldSkip = true;
-      console.warn('Skipping integration tests because Mongo container failed to start.', err);
+      console.warn(
+        'Skipping integration tests because Mongo container failed to start.',
+        err,
+      );
     }
   });
 
@@ -47,7 +50,9 @@ describe('Apps & App Users (integration)', () => {
 
   it('provisions apps and manages members with guard enforcement', async () => {
     if (shouldSkip || !app) {
-      console.warn('Integration test skipped - environment does not support Docker testcontainers.');
+      console.warn(
+        'Integration test skipped - environment does not support Docker testcontainers.',
+      );
       return;
     }
     const server = app.getHttpServer();
@@ -80,9 +85,11 @@ describe('Apps & App Users (integration)', () => {
       .get('/v1/apps')
       .set('x-admin-token', adminToken)
       .expect(200)
-      .expect(res => {
+      .expect((res) => {
         expect(Array.isArray(res.body)).toBe(true);
-        expect(res.body.find((appSummary: any) => appSummary.appId === appId)).toMatchObject({
+        expect(
+          res.body.find((appSummary: any) => appSummary.appId === appId),
+        ).toMatchObject({
           name: 'integration-app',
           enabled: true,
         });
@@ -105,7 +112,7 @@ describe('Apps & App Users (integration)', () => {
       .get(`/v1/apps/${appId}`)
       .set('x-admin-token', adminToken)
       .expect(200)
-      .expect(res => {
+      .expect((res) => {
         expect(res.body).toMatchObject({
           appId,
           name: 'renamed app',
@@ -113,9 +120,7 @@ describe('Apps & App Users (integration)', () => {
         });
       });
 
-    await request(server)
-      .get(`/v1/apps/${appId}/users`)
-      .expect(403);
+    await request(server).get(`/v1/apps/${appId}/users`).expect(403);
 
     await request(server)
       .post(`/v1/apps/${appId}/users`)
@@ -126,7 +131,11 @@ describe('Apps & App Users (integration)', () => {
     const createdUser = await request(server)
       .post(`/v1/apps/${appId}/users`)
       .set('x-app-user-token', adminUserToken)
-      .send({ email: 'viewer@example.com', name: 'Viewer One', role: AppUserRole.Viewer })
+      .send({
+        email: 'viewer@example.com',
+        name: 'Viewer One',
+        role: AppUserRole.Viewer,
+      })
       .expect(201);
 
     expect(createdUser.body).toMatchObject({
@@ -148,7 +157,10 @@ describe('Apps & App Users (integration)', () => {
     expect(listUsersResponse.body).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ id: admin.id, email: 'owner@example.com' }),
-        expect.objectContaining({ id: createdUserId, email: 'viewer@example.com' }),
+        expect.objectContaining({
+          id: createdUserId,
+          email: 'viewer@example.com',
+        }),
       ]),
     );
 
