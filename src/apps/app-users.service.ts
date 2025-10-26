@@ -41,6 +41,13 @@ export class AppUsersService {
         return this.toDto(doc);
     }
 
+    // TODO: hash token
+    async canRecord(appId: string, email: string, token: string): Promise<AppUserDtoShape> {
+        const doc = await this.users.findOne({ appId, email, token }).lean();
+        if (!doc) throw new NotFoundException('User not found');
+        return this.toDto(doc);
+    }
+
     async update(
         appId: string,
         userId: string,

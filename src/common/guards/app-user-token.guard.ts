@@ -20,13 +20,20 @@ export class AppUserTokenGuard implements CanActivate {
             [ctx.getHandler(), ctx.getClass()]
         );
 
+        console.log('token --->', token)
         if (!token) return false;
 
         const appId = this.resolveAppId(req);
+        console.log('appId --->', appId)
+
         if (!appId) return false;
+        console.log('appId --->', { appId, token, enabled: true })
 
         const user = await this.users.findOne({ appId, token, enabled: true }).lean();
+        console.log('user --->', user)
+
         if (!user) return false;
+        console.log('requiredRoles --->', requiredRoles)
 
         if (requiredRoles && requiredRoles.length && !requiredRoles.includes(user.role)) {
             return false;

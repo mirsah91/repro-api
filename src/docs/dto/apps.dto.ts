@@ -103,3 +103,11 @@ export class AppKeysDto extends AppDetailDto {
     @ApiProperty({ type: AppUserDto })
     admin!: AppUserDto;
 }
+
+export class AppUserLoginDto {
+    @ApiProperty({ example: 'user@example.com' })
+    email: string;
+
+    @ApiProperty({ example: 'c0a801b2-5c0d-4c7d-9f1f-1234567890ab' })
+    token: string;
+}
