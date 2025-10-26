@@ -9,6 +9,8 @@ export class Session {
     @Prop() finishedAt?: Date;
     @Prop({ type: Object }) env?: Record<string, any>;
     @Prop() notes?: string;
+    @Prop() userId?: string;
+    @Prop() userEmail?: string;
 }
 export type SessionDocument = HydratedDocument<Session>;
 export const SessionSchema = SchemaFactory.createForClass(Session);
