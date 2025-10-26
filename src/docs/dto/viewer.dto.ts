@@ -162,6 +162,26 @@ export class DbChangeDto {
   @ApiProperty({ nullable: true, description: 'Document after' })
   after!: any;
 
+  @ApiProperty({
+    required: false,
+    type: Object,
+    additionalProperties: true,
+    description: 'Captured query details (filter/update/projection/options/pipeline)',
+  })
+  @IsOptional()
+  @IsObject()
+  query?: Record<string, any>;
+
+  @ApiProperty({
+    required: false,
+    type: Object,
+    additionalProperties: true,
+    description: 'Summary of the database call result',
+  })
+  @IsOptional()
+  @IsObject()
+  resultMeta?: Record<string, any>;
+
   @ApiProperty({ enum: DbOp })
   @IsEnum(DbOp)
   op!: DbOp;

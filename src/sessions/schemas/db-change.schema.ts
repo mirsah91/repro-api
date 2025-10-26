@@ -31,6 +31,7 @@ export class DbChange {
     upsertedId?: any;
     upserted?: number;
     deleted?: number;
+    result?: any;
   };
 
   @Prop() durMs?: number;
