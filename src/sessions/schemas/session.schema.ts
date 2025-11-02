@@ -12,6 +12,7 @@ export class Session {
   @Prop() notes?: string;
   @Prop() userId?: string;
   @Prop() userEmail?: string;
+  @Prop() clockOffsetMs?: number;
 }
 export type SessionDocument = HydratedDocument<Session>;
 export const SessionSchema = SchemaFactory.createForClass(Session);

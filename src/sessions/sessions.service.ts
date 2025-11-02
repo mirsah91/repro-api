@@ -92,6 +92,7 @@ export class SessionsService {
         _id: sessionId,
         appId,
         startedAt: new Date(serverNow),
+        clockOffsetMs,
         userId,
         userEmail: appUser?.email,
       }),
@@ -185,12 +186,30 @@ export class SessionsService {
         if (Object.prototype.hasOwnProperty.call(ev, 'respBody')) {
           set.respBody = encryptField(ev.respBody ?? null);
         }
+        if (Object.prototype.hasOwnProperty.call(ev, 'body')) {
+          set.body = encryptField(ev.body ?? null);
+        }
+        if (Object.prototype.hasOwnProperty.call(ev, 'params')) {
+          set.params = encryptField(ev.params ?? {});
+        }
+        if (Object.prototype.hasOwnProperty.call(ev, 'query')) {
+          set.query = encryptField(ev.query ?? {});
+        }
 
         await this.requests.updateOne(
           this.tenantFilter({ sessionId, rid: ev.rid }),
           { $set: set },
           { upsert: true },
         );
+
+        if (ev.aid) {
+          await this.actions
+            .updateOne(
+              this.tenantFilter({ sessionId, actionId: ev.aid }),
+              { $set: { hasReq: true } },
+            )
+            .exec();
+        }
       }
     }
     return { ok: true };
@@ -338,12 +357,30 @@ export class SessionsService {
           if (Object.prototype.hasOwnProperty.call(req, 'respBody')) {
             set.respBody = encryptField(req.respBody ?? null);
           }
+          if (Object.prototype.hasOwnProperty.call(req, 'body')) {
+            set.body = encryptField(req.body ?? null);
+          }
+          if (Object.prototype.hasOwnProperty.call(req, 'params')) {
+            set.params = encryptField(req.params ?? {});
+          }
+          if (Object.prototype.hasOwnProperty.call(req, 'query')) {
+            set.query = encryptField(req.query ?? {});
+          }
 
           const requestDoc = await this.requests.findOneAndUpdate(
             this.tenantFilter({ sessionId, rid: resolvedRid }),
             { $set: set },
             { upsert: true, new: true, setDefaultsOnInsert: true },
           );
+
+          if (normalizedActionId) {
+            await this.actions
+              .updateOne(
+                this.tenantFilter({ sessionId, actionId: normalizedActionId }),
+                { $set: { hasReq: true } },
+              )
+              .exec();
+          }
 
           if (requestDoc?._id) {
             await this.traces

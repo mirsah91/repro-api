@@ -15,6 +15,9 @@ export class RequestEvt {
   @Prop({ type: SchemaTypes.Mixed }) headers?: Record<string, any>;
   @Prop() key?: string; // normalized endpoint key
   @Prop({ type: SchemaTypes.Mixed }) respBody?: any; // captured JSON response (truncated if needed)
+  @Prop({ type: SchemaTypes.Mixed }) body?: any; // captured request payload
+  @Prop({ type: SchemaTypes.Mixed }) params?: Record<string, any>; // route params
+  @Prop({ type: SchemaTypes.Mixed }) query?: Record<string, any>; // query string params
 }
 
 export type RequestEvtDocument = HydratedDocument<RequestEvt>;

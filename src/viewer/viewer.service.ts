@@ -329,6 +329,8 @@ export class ViewerService {
       appId: s?.appId,
       startedAt: s?.startedAt,
       finishedAt: s?.finishedAt,
+      clockOffsetMs:
+        typeof s?.clockOffsetMs === 'number' ? s?.clockOffsetMs : undefined,
       rrweb, // only when include=rrweb
       actions, // unchanged
       respDiffs, // only when include=respdiffs

@@ -68,6 +68,24 @@ export class BackendRequestDto {
   @ApiProperty({ example: 500 }) status!: number;
   @ApiProperty({ example: 312 }) durMs!: number;
   @ApiProperty({ example: {} }) headers?: Record<string, any>;
+  @ApiPropertyOptional({
+    description: 'Captured request body (sanitized JSON if available)',
+    type: Object,
+    additionalProperties: true,
+  })
+  body?: any;
+  @ApiPropertyOptional({
+    description: 'Route parameters provided by the framework',
+    type: Object,
+    additionalProperties: true,
+  })
+  params?: Record<string, any>;
+  @ApiPropertyOptional({
+    description: 'Query string parameters parsed by the framework',
+    type: Object,
+    additionalProperties: true,
+  })
+  query?: Record<string, any>;
 }
 export class BackendDbChangeDto {
   @ApiProperty({ example: 'orders' }) collection!: string;
