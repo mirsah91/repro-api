@@ -3,6 +3,7 @@ import { HydratedDocument } from 'mongoose';
 
 @Schema({ collection: 'sessions', _id: false })
 export class Session {
+  @Prop({ index: true }) tenantId: string;
   @Prop({ type: String }) _id: string; // sessionId
   @Prop() appId: string;
   @Prop() startedAt: Date;
@@ -11,6 +12,7 @@ export class Session {
   @Prop() notes?: string;
   @Prop() userId?: string;
   @Prop() userEmail?: string;
+  @Prop() clockOffsetMs?: number;
 }
 export type SessionDocument = HydratedDocument<Session>;
 export const SessionSchema = SchemaFactory.createForClass(Session);

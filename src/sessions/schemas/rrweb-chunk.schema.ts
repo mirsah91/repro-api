@@ -4,6 +4,7 @@ import mongoose from 'mongoose';
 
 @Schema({ collection: 'rrweb_chunks' })
 export class RrwebChunk {
+  @Prop({ index: true }) tenantId: string;
   @Prop() sessionId: string;
   @Prop() seq: number;
   @Prop() tFirst: number;
@@ -12,4 +13,7 @@ export class RrwebChunk {
 }
 export type RrwebChunkDocument = HydratedDocument<RrwebChunk>;
 export const RrwebChunkSchema = SchemaFactory.createForClass(RrwebChunk);
-RrwebChunkSchema.index({ sessionId: 1, seq: 1 }, { unique: true });
+RrwebChunkSchema.index(
+  { tenantId: 1, sessionId: 1, seq: 1 },
+  { unique: true },
+);

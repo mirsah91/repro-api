@@ -4,6 +4,7 @@ import { SdkService } from './sdk.service';
 import { MongooseModule } from '@nestjs/mongoose';
 import { App, AppSchema } from '../apps/schemas/app.schema';
 import { SdkToken, SdkTokenSchema } from './schemas/sdk-token.schema';
+import { TenantModule } from '../common/tenant/tenant.module';
 
 @Module({
   imports: [
@@ -11,6 +12,7 @@ import { SdkToken, SdkTokenSchema } from './schemas/sdk-token.schema';
       { name: App.name, schema: AppSchema },
       { name: SdkToken.name, schema: SdkTokenSchema },
     ]),
+    TenantModule,
   ],
   controllers: [SdkController],
   providers: [SdkService],

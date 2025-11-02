@@ -1,8 +1,9 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
+import { HydratedDocument, SchemaTypes } from 'mongoose';
 
 @Schema({ collection: 'changes' })
 export class DbChange {
+  @Prop({ index: true }) tenantId: string;
   @Prop() sessionId: string;
   @Prop() actionId: string;
 
@@ -10,12 +11,12 @@ export class DbChange {
   @Prop() op: string; // 'find', 'updateOne', 'insert', 'deleteOne', 'aggregate', 'bulkWrite', ...
 
   // For document diffs (existing)
-  @Prop({ type: Object }) pk?: any;
-  @Prop({ type: Object }) before?: any;
-  @Prop({ type: Object }) after?: any;
+  @Prop({ type: SchemaTypes.Mixed }) pk?: any;
+  @Prop({ type: SchemaTypes.Mixed }) before?: any;
+  @Prop({ type: SchemaTypes.Mixed }) after?: any;
 
   // NEW for generic query capture
-  @Prop({ type: Object }) query?: {
+  @Prop({ type: SchemaTypes.Mixed }) query?: {
     filter?: any;
     update?: any;
     projection?: any;
@@ -24,7 +25,7 @@ export class DbChange {
     bulk?: any[];
   };
 
-  @Prop({ type: Object }) resultMeta?: {
+  @Prop({ type: SchemaTypes.Mixed }) resultMeta?: {
     docsCount?: number;
     matched?: number;
     modified?: number;
@@ -35,7 +36,7 @@ export class DbChange {
   };
 
   @Prop() durMs?: number;
-  @Prop({ type: Object }) error?: { message?: string; code?: any };
+  @Prop({ type: SchemaTypes.Mixed }) error?: { message?: string; code?: any };
 
   @Prop() t: number;
 }

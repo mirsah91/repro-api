@@ -7,6 +7,29 @@ export class CreateAppDto {
 
   @ApiProperty({ example: 'owner@example.com' })
   adminEmail!: string;
+
+  @ApiPropertyOptional({
+    example: 'Str0ng-and-unique!',
+    minLength: 12,
+    description:
+      'Optional. Supply to set an explicit initial admin password instead of receiving a generated one.',
+  })
+  adminPassword?: string;
+}
+
+export class InitWorkspaceDto {
+  @ApiProperty({ example: 'owner@example.com' })
+  email!: string;
+
+  @ApiPropertyOptional({ example: 'Acme Web' })
+  appName?: string;
+
+  @ApiProperty({
+    example: 'Str0ng-and-unique!',
+    minLength: 12,
+    description: 'Password for the initial admin user.',
+  })
+  password!: string;
 }
 
 export class UpdateAppDto {
@@ -18,6 +41,9 @@ export class UpdateAppDto {
 }
 
 export class AppDto {
+  @ApiProperty({ example: 'TENANT_9f034ad4-2b47-4e89-b273-17cf23a2b61e' })
+  tenantId!: string;
+
   @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
   appId!: string;
 
@@ -40,6 +66,9 @@ export class AppDto {
 export class AppDetailDto extends AppDto {
   @ApiProperty({ example: '5f1f6f9b-3e6a-4b9d-8a2b-9b0f7d' })
   appSecret!: string;
+
+  @ApiProperty({ example: 'V0Y3d0FJc0F2QURyUWxJV0ZLQ2JJNjdjTFB6WE5xYmU=' })
+  encryptionKey!: string;
 }
 
 export class AppSummaryDto extends AppDto {
@@ -51,6 +80,9 @@ export class AppUserDto {
   @ApiProperty({ example: '65f8e63c8a7a2c1d9c5e4f12' })
   id!: string;
 
+  @ApiProperty({ example: 'TENANT_9f034ad4-2b47-4e89-b273-17cf23a2b61e' })
+  tenantId!: string;
+
   @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
   appId!: string;
 
@@ -60,8 +92,12 @@ export class AppUserDto {
   @ApiProperty({ enum: AppUserRole, example: AppUserRole.Viewer })
   role!: AppUserRole;
 
-  @ApiProperty({ example: 'c0a801b2-5c0d-4c7d-9f1f-1234567890ab' })
-  token!: string;
+  @ApiPropertyOptional({
+    example: 'c0a801b2-5c0d-4c7d-9f1f-1234567890ab',
+    description:
+      'Workspace password / access token returned when initially generated or reset.',
+  })
+  password?: string;
 
   @ApiProperty({ example: true })
   enabled!: boolean;
@@ -100,8 +136,11 @@ export class UpdateAppUserDto {
   @ApiPropertyOptional({ example: false })
   enabled?: boolean;
 
-  @ApiPropertyOptional({ example: true })
-  resetToken?: boolean;
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Reset the user password and return the new value in the response.',
+  })
+  resetPassword?: boolean;
 }
 
 export class AppKeysDto extends AppDetailDto {
@@ -113,8 +152,11 @@ export class AppUserLoginDto {
   @ApiProperty({ example: 'user@example.com' })
   email: string;
 
-  @ApiProperty({ example: 'c0a801b2-5c0d-4c7d-9f1f-1234567890ab' })
-  token: string;
+  @ApiProperty({
+    example: 'c0a801b2-5c0d-4c7d-9f1f-1234567890ab',
+    description: 'Workspace password issued to the user.',
+  })
+  password: string;
 }
 
 export class AppUserLoginResponseDto {

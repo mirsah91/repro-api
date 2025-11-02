@@ -122,6 +122,34 @@ export class RequestEvtDto {
 
   @ApiProperty({
     required: false,
+    description: 'Captured request body (JSON if available; may be string)',
+    type: Object,
+    additionalProperties: true,
+  })
+  @IsOptional()
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  body?: any;
+
+  @ApiProperty({
+    required: false,
+    description: 'Framework-provided route params',
+    type: Object,
+    additionalProperties: true,
+  })
+  @IsOptional()
+  params?: Record<string, any>;
+
+  @ApiProperty({
+    required: false,
+    description: 'Parsed query string parameters',
+    type: Object,
+    additionalProperties: true,
+  })
+  @IsOptional()
+  query?: Record<string, any>;
+
+  @ApiProperty({
+    required: false,
     description: 'Captured response body (JSON if available; may be string)',
   })
   // eslint-disable-next-line @typescript-eslint/ban-types
@@ -382,6 +410,14 @@ export class FullResponseDto {
   @ApiProperty({ required: false, type: String, format: 'date-time' })
   @IsOptional()
   finishedAt?: Date;
+
+  @ApiProperty({
+    required: false,
+    description: 'Server minus client clock offset captured at session start',
+  })
+  @IsOptional()
+  @IsNumber()
+  clockOffsetMs?: number;
 
   @ApiProperty({ required: false, type: RrwebMetaDto })
   @IsOptional()

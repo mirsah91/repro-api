@@ -9,6 +9,13 @@ import { DbChange } from './schemas/db-change.schema';
 import { RrwebChunk } from './schemas/rrweb-chunk.schema';
 import { EmailEvt } from './schemas/emails.schema';
 import { TraceEvt } from './schemas/trace.schema';
+import { TenantContext } from '../common/tenant/tenant-context';
+import {
+  encryptField,
+  hydrateChangeDoc,
+  hydrateEmailDoc,
+  hydrateRequestDoc,
+} from './utils/session-data-crypto';
 
 @Injectable()
 export class SessionsService {
@@ -20,6 +27,7 @@ export class SessionsService {
     @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
+    private readonly tenant: TenantContext,
   ) {}
 
   private ensureTraceIndexPromise?: Promise<void>;
@@ -27,23 +35,27 @@ export class SessionsService {
   private ensureTraceBatchIndex(): Promise<void> {
     if (!this.ensureTraceIndexPromise) {
       this.ensureTraceIndexPromise = (async () => {
-        const legacyIndexName = 'sessionId_1_requestRid_1';
-        try {
-          await this.traces.collection.dropIndex(legacyIndexName);
-        } catch (dropErr: any) {
-          if (dropErr?.codeName !== 'IndexNotFound') {
-            // rethrow unexpected drop failures to avoid masking them
-            throw dropErr;
+        const legacyIndexes = [
+          'sessionId_1_requestRid_1',
+          'sessionId_1_requestRid_1_batchIndex_1',
+        ];
+        for (const name of legacyIndexes) {
+          try {
+            await this.traces.collection.dropIndex(name);
+          } catch (dropErr: any) {
+            if (dropErr?.codeName !== 'IndexNotFound') {
+              throw dropErr;
+            }
           }
         }
 
         try {
           await this.traces.collection.createIndex(
-            { sessionId: 1, requestRid: 1, batchIndex: 1 },
+            { tenantId: 1, sessionId: 1, requestRid: 1, batchIndex: 1 },
             {
               unique: true,
               background: true,
-              name: 'sessionId_1_requestRid_1_batchIndex_1',
+              name: 'tenantId_1_sessionId_1_requestRid_1_batchIndex_1',
             },
           );
         } catch (createErr: any) {
@@ -75,13 +87,16 @@ export class SessionsService {
           undefined)
       : undefined;
 
-    await this.sessions.create({
-      _id: sessionId,
-      appId,
-      startedAt: new Date(serverNow),
-      userId,
-      userEmail: appUser?.email,
-    });
+    await this.sessions.create(
+      this.tenantDoc({
+        _id: sessionId,
+        appId,
+        startedAt: new Date(serverNow),
+        clockOffsetMs,
+        userId,
+        userEmail: appUser?.email,
+      }),
+    );
 
     return { sessionId, clockOffsetMs };
   }
@@ -94,33 +109,38 @@ export class SessionsService {
       const tLast = Number(body.tLast ?? tFirst);
       const payload = JSON.stringify(body.events);
 
-      await this.chunks.create({
-        sessionId,
-        seq,
-        tFirst,
-        tLast,
-        data: Buffer.from(payload, 'utf8'),
-      });
+      await this.chunks.create(
+        this.tenantDoc({
+          sessionId,
+          seq,
+          tFirst,
+          tLast,
+          data: Buffer.from(payload, 'utf8'),
+        }),
+      );
 
       return { ok: true }; // done; nothing else to process in this POST
     }
 
     for (const ev of body.events ?? []) {
       if (ev.type === 'rrweb') {
-        await this.chunks.create({
-          sessionId,
-          seq: body.seq ?? ev.t,
-          tFirst: ev.t,
-          tLast: ev.t,
-          data: Buffer.from(
-            typeof ev.chunk === 'string' ? ev.chunk : JSON.stringify(ev),
-            'utf8',
-          ),
-        });
+        await this.chunks.create(
+          this.tenantDoc({
+            sessionId,
+            seq: body.seq ?? ev.t,
+            tFirst: ev.t,
+            tLast: ev.t,
+            data: Buffer.from(
+              typeof ev.chunk === 'string' ? ev.chunk : JSON.stringify(ev),
+              'utf8',
+            ),
+          }),
+        );
         continue;
       } else if (ev.type === 'action') {
         // Use $setOnInsert ONLY for fields that never appear in $set
         const setOnInsert: any = {
+          tenantId: this.tenant.tenantId,
           sessionId,
           actionId: ev.aid,
           tStart: ev.tStart ?? Date.now(),
@@ -137,7 +157,7 @@ export class SessionsService {
         if (ev.error) set.error = true;
 
         await this.actions.updateOne(
-          { sessionId, actionId: ev.aid },
+          this.tenantFilter({ sessionId, actionId: ev.aid }),
           {
             $setOnInsert: setOnInsert,
             ...(Object.keys(set).length ? { $set: set } : {}),
@@ -145,25 +165,51 @@ export class SessionsService {
           { upsert: true },
         );
       } else if (ev.type === 'net') {
+        const set: Record<string, any> = {
+          tenantId: this.tenant.tenantId,
+          sessionId,
+          actionId: ev.aid ?? null,
+          rid: ev.rid,
+          t: ev.t,
+        };
+
+        if (typeof ev.method !== 'undefined') set.method = ev.method;
+        if (typeof ev.url !== 'undefined')
+          set.url = encryptField(ev.url ?? null);
+        if (Object.prototype.hasOwnProperty.call(ev, 'status'))
+          set.status = ev.status;
+        if (Object.prototype.hasOwnProperty.call(ev, 'durMs'))
+          set.durMs = ev.durMs;
+        if (typeof ev.headers !== 'undefined')
+          set.headers = encryptField(ev.headers ?? {});
+        if (typeof ev.key !== 'undefined') set.key = ev.key ?? null;
+        if (Object.prototype.hasOwnProperty.call(ev, 'respBody')) {
+          set.respBody = encryptField(ev.respBody ?? null);
+        }
+        if (Object.prototype.hasOwnProperty.call(ev, 'body')) {
+          set.body = encryptField(ev.body ?? null);
+        }
+        if (Object.prototype.hasOwnProperty.call(ev, 'params')) {
+          set.params = encryptField(ev.params ?? {});
+        }
+        if (Object.prototype.hasOwnProperty.call(ev, 'query')) {
+          set.query = encryptField(ev.query ?? {});
+        }
+
         await this.requests.updateOne(
-          { sessionId, rid: ev.rid },
-          {
-            $set: {
-              sessionId,
-              actionId: ev.aid ?? null,
-              rid: ev.rid,
-              method: ev.method,
-              url: ev.url,
-              status: ev.status,
-              durMs: ev.durMs,
-              t: ev.t,
-              headers: ev.headers ?? {},
-              key: ev.key ?? null,
-              respBody: ev.respBody ?? undefined, // may be undefined if not JSON
-            },
-          },
+          this.tenantFilter({ sessionId, rid: ev.rid }),
+          { $set: set },
           { upsert: true },
         );
+
+        if (ev.aid) {
+          await this.actions
+            .updateOne(
+              this.tenantFilter({ sessionId, actionId: ev.aid }),
+              { $set: { hasReq: true } },
+            )
+            .exec();
+        }
       }
     }
     return { ok: true };
@@ -188,7 +234,10 @@ export class SessionsService {
       }
 
       const doc = await this.actions
-        .findOne({ sessionId, actionId }, { tStart: 1, tEnd: 1 })
+        .findOne(this.tenantFilter({ sessionId, actionId }), {
+          tStart: 1,
+          tEnd: 1,
+        })
         .lean()
         .exec();
 
@@ -268,6 +317,7 @@ export class SessionsService {
         // ---- REQUEST ----
         if (req && resolvedRid) {
           const set: Record<string, any> = {
+            tenantId: this.tenant.tenantId,
             sessionId,
             rid: resolvedRid,
           };
@@ -285,7 +335,7 @@ export class SessionsService {
           const urlCandidate =
             typeof req.url !== 'undefined' ? req.url : req.path;
           if (typeof urlCandidate !== 'undefined') {
-            set.url = urlCandidate;
+            set.url = encryptField(urlCandidate ?? null);
           }
 
           if (typeof req.status === 'number') {
@@ -297,7 +347,7 @@ export class SessionsService {
           }
 
           if (typeof req.headers !== 'undefined') {
-            set.headers = req.headers ?? {};
+            set.headers = encryptField(req.headers ?? {});
           }
 
           if (Object.prototype.hasOwnProperty.call(req, 'key')) {
@@ -305,19 +355,38 @@ export class SessionsService {
           }
 
           if (Object.prototype.hasOwnProperty.call(req, 'respBody')) {
-            set.respBody = req.respBody;
+            set.respBody = encryptField(req.respBody ?? null);
+          }
+          if (Object.prototype.hasOwnProperty.call(req, 'body')) {
+            set.body = encryptField(req.body ?? null);
+          }
+          if (Object.prototype.hasOwnProperty.call(req, 'params')) {
+            set.params = encryptField(req.params ?? {});
+          }
+          if (Object.prototype.hasOwnProperty.call(req, 'query')) {
+            set.query = encryptField(req.query ?? {});
           }
 
           const requestDoc = await this.requests.findOneAndUpdate(
-                { sessionId, rid: resolvedRid },
-                { $set: set },
-                { upsert: true, new: true, setDefaultsOnInsert: true },
+            this.tenantFilter({ sessionId, rid: resolvedRid }),
+            { $set: set },
+            { upsert: true, new: true, setDefaultsOnInsert: true },
           );
+
+          if (normalizedActionId) {
+            await this.actions
+              .updateOne(
+                this.tenantFilter({ sessionId, actionId: normalizedActionId }),
+                { $set: { hasReq: true } },
+              )
+              .exec();
+          }
 
           if (requestDoc?._id) {
             await this.traces
               .updateMany(
                 {
+                  tenantId: this.tenant.tenantId,
                   sessionId,
                   requestRid: resolvedRid,
                   $or: [{ request: { $exists: false } }, { request: null }],
@@ -347,11 +416,15 @@ export class SessionsService {
             const hasTotal = Number.isFinite(totalValue);
 
             const existingRequest = await this.requests
-              .findOne({ sessionId, rid: batchRid }, { _id: 1 })
+              .findOne(
+                this.tenantFilter({ sessionId, rid: batchRid }),
+                { _id: 1 },
+              )
               .lean()
               .exec();
 
             const setPayload: Record<string, any> = {
+              tenantId: this.tenant.tenantId,
               sessionId,
               requestRid: batchRid,
               batchIndex,
@@ -367,22 +440,26 @@ export class SessionsService {
             try {
               await this.traces
                 .updateOne(
-                  { sessionId, requestRid: batchRid, batchIndex },
+                  this.tenantFilter({
+                    sessionId,
+                    requestRid: batchRid,
+                    batchIndex,
+                  }),
                   { $set: setPayload },
                   { upsert: true },
                 )
                 .exec();
             } catch (err: any) {
-              if (
-                err?.code === 11000 &&
-                err?.keyPattern?.sessionId === 1 &&
-                err?.keyPattern?.requestRid === 1
-              ) {
+              if (err?.code === 11000) {
                 await this.ensureTraceBatchIndex();
 
                 await this.traces
                   .updateOne(
-                    { sessionId, requestRid: batchRid, batchIndex },
+                    this.tenantFilter({
+                      sessionId,
+                      requestRid: batchRid,
+                      batchIndex,
+                    }),
                     { $set: setPayload },
                     { upsert: true },
                   )
@@ -402,50 +479,79 @@ export class SessionsService {
             return Array.isArray(v) ? v : [v];
           };
 
-          await this.emails.create({
-            sessionId,
-            actionId: normalizedActionId ?? null,
-            provider: mail.provider || 'sendgrid',
-            kind: mail.kind || 'send',
-            from: mail.from ?? null,
-            to: norm(mail.to),
-            cc: norm(mail.cc),
-            bcc: norm(mail.bcc),
-            subject: mail.subject ?? '',
-            text: mail.text ?? null,
-            html: mail.html ?? null,
-            templateId: mail.templateId ?? null,
-            dynamicTemplateData: mail.dynamicTemplateData ?? null,
-            categories: Array.isArray(mail.categories) ? mail.categories : [],
-            customArgs: mail.customArgs ?? null,
-            attachmentsMeta: Array.isArray(mail.attachmentsMeta)
-              ? mail.attachmentsMeta
-              : [],
-            statusCode:
-              typeof mail.statusCode === 'number' ? mail.statusCode : null,
-            durMs: typeof mail.durMs === 'number' ? mail.durMs : null,
-            headers: mail.headers ?? {},
-            t: alignedTime,
-          });
+          const to = norm(mail.to);
+          const cc = norm(mail.cc);
+          const bcc = norm(mail.bcc);
+          const categories = Array.isArray(mail.categories)
+            ? mail.categories
+            : [];
+          const attachmentsMeta = Array.isArray(mail.attachmentsMeta)
+            ? mail.attachmentsMeta
+            : [];
+
+          await this.emails.create(
+            this.tenantDoc({
+              sessionId,
+              actionId: normalizedActionId ?? null,
+              provider: mail.provider || 'sendgrid',
+              kind: mail.kind || 'send',
+              from: encryptField(mail.from ?? null),
+              to: encryptField(to),
+              cc: encryptField(cc),
+              bcc: encryptField(bcc),
+              subject: encryptField(mail.subject ?? ''),
+              text: encryptField(mail.text ?? null),
+              html: encryptField(mail.html ?? null),
+              templateId: encryptField(mail.templateId ?? null),
+              dynamicTemplateData: encryptField(
+                mail.dynamicTemplateData ?? null,
+              ),
+              categories: encryptField(categories),
+              customArgs: encryptField(mail.customArgs ?? null),
+              attachmentsMeta: encryptField(attachmentsMeta),
+              statusCode:
+                typeof mail.statusCode === 'number' ? mail.statusCode : null,
+              durMs: typeof mail.durMs === 'number' ? mail.durMs : null,
+              headers: encryptField(mail.headers ?? {}),
+              t: alignedTime,
+            }),
+          );
         }
 
         // ---- DB CHANGES ----
         for (const d of e.db ?? []) {
-          await this.changes.create({
+          const changePayload: Record<string, any> = {
             sessionId,
             actionId: normalizedActionId ?? null,
             collection: d.collection,
-            pk: d.pk,
-            before: d.before ?? null,
-            after: d.after ?? null,
             op: d.op ?? 'update',
             t: alignedTime,
-            // NEW: persist query capture
-            query: d.query ?? undefined,
-            resultMeta: d.resultMeta ?? undefined,
-            durMs: d.durMs ?? undefined,
-            error: d.error ?? undefined,
-          });
+          };
+
+          if (typeof d.pk !== 'undefined') {
+            changePayload.pk = encryptField(d.pk ?? null);
+          }
+
+          changePayload.before = encryptField(d.before ?? null);
+          changePayload.after = encryptField(d.after ?? null);
+
+          if (typeof d.query !== 'undefined') {
+            changePayload.query = encryptField(d.query ?? null);
+          }
+
+          if (typeof d.resultMeta !== 'undefined') {
+            changePayload.resultMeta = encryptField(d.resultMeta ?? null);
+          }
+
+          if (typeof d.durMs !== 'undefined') {
+            changePayload.durMs = d.durMs;
+          }
+
+          if (typeof d.error !== 'undefined') {
+            changePayload.error = encryptField(d.error ?? null);
+          }
+
+          await this.changes.create(this.tenantDoc(changePayload));
         }
       } catch (err) {
         // isolate failures to a single entry
@@ -458,7 +564,7 @@ export class SessionsService {
 
   async finishSession(sessionId: string, appId: string, notes?: string) {
     const res = await this.sessions.findOneAndUpdate(
-      { _id: sessionId, appId },
+      this.tenantFilter({ _id: sessionId, appId }),
       { $set: { finishedAt: new Date(), notes: notes ?? '' } },
     );
     if (!res) throw new NotFoundException('Session not found');
@@ -475,7 +581,7 @@ export class SessionsService {
   ) {
     await this.ensureSessionExists(sessionId, appId);
     return this.chunks
-      .find({ sessionId, seq: { $gt: afterSeq } })
+      .find(this.tenantFilter({ sessionId, seq: { $gt: afterSeq } }))
       .sort({ seq: 1 })
       .limit(limit)
       .lean()
@@ -484,12 +590,15 @@ export class SessionsService {
 
   async getTimeline(sessionId: string, appId: string) {
     await this.ensureSessionExists(sessionId, appId);
-    const [actions, requests, db, emails] = await Promise.all([
-      this.actions.find({ sessionId }).lean().exec(),
-      this.requests.find({ sessionId }).lean().exec(),
-      this.changes.find({ sessionId }).lean().exec(),
-      this.emails.find({ sessionId }).lean().exec(),
+    const [actions, requestDocs, changeDocs, emailDocs] = await Promise.all([
+      this.actions.find(this.tenantFilter({ sessionId })).lean().exec(),
+      this.requests.find(this.tenantFilter({ sessionId })).lean().exec(),
+      this.changes.find(this.tenantFilter({ sessionId })).lean().exec(),
+      this.emails.find(this.tenantFilter({ sessionId })).lean().exec(),
     ]);
+    const requests = requestDocs.map((doc) => hydrateRequestDoc(doc));
+    const db = changeDocs.map((doc) => hydrateChangeDoc(doc));
+    const emails = emailDocs.map((doc) => hydrateEmailDoc(doc));
 
     // Flatten everything into “ticks” with a common `t` (ms, server time)
     const ticks: any[] = [];
@@ -553,9 +662,13 @@ export class SessionsService {
     await this.ensureSessionExists(sessionId, appId);
     const NULL_KEY = '__trace_null_key__';
     const traceDocs = await this.traces
-      .find({ sessionId })
+      .find(this.tenantFilter({ sessionId }))
       .sort({ requestRid: 1, batchIndex: 1 })
-      .populate({ path: 'request', select: 'key durMs status' })
+      .populate({
+        path: 'request',
+        match: { tenantId: this.tenant.tenantId },
+        select: 'key durMs status',
+      })
       .lean()
       .exec();
 
@@ -624,7 +737,9 @@ export class SessionsService {
     const seq = Number(seqStr);
     if (!Number.isFinite(seq)) throw new NotFoundException('bad seq');
 
-    const doc = await this.chunks.findOne({ sessionId, seq }).lean();
+    const doc = await this.chunks
+      .findOne(this.tenantFilter({ sessionId, seq }))
+      .lean();
     if (!doc) throw new NotFoundException('chunk not found');
 
     // data is a Buffer; return base64 for the frontend to decode
@@ -633,7 +748,21 @@ export class SessionsService {
   }
 
   private async ensureSessionExists(sessionId: string, appId: string) {
-    const exists = await this.sessions.exists({ _id: sessionId, appId });
+    const exists = await this.sessions.exists(
+      this.tenantFilter({ _id: sessionId, appId }),
+    );
     if (!exists) throw new NotFoundException('Session not found');
+  }
+
+  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+    tenantId: string;
+  } {
+    return { ...criteria, tenantId: this.tenant.tenantId };
+  }
+
+  private tenantDoc<T extends Record<string, any>>(doc: T): T & {
+    tenantId: string;
+  } {
+    return { ...doc, tenantId: this.tenant.tenantId };
   }
 }

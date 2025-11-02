@@ -1,5 +1,5 @@
 import { Body, Controller, NotFoundException, Patch, Post, Req, UseGuards } from '@nestjs/common';
-import { ApiOkResponse, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import { ApiHeader, ApiOkResponse, ApiSecurity, ApiTags } from '@nestjs/swagger';
 import { AppUsersService } from './app-users.service';
 import {
   AppUserLoginDto,
@@ -17,16 +17,27 @@ export class AppUsersAuthController {
   @ApiOkResponse({ type: AppUserLoginResponseDto })
   @Post('login')
   async login(
+    @Req() req: any,
     @Body() loginDto: AppUserLoginDto,
   ): Promise<AppUserLoginResponseDto> {
-    const { user, app } = await this.users.loginByCredentials(
-      loginDto.email,
-      loginDto.token,
-    );
-    return { user, app };
+    const tenantHeader = req?.headers?.['x-tenant-id'];
+    const headerValue = Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader;
+    const hasTenant =
+      typeof headerValue === 'string' && headerValue.trim().length > 0;
+
+    const result = hasTenant
+      ? await this.users.loginByCredentials(loginDto.email, loginDto.password)
+      : await this.users.loginWithoutTenant(loginDto.email, loginDto.password);
+
+    return result;
   }
 
   @ApiOkResponse({ type: AppUserProfileResponseDto })
+  @ApiHeader({
+    name: 'X-Tenant-Id',
+    description: 'Tenant identifier for the workspace.',
+    required: true,
+  })
   @ApiSecurity('appUserToken')
   @UseGuards(AppUserTokenGuard)
   @Patch('me')

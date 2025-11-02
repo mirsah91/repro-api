@@ -13,6 +13,7 @@ import { RrwebChunk } from '../sessions/schemas/rrweb-chunk.schema';
 import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
 import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
+import { TenantModule } from '../common/tenant/tenant.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
       { name: EmailEvt.name, schema: EmailEvtSchema },
       { name: AppUser.name, schema: AppUserSchema },
     ]),
+    TenantModule,
   ],
   controllers: [ViewerController],
   providers: [ViewerService, AppUserTokenGuard],

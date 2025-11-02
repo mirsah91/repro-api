@@ -8,7 +8,13 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
-import { ApiOkResponse, ApiParam, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import {
+  ApiHeader,
+  ApiOkResponse,
+  ApiParam,
+  ApiSecurity,
+  ApiTags,
+} from '@nestjs/swagger';
 import { AppUsersService } from './app-users.service';
 import {
   AppUserDto,
@@ -21,6 +27,11 @@ import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from './schemas/app-user.schema';
 
 @ApiTags('app-users')
+@ApiHeader({
+  name: 'X-Tenant-Id',
+  description: 'Tenant identifier for the current workspace.',
+  required: true,
+})
 @Controller('v1/apps/:appId/users')
 export class AppUsersController {
   constructor(private readonly users: AppUsersService) {}
@@ -86,13 +97,13 @@ export class AppUsersController {
   @ApiOkResponse({ type: AppUserDto })
   @Post('/canRecord')
   canRecord(@Param('appId') appId: string, @Body() loginDto: AppUserLoginDto) {
-    return this.users.canRecord(appId, loginDto.email, loginDto.token);
+    return this.users.canRecord(appId, loginDto.email, loginDto.password);
   }
 
   @ApiParam({ name: 'appId' })
   @ApiOkResponse({ type: AppUserDto })
   @Post('/login')
   login(@Param('appId') appId: string, @Body() loginDto: AppUserLoginDto) {
-    return this.users.login(appId, loginDto.email, loginDto.token);
+    return this.users.login(appId, loginDto.email, loginDto.password);
   }
 }

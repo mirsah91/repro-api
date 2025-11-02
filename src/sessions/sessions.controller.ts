@@ -1,6 +1,7 @@
 import {
   ApiBearerAuth,
   ApiBody,
+  ApiHeader,
   ApiOkResponse,
   ApiParam,
   ApiSecurity,
@@ -37,6 +38,11 @@ import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from '../apps/schemas/app-user.schema';
 
 @ApiTags('sessions')
+@ApiHeader({
+  name: 'X-Tenant-Id',
+  description: 'Tenant identifier for the workspace.',
+  required: true,
+})
 @ApiExtraModels(RrwebEventDto, ActionEventDto, NetEventDto)
 @Controller('v1')
 export class SessionsController {

@@ -8,6 +8,12 @@ import { DbChange } from '../sessions/schemas/db-change.schema';
 import { RrwebChunk } from '../sessions/schemas/rrweb-chunk.schema';
 import { FullResponseDto } from './viewer.dto';
 import { EmailEvt } from '../sessions/schemas/emails.schema';
+import { TenantContext } from '../common/tenant/tenant-context';
+import {
+  hydrateChangeDoc,
+  hydrateEmailDoc,
+  hydrateRequestDoc,
+} from '../sessions/utils/session-data-crypto';
 
 @Injectable()
 export class ViewerService {
@@ -18,6 +24,7 @@ export class ViewerService {
     @InjectModel(DbChange.name) private changes: Model<DbChange>,
     @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
+    private readonly tenant: TenantContext,
   ) {}
 
   /** ---- tiny JSON diff helper (MVP) ---- */
@@ -140,10 +147,12 @@ export class ViewerService {
   }
 
   async summary(sessionId: string, appId: string) {
-    const s = await this.sessions.findOne({ _id: sessionId, appId }).lean();
+    const s = await this.sessions
+      .findOne(this.tenantFilter({ _id: sessionId, appId }))
+      .lean();
     if (!s) throw new NotFoundException('Session not found');
     const actions = await this.actions
-      .find({ sessionId })
+      .find(this.tenantFilter({ sessionId }))
       .sort({ tStart: 1 })
       .lean();
     return { sessionId, appId: s?.appId, actions, env: s?.env ?? {} };
@@ -151,16 +160,20 @@ export class ViewerService {
 
   async actionDetails(sessionId: string, actionId: string, appId: string) {
     await this.ensureSession(sessionId, appId);
-    const a = await this.actions.findOne({ sessionId, actionId }).lean();
-    const reqs = await this.requests
-      .find({ sessionId, actionId })
+    const a = await this.actions
+      .findOne(this.tenantFilter({ sessionId, actionId }))
+      .lean();
+    const reqDocs = await this.requests
+      .find(this.tenantFilter({ sessionId, actionId }))
       .sort({ t: 1 })
       .lean();
-    const db = await this.changes
-      .find({ sessionId, actionId })
+    const dbDocs = await this.changes
+      .find(this.tenantFilter({ sessionId, actionId }))
       .sort({ t: 1 })
       .lean();
-    return { ui: a?.ui ?? {}, requests: reqs, db };
+    const requests = reqDocs.map((doc) => hydrateRequestDoc(doc));
+    const db = dbDocs.map((doc) => hydrateChangeDoc(doc));
+    return { ui: a?.ui ?? {}, requests, db };
   }
 
   async full(
@@ -173,15 +186,32 @@ export class ViewerService {
   ): Promise<FullResponseDto> {
     const appId = opts?.appId;
     if (!appId) throw new NotFoundException('Session not found');
-    const s = await this.sessions.findOne({ _id: sessionId, appId }).lean();
+    const s = await this.sessions
+      .findOne(this.tenantFilter({ _id: sessionId, appId }))
+      .lean();
     if (!s) throw new NotFoundException('Session not found');
 
-    const [acts, reqs, dbs, mails] = await Promise.all([
-      this.actions.find({ sessionId }).sort({ tStart: 1 }).lean(),
-      this.requests.find({ sessionId }).sort({ t: 1 }).lean(),
-      this.changes.find({ sessionId }).sort({ t: 1 }).lean(),
-      this.emails.find({ sessionId }).sort({ t: 1 }).lean(), // <-- new
+    const [acts, reqDocs, dbDocs, mailDocs] = await Promise.all([
+      this.actions
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ tStart: 1 })
+        .lean(),
+      this.requests
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ t: 1 })
+        .lean(),
+      this.changes
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ t: 1 })
+        .lean(),
+      this.emails
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ t: 1 })
+        .lean(), // <-- new
     ]);
+    const reqs = reqDocs.map((doc) => hydrateRequestDoc(doc));
+    const dbs = dbDocs.map((doc) => hydrateChangeDoc(doc));
+    const mails = mailDocs.map((doc) => hydrateEmailDoc(doc));
 
     const mailBy: Record<string, any[]> = {};
     for (const m of mails) (mailBy[m.actionId || ''] ||= []).push(m);
@@ -223,16 +253,18 @@ export class ViewerService {
     let rrweb: any = undefined;
     if (opts?.includeRrweb) {
       const [first] = await this.chunks
-        .find({ sessionId })
+        .find(this.tenantFilter({ sessionId }))
         .sort({ seq: 1 })
         .limit(1)
         .lean();
       const [last] = await this.chunks
-        .find({ sessionId })
+        .find(this.tenantFilter({ sessionId }))
         .sort({ seq: -1 })
         .limit(1)
         .lean();
-      const count = await this.chunks.countDocuments({ sessionId });
+      const count = await this.chunks.countDocuments(
+        this.tenantFilter({ sessionId }),
+      );
       rrweb = {
         chunks: count,
         firstSeq: first?.seq ?? null,
@@ -297,6 +329,8 @@ export class ViewerService {
       appId: s?.appId,
       startedAt: s?.startedAt,
       finishedAt: s?.finishedAt,
+      clockOffsetMs:
+        typeof s?.clockOffsetMs === 'number' ? s?.clockOffsetMs : undefined,
       rrweb, // only when include=rrweb
       actions, // unchanged
       respDiffs, // only when include=respdiffs
@@ -327,7 +361,15 @@ export class ViewerService {
   }
 
   private async ensureSession(sessionId: string, appId: string) {
-    const exists = await this.sessions.exists({ _id: sessionId, appId });
+    const exists = await this.sessions.exists(
+      this.tenantFilter({ _id: sessionId, appId }),
+    );
     if (!exists) throw new NotFoundException('Session not found');
+  }
+
+  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+    tenantId: string;
+  } {
+    return { ...criteria, tenantId: this.tenant.tenantId };
   }
 }

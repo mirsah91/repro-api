@@ -2,9 +2,19 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import * as express from 'express';
+import { readFileSync } from 'fs';
+import { createSecureLogger } from './common/security/secure-logger';
+import { requireEncryptionKey } from './common/security/encryption.util';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { cors: true });
+  requireEncryptionKey();
+  const httpsOptions = buildHttpsOptions();
+
+  const app = await NestFactory.create(AppModule, {
+    cors: true,
+    ...(httpsOptions ? { httpsOptions } : {}),
+    logger: createSecureLogger(),
+  });
   app.use(express.json({ limit: '20mb' })); // requests
   app.use(express.urlencoded({ extended: true, limit: '20mb' }));
   const config = new DocumentBuilder()
@@ -38,3 +48,32 @@ async function bootstrap() {
 }
 
 bootstrap();
+
+function buildHttpsOptions():
+  | { key: Buffer; cert: Buffer; ca?: Buffer }
+  | undefined {
+  const keyPath = process.env.TLS_KEY_PATH;
+  const certPath = process.env.TLS_CERT_PATH;
+  const caPath = process.env.TLS_CA_PATH;
+
+  if (!keyPath || !certPath) {
+    if (!process.env.DISABLE_TLS_WARNING) {
+      console.warn('[tls] TLS disabled - provide TLS_KEY_PATH and TLS_CERT_PATH to enable HTTPS');
+    }
+    return undefined;
+  }
+
+  try {
+    const options: { key: Buffer; cert: Buffer; ca?: Buffer } = {
+      key: readFileSync(keyPath),
+      cert: readFileSync(certPath),
+    };
+    if (caPath) {
+      options.ca = readFileSync(caPath);
+    }
+    return options;
+  } catch (err) {
+    console.error('[tls] Failed to read TLS materials', err);
+    return undefined;
+  }
+}
