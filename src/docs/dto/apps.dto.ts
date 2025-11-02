@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { IsOptional, IsString } from 'class-validator';
 import { AppUserRole } from '../../apps/schemas/app-user.schema';
 
 export class CreateAppDto {
@@ -178,4 +179,54 @@ export class UpdateAppUserProfileDto {
 export class AppUserProfileResponseDto {
   @ApiProperty({ type: AppUserDto })
   user!: AppUserDto;
+}
+
+export class SessionSummaryRequestDto {
+  @ApiProperty({ example: 'S_123456789abcdef' })
+  @IsString()
+  sessionId!: string;
+
+  @ApiPropertyOptional({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  @IsOptional()
+  @IsString()
+  appId?: string;
+}
+
+export class SessionSummaryResponseDto {
+  @ApiProperty({ example: 'S_123456789abcdef' })
+  sessionId!: string;
+
+  @ApiProperty({ example: 'Executive Overview: ...' })
+  summary!: string;
+
+  @ApiProperty({ example: 'gpt-4o-mini' })
+  model!: string;
+
+  @ApiProperty({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      actions: 3,
+      requests: 5,
+      dbChanges: 2,
+      emails: 1,
+      traces: 4,
+    },
+  })
+  counts!: Record<string, number>;
+
+  @ApiPropertyOptional({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      promptTokens: 1200,
+      completionTokens: 450,
+      totalTokens: 1650,
+    },
+  })
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
 }

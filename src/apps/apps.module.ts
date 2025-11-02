@@ -10,12 +10,25 @@ import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 import { AppUsersAuthController } from './app-users-auth.controller';
 import { InitController } from './init.controller';
 import { TenantModule } from '../common/tenant/tenant.module';
+import { Session, SessionSchema } from '../sessions/schemas/session.schema';
+import { Action, ActionSchema } from '../sessions/schemas/action.schema';
+import { RequestEvt, RequestEvtSchema } from '../sessions/schemas/request.schema';
+import { DbChange, DbChangeSchema } from '../sessions/schemas/db-change.schema';
+import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
+import { TraceEvt, TraceEvtSchema } from '../sessions/schemas/trace.schema';
+import { SessionSummaryService } from './session-summary.service';
 
 @Module({
   imports: [
     MongooseModule.forFeature([
       { name: App.name, schema: AppSchema },
       { name: AppUser.name, schema: AppUserSchema },
+      { name: Session.name, schema: SessionSchema },
+      { name: Action.name, schema: ActionSchema },
+      { name: RequestEvt.name, schema: RequestEvtSchema },
+      { name: DbChange.name, schema: DbChangeSchema },
+      { name: EmailEvt.name, schema: EmailEvtSchema },
+      { name: TraceEvt.name, schema: TraceEvtSchema },
     ]),
     TenantModule,
   ],
@@ -25,7 +38,12 @@ import { TenantModule } from '../common/tenant/tenant.module';
     AppUsersAuthController,
     InitController,
   ],
-  providers: [AppsService, AppUsersService, AppUserTokenGuard],
+  providers: [
+    AppsService,
+    AppUsersService,
+    AppUserTokenGuard,
+    SessionSummaryService,
+  ],
   exports: [MongooseModule],
 })
 export class AppsModule {}
