@@ -18,14 +18,14 @@ services:
       - mongo
     ports:
       - "${PORT:-4000}:4000"
+    env_file:
+      - .env
     environment:
       # override for container networking
-      MONGO_URI: "mongodb://mongo:27017/repro"
-      PORT: "${PORT:-4000}"
-      ADMIN_TOKEN: "${ADMIN_TOKEN:-change-me}"
-      APP_URL: "${APP_URL:-http://localhost:4000}"
-    # if you keep a local .env, you can also include:
-    # env_file: .env
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/repro}
+      PORT: ${PORT:-4000}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me}
+      APP_URL: ${APP_URL:-http://localhost:4000}
     restart: unless-stopped
 
 volumes:

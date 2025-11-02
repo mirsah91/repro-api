@@ -15,6 +15,7 @@ import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
+import { TenantModule } from '../common/tenant/tenant.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
       { name: TraceEvt.name, schema: TraceEvtSchema },
       { name: AppUser.name, schema: AppUserSchema },
     ]),
+    TenantModule,
   ],
   controllers: [SessionsController],
   providers: [

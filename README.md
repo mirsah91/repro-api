@@ -1,98 +1,92 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Repro API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+This service powers multi-tenant session capture and analytics for the Repro platform. The API now enforces strict tenant isolation, encrypts sensitive data both in transit and at rest, and requires clients to identify themselves with tenant-aware credentials on every request.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Key Capabilities
 
-## Description
+- **Tenant isolation** – every document stored in MongoDB is tagged with a `tenantId`. Guards resolve the tenant from request headers and the `TenantContext` wiring ensures services never have to pass tenant identifiers by hand.
+- **Encrypted secrets** – app secrets, SDK tokens, and app user tokens are persisted as HMAC digests plus AES-256-GCM ciphertext. Log files are written with the same cipher (
+  see `common/security/secure-logger.ts`).
+- **TLS everywhere** – the Nest HTTP server can terminate TLS and the MongoDB driver negotiates TLS connections by default. Plain HTTP and non-TLS drivers are supported for local development but not recommended for production.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Environment Variables
 
-## Project setup
+| Variable | Required | Description |
+| --- | --- | --- |
+| `DATA_ENCRYPTION_KEY` | ✅ | 32-byte secret (raw, hex, or base64). Used to derive symmetric keys for encrypting app secrets, tokens, and log files. The process will exit if it is not set. |
+| `MONGO_URI` | ✅ | Mongo connection string with database name (e.g. `mongodb+srv://.../repro`). |
+| `MONGO_TLS` | Optional (default `true`) | Set to `false` to disable driver TLS in development. |
+| `MONGO_TLS_CA` | Optional | Path to a CA bundle used when `MONGO_TLS` is enabled. |
+| `MONGO_TLS_ALLOW_INVALID_CERTS` | Optional | Set to `true` when using self-signed certificates in non-production environments. |
+| `TLS_KEY_PATH` / `TLS_CERT_PATH` | Optional | When both are supplied, Nest will boot in HTTPS mode using the provided PEM files. |
+| `TLS_CA_PATH` | Optional | Additional CA bundle for HTTPS clients. |
+| `SECURE_LOG_DIR` / `SECURE_LOG_FILE` | Optional | Override the default location (`logs/secure.log.enc`) for AES-encrypted audit logs. |
 
-```bash
-$ npm install
+## Request Headers
+
+All requests that interact with tenant data must include `X-Tenant-Id`. Other guards continue to enforce the existing headers (`Authorization`, `X-App-Id`, `X-App-Secret`, `X-App-User-Token`, etc.).
+
+```
+X-Tenant-Id: TENANT_...
+Authorization: Bearer <sdk-token>
+X-App-User-Token: <workspace password>
 ```
 
-## Compile and run the project
+Admin operations now rely on the same workspace credential flow: supply the admin user's `X-App-User-Token` (the generated password) together with `X-Tenant-Id` to manage apps, rotate keys, and invite teammates.
+
+## Client Registration Flow
+
+1. `POST /init` provisions a new tenant using `{ email, appName?, password }`. The response includes:
+   - `tenantId`
+   - `appSecret` (plain text, returned once)
+   - `encryptionKey` (per-tenant data key managed by the API)
+   - An initial admin user that reuses the password you supplied (or a generated one when omitted)
+2. The tenant id must be stored by the client and attached to every future Repro SDK call via the `X-Tenant-Id` header.
+
+## Data Storage Changes
+
+- **Apps (`apps` collection)**: now contain `tenantId`, `appSecretHash`, `appSecretEnc`, and `encryptionKeyEnc` fields.
+- **App Users (`app_users`)**: new `tenantId`, `tokenHash`, and `tokenEnc` fields. Existing tokens must be reset (the API re-encrypts new ones automatically).
+- **Sessions & Observability**: all session-related collections include `tenantId` and their indexes were updated to scope uniqueness to the tenant.
+- **SDK Tokens**: persisted as `(tenantId, appId, tokenHash, tokenEnc)`.
+
+Indexes were updated to include `tenantId`. Allow MongoDB to rebuild background indexes after deploying these changes.
+
+## TLS Configuration
+
+When `TLS_KEY_PATH` and `TLS_CERT_PATH` are set, the API serves HTTPS traffic. For local testing, you can generate a self-signed cert:
 
 ```bash
-# development
-$ npm run start
+openssl req -x509 -nodes -newkey rsa:4096 \
+  -keyout ./certs/api-key.pem \
+  -out ./certs/api-cert.pem \
+  -days 365 \
+  -subj "/CN=localhost"
 
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+export TLS_KEY_PATH=./certs/api-key.pem
+export TLS_CERT_PATH=./certs/api-cert.pem
+export MONGO_TLS=false # if using a local Mongo without TLS
+npm run start:dev
 ```
 
-## Run tests
+## Development Notes
+
+- `TenantContext` (request scoped) resolves the tenant id once and makes it available everywhere via dependency injection. Avoid threading tenant ids through method parameters.
+- Guards (`AppSecretGuard`, `SdkTokenGuard`, `AppUserTokenGuard`) verify both the credential and the tenant id before populating the request context.
+- Logs written through `createSecureLogger()` are AES-encrypted line-by-line. Enable the logger by default via `main.ts`.
+
+## Running Locally
 
 ```bash
-# unit tests
-$ npm run test
+cp .env.example .env
+echo "DATA_ENCRYPTION_KEY=$(openssl rand -base64 32)" >> .env
+echo "MONGO_URI=mongodb://localhost:27017/repro" >> .env
 
-# e2e tests
-$ npm run test:e2e
+# optional dev shortcuts
+echo "MONGO_TLS=false" >> .env
 
-# test coverage
-$ npm run test:cov
+npm install
+npm run start:dev
 ```
 
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Ensure your SDKs (React, Nest, Node) attach the tenant header – refer to their READMEs for configuration details.

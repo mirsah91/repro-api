@@ -4,6 +4,9 @@ import { RequestEvt } from './request.schema';
 
 @Schema({ collection: 'traces' })
 export class TraceEvt {
+  @Prop({ index: true })
+  tenantId!: string;
+
   @Prop({ required: true })
   sessionId!: string;
 
@@ -24,8 +27,8 @@ export type TraceEvtDocument = HydratedDocument<TraceEvt>;
 export const TraceEvtSchema = SchemaFactory.createForClass(TraceEvt);
 
 TraceEvtSchema.index(
-  { sessionId: 1, requestRid: 1, batchIndex: 1 },
+  { tenantId: 1, sessionId: 1, requestRid: 1, batchIndex: 1 },
   { unique: true },
 );
-TraceEvtSchema.index({ sessionId: 1, requestRid: 1 });
-TraceEvtSchema.index({ sessionId: 1 });
+TraceEvtSchema.index({ tenantId: 1, sessionId: 1, requestRid: 1 });
+TraceEvtSchema.index({ tenantId: 1, sessionId: 1 });

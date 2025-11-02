@@ -1,4 +1,9 @@
-import { ApiOkResponse, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import {
+  ApiHeader,
+  ApiOkResponse,
+  ApiSecurity,
+  ApiTags,
+} from '@nestjs/swagger';
 import {
   CreateAppDto,
   AppKeysDto,
@@ -17,7 +22,9 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
-import { AdminTokenGuard } from '../common/guards/admin-token.guard';
+import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
+import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
+import { AppUserRole } from './schemas/app-user.schema';
 
 @ApiTags('apps')
 @Controller('v1/apps')
@@ -27,36 +34,60 @@ export class AppsController {
   @ApiOkResponse({ type: AppKeysDto })
   @Post()
   async create(@Body() body: CreateAppDto) {
-    return this.svc.createApp(body?.name, body.adminEmail);
+    return this.svc.createApp(body?.name, body.adminEmail, body.adminPassword);
   }
 
   @ApiOkResponse({ type: AppDto, isArray: true })
-  @ApiSecurity('adminToken')
-  @UseGuards(AdminTokenGuard)
+  @ApiSecurity('appUserToken')
+  @ApiHeader({
+    name: 'X-Tenant-Id',
+    description: 'Tenant identifier for the workspace.',
+    required: true,
+  })
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin)
   @Get()
   list() {
     return this.svc.listApps();
   }
 
   @ApiOkResponse({ type: AppDetailDto })
-  @ApiSecurity('adminToken')
-  @UseGuards(AdminTokenGuard)
+  @ApiSecurity('appUserToken')
+  @ApiHeader({
+    name: 'X-Tenant-Id',
+    description: 'Tenant identifier for the workspace.',
+    required: true,
+  })
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin)
   @Get(':appId')
   get(@Param('appId') appId: string) {
     return this.svc.getApp(appId);
   }
 
   @ApiOkResponse({ type: AppDetailDto })
-  @ApiSecurity('adminToken')
-  @UseGuards(AdminTokenGuard)
+  @ApiSecurity('appUserToken')
+  @ApiHeader({
+    name: 'X-Tenant-Id',
+    description: 'Tenant identifier for the workspace.',
+    required: true,
+  })
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin)
   @Patch(':appId')
   update(@Param('appId') appId: string, @Body() body: UpdateAppDto) {
     return this.svc.updateApp(appId, body);
   }
 
   @ApiOkResponse({ schema: { example: { deleted: true } } })
-  @ApiSecurity('adminToken')
-  @UseGuards(AdminTokenGuard)
+  @ApiSecurity('appUserToken')
+  @ApiHeader({
+    name: 'X-Tenant-Id',
+    description: 'Tenant identifier for the workspace.',
+    required: true,
+  })
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin)
   @Delete(':appId')
   remove(@Param('appId') appId: string) {
     return this.svc.removeApp(appId);

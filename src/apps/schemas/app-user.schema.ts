@@ -9,16 +9,17 @@ export enum AppUserRole {
 
 @Schema({ timestamps: true, collection: 'app_users' })
 export class AppUser {
+  @Prop({ index: true }) tenantId!: string;
   @Prop({ index: true }) appId!: string;
 
-  @Prop({ required: true, unique: true })
+  @Prop({ required: true })
   email!: string;
 
   @Prop({ enum: AppUserRole, default: AppUserRole.Viewer })
   role!: AppUserRole;
 
-  @Prop({ required: true })
-  token!: string;
+  @Prop({ required: true }) tokenHash!: string;
+  @Prop({ required: true }) tokenEnc!: string;
 
   @Prop({ default: true })
   enabled!: boolean;
@@ -30,8 +31,11 @@ export class AppUser {
 export type AppUserDocument = HydratedDocument<AppUser>;
 export const AppUserSchema = SchemaFactory.createForClass(AppUser);
 
-AppUserSchema.index({ email: 1 }, { unique: true, name: 'uniq_email' });
 AppUserSchema.index(
-  { appId: 1, token: 1 },
+  { tenantId: 1, email: 1 },
+  { unique: true, name: 'uniq_tenant_email' },
+);
+AppUserSchema.index(
+  { tenantId: 1, appId: 1, tokenHash: 1 },
   { unique: true, name: 'uniq_app_token' },
 );

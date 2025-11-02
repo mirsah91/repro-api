@@ -3,6 +3,7 @@ import { HydratedDocument } from 'mongoose';
 
 @Schema({ collection: 'sessions', _id: false })
 export class Session {
+  @Prop({ index: true }) tenantId: string;
   @Prop({ type: String }) _id: string; // sessionId
   @Prop() appId: string;
   @Prop() startedAt: Date;
