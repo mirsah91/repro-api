@@ -8,6 +8,59 @@ This service powers multi-tenant session capture and analytics for the Repro pla
 - **Encrypted secrets** – app secrets, SDK tokens, and app user tokens are persisted as HMAC digests plus AES-256-GCM ciphertext. Log files are written with the same cipher (
   see `common/security/secure-logger.ts`).
 - **TLS everywhere** – the Nest HTTP server can terminate TLS and the MongoDB driver negotiates TLS connections by default. Plain HTTP and non-TLS drivers are supported for local development but not recommended for production.
+## Encryption Architecture
+
+Repro uses a single symmetric master key to protect tenant credentials, SDK tokens, session payloads, and secure audit logs. The key is supplied via `DATA_ENCRYPTION_KEY`, normalized to 32 bytes, and cached in process memory (`src/common/security/encryption.util.ts`). AES-256-GCM provides confidentiality and integrity, while HMAC-SHA256 enables constant-time secret lookups.
+
+```mermaid
+flowchart TD
+    subgraph runtime["Repro API Runtime"]
+        envKey["DATA_ENCRYPTION_KEY (environment variable)"]
+        derive["deriveKey() sha256(normalize(key))"]
+        aes["AES-256-GCM encryptString()/decryptString()"]
+        hmac["HMAC-SHA256 hashSecret()"]
+    end
+
+    subgraph mongo["MongoDB Collections"]
+        apps["apps appSecretHash appSecretEnc encryptionKeyEnc"]
+        appUsers["app_users tokenHash tokenEnc"]
+        sdkTokens["sdk_tokens tokenHash tokenEnc"]
+        sessions["sessions + sub-collections encrypted payload fields"]
+        logs["Encrypted audit log file secure.log.enc"]
+    end
+
+    envKey --> derive --> aes
+    derive --> hmac
+    aes --> |ciphertext| apps
+    aes --> |ciphertext| appUsers
+    aes --> |ciphertext| sdkTokens
+    aes --> |ciphertext| sessions
+    aes --> |ciphertext| logs
+    hmac --> |digest| apps
+    hmac --> |digest| appUsers
+    hmac --> |digest| sdkTokens
+```
+
+### Key Derivation
+- `DATA_ENCRYPTION_KEY` accepts raw, hex, or base64 encodings; the service rejects startup if it is missing (`src/common/security/encryption.util.ts:17`).
+- `deriveKey()` squeezes the input to 32 bytes with SHA-256 and caches the result per process.
+
+### Secret & Token Storage
+- `apps` collection stores both `appSecretHash` (HMAC) and `appSecretEnc` (AES), along with a per-tenant `encryptionKeyEnc` used by clients (`src/apps/apps.service.ts:42`).
+- `app_users` and `sdk_tokens` store their credential digests and ciphertext, allowing authentication with hashes while retaining recoverable plaintext when required (`src/apps/app-users.service.ts:94`, `src/sdk/sdk.service.ts:26`).
+
+### Session Data Protection
+- Request/response metadata, headers, bodies, email payloads, database diffs, and other sensitive traces are wrapped with `encryptField()` before persistence (`src/sessions/sessions.service.ts:168`, `src/sessions/utils/session-data-crypto.ts:6`).
+- Hydrator helpers reverse the process when documents are read, tolerating legacy or malformed records gracefully.
+
+### Secure Audit Logging
+- `createSecureLogger()` encrypts JSON log entries line-by-line before writing to disk, ensuring operational telemetry cannot leak secrets (`src/common/security/secure-logger.ts`).
+
+### Benefits
+- Protects user credentials and tenant keys even if MongoDB is exfiltrated; attackers need both ciphertext and the environment master key.
+- Prevents tampering—GCM authentication tags cause decryption failures if data is modified.
+- Limits insider access by hiding PII within session payloads and email captures.
+- Ensures sensitive diagnostics remain private while still available for authorized troubleshooting.
 
 ## Environment Variables
 

@@ -7,7 +7,10 @@ import {
   AppUserLoginDto,
   AppUserLoginResponseDto,
   InitWorkspaceDto,
+  SessionSummaryRequestDto,
+  SessionSummaryResponseDto,
 } from '../docs/dto/apps.dto';
+import { SessionSummaryService } from './session-summary.service';
 
 @ApiTags('init')
 @Controller('init')
@@ -15,6 +18,7 @@ export class InitController {
   constructor(
     private readonly apps: AppsService,
     private readonly users: AppUsersService,
+    private readonly summaries: SessionSummaryService,
   ) {}
 
   @ApiOkResponse({ type: AppKeysDto })
@@ -38,5 +42,15 @@ export class InitController {
       body.password,
     );
     return { user, app };
+  }
+
+  @ApiOkResponse({ type: SessionSummaryResponseDto })
+  @Post('session-summary')
+  async summarizeSession(
+    @Body() body: SessionSummaryRequestDto,
+  ): Promise<SessionSummaryResponseDto> {
+    return this.summaries.summarizeSession(body.sessionId, {
+      appId: body.appId,
+    });
   }
 }
