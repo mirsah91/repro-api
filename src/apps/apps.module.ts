@@ -16,7 +16,7 @@ import { RequestEvt, RequestEvtSchema } from '../sessions/schemas/request.schema
 import { DbChange, DbChangeSchema } from '../sessions/schemas/db-change.schema';
 import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
 import { TraceEvt, TraceEvtSchema } from '../sessions/schemas/trace.schema';
-import { SessionSummaryService } from './session-summary.service';
+import { SessionSummaryService } from '../sessions/session-summary.service';
 
 @Module({
   imports: [

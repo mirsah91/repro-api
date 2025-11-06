@@ -48,8 +48,8 @@ import { AppUserRole } from '../apps/schemas/app-user.schema';
 export class SessionsController {
   constructor(private svc: SessionsService) {}
 
-  @ApiBearerAuth('sdk')
-  @ApiSecurity('appUserToken')
+  @ApiSecurity('sdkToken')
+  @ApiBearerAuth('appUser')
   @ApiOkResponse({ type: StartSessionRespDto })
   @UseGuards(SdkTokenGuard, AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Recorder)
@@ -58,8 +58,8 @@ export class SessionsController {
     return this.svc.startSession(req.appId, body?.clientTime, req.appUser);
   }
 
-  @ApiBearerAuth('sdk')
-  @ApiSecurity('appUserToken')
+  @ApiSecurity('sdkToken')
+  @ApiBearerAuth('appUser')
   @ApiParam({ name: 'sid' })
   @ApiBody({ type: AppendEventsDto })
   @ApiOkResponse({ schema: { example: { ok: true } } })
@@ -89,8 +89,8 @@ export class SessionsController {
     return this.svc.ingestBackend(sid, req.appId, body);
   }
 
-  @ApiBearerAuth('sdk')
-  @ApiSecurity('appUserToken')
+  @ApiSecurity('sdkToken')
+  @ApiBearerAuth('appUser')
   @ApiParam({ name: 'sid' })
   @ApiBody({ type: FinishSessionDto })
   @ApiOkResponse({ type: FinishSessionRespDto })
@@ -105,7 +105,7 @@ export class SessionsController {
     return this.svc.finishSession(sid, req.appId, body?.notes);
   }
 
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
@@ -138,7 +138,7 @@ export class SessionsController {
     };
   }
 
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
@@ -147,7 +147,7 @@ export class SessionsController {
     return this.svc.getTimeline(sessionId, req.appId);
   }
 
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
@@ -156,7 +156,7 @@ export class SessionsController {
     return this.svc.getTracesBySession(sessionId, req.appId);
   }
 
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)

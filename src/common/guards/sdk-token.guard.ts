@@ -11,7 +11,9 @@ export class SdkTokenGuard implements CanActivate {
   ) {}
   async canActivate(ctx: ExecutionContext) {
     const req = ctx.switchToHttp().getRequest();
-    const auth = (req.headers.authorization || '').replace('Bearer ', '');
+    const headerToken = extractHeader(req.headers['x-sdk-token']);
+    const bearerToken = extractBearer(req.headers['authorization']);
+    const auth = headerToken ?? bearerToken;
     const tenantId = extractHeader(req.headers['x-tenant-id']);
     if (!auth || !tenantId) return false;
     const tok = await this.tokenModel
@@ -32,4 +34,13 @@ function extractHeader(value: unknown): string | undefined {
   if (Array.isArray(value)) return value[0];
   if (typeof value === 'string' && value.trim()) return value.trim();
   return undefined;
+}
+
+function extractBearer(value: unknown): string | undefined {
+  const header = extractHeader(value);
+  if (!header) return undefined;
+  if (!/^bearer\s+/i.test(header)) {
+    return undefined;
+  }
+  return header.replace(/^bearer\s+/i, '').trim();
 }

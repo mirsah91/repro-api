@@ -8,18 +8,18 @@ import { InjectModel } from '@nestjs/mongoose';
 import { ConfigService } from '@nestjs/config';
 import { Model } from 'mongoose';
 import OpenAI from 'openai';
-import { Session } from '../sessions/schemas/session.schema';
-import { Action } from '../sessions/schemas/action.schema';
-import { RequestEvt } from '../sessions/schemas/request.schema';
-import { DbChange } from '../sessions/schemas/db-change.schema';
-import { EmailEvt } from '../sessions/schemas/emails.schema';
-import { TraceEvt } from '../sessions/schemas/trace.schema';
+import { Session } from './schemas/session.schema';
+import { Action } from './schemas/action.schema';
+import { RequestEvt } from './schemas/request.schema';
+import { DbChange } from './schemas/db-change.schema';
+import { EmailEvt } from './schemas/emails.schema';
+import { TraceEvt } from './schemas/trace.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
 import {
   hydrateChangeDoc,
   hydrateEmailDoc,
   hydrateRequestDoc,
-} from '../sessions/utils/session-data-crypto';
+} from './utils/session-data-crypto';
 
 const STRING_TRUNCATION_LENGTH = 4000;
 
@@ -56,12 +56,6 @@ export class SessionSummaryService {
       throw new BadRequestException('sessionId is required');
     }
 
-    const q = this.tenantFilter({
-          _id: sessionId,
-          ...(opts?.appId ? { appId: opts.appId } : {}),
-        });
-
-    console.log('query ==>', JSON.stringify(q))
     const sessionDoc = await this.sessions
       .findOne(
         this.tenantFilter({
@@ -273,7 +267,7 @@ export class SessionSummaryService {
       return `${value.slice(
         0,
         STRING_TRUNCATION_LENGTH,
-      )}… [truncated for prompt length]`;
+      )}\u2026 [truncated for prompt length]`;
     }
     return value;
   }

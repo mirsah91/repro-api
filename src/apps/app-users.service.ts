@@ -6,6 +6,9 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { randomUUID } from 'crypto';
+import { ConfigService } from '@nestjs/config';
+import { signJwt } from '../common/security/jwt.util';
+import { AppUserJwtPayload } from '../common/security/app-user-jwt.interface';
 import {
   AppUser,
   AppUserDocument,
@@ -44,6 +47,7 @@ export interface AppUserDtoShape {
   name?: string;
   createdAt?: Date;
   updatedAt?: Date;
+  accessToken?: string;
 }
 
 export interface AppSummaryShape {
@@ -65,6 +69,7 @@ export class AppUsersService {
     @InjectModel(AppUser.name) private readonly users: Model<AppUserDocument>,
     @InjectModel(App.name) private readonly apps: Model<AppDocument>,
     private readonly tenant: TenantContext,
+    private readonly config: ConfigService,
   ) {}
 
   async list(appId: string): Promise<AppUserDtoShape[]> {
@@ -161,6 +166,7 @@ export class AppUsersService {
     if (!doc) throw new NotFoundException('Invalid credentials');
 
     const user = this.toDto(doc, normalizedPassword);
+    const accessToken = this.issueAccessToken(doc);
     const appDoc = await this.apps
       .findOne(this.withTenantFilter({ appId: user.appId }))
       .lean<{
@@ -176,7 +182,7 @@ export class AppUsersService {
     const app = appDoc
       ? this.toAppDto(appDoc, user.role === AppUserRole.Admin)
       : this.toFallbackApp(user.appId);
-    return { user, app };
+    return { user: { ...user, accessToken }, app };
   }
 
   async loginWithoutTenant(
@@ -198,6 +204,7 @@ export class AppUsersService {
 
     this.tenant.setTenantId(doc.tenantId);
     const user = this.toDto(doc, normalizedPassword);
+    const accessToken = this.issueAccessToken(doc);
 
     const appDoc = await this.apps
       .findOne({ tenantId: doc.tenantId, appId: doc.appId })
@@ -215,8 +222,7 @@ export class AppUsersService {
     const app = appDoc
       ? this.toAppDto(appDoc, user.role === AppUserRole.Admin)
       : this.toFallbackApp(user.appId);
-
-    return { user, app };
+    return { user: { ...user, accessToken }, app };
   }
 
   async updateProfile(
@@ -420,6 +426,55 @@ export class AppUsersService {
       name: appId,
       enabled: true,
     };
+  }
+
+  private issueAccessToken(doc: StoredAppUser): string {
+    const { secret, expiresInSeconds } = this.resolveJwtSettings();
+    const payload: AppUserJwtPayload = {
+      sub: String(doc._id),
+      tenantId: doc.tenantId,
+      appId: doc.appId,
+      role: doc.role,
+      email: doc.email,
+      tokenHash: doc.tokenHash,
+    };
+    return signJwt<AppUserJwtPayload>(payload, secret, {
+      expiresInSeconds,
+      issuer: 'repro-api',
+      subject: payload.sub,
+      audience: doc.tenantId,
+    });
+  }
+
+  private resolveJwtSettings(): { secret: string; expiresInSeconds: number } {
+    const secret = this.config.get<string>('APP_USER_JWT_SECRET');
+    if (!secret) {
+      throw new Error('APP_USER_JWT_SECRET must be configured');
+    }
+    const raw = this.config.get<string>('APP_USER_JWT_EXPIRES_IN')?.trim() || '12h';
+    const expiresInSeconds = this.parseDuration(raw);
+    return { secret, expiresInSeconds };
+  }
+
+  private parseDuration(input: string): number {
+    const trimmed = input.trim();
+    const match = /^([0-9]+)([smhd])?$/.exec(trimmed);
+    if (!match) {
+      const asNumber = Number(trimmed);
+      if (!Number.isFinite(asNumber) || asNumber <= 0) {
+        return 60 * 60 * 12; // default 12h
+      }
+      return Math.floor(asNumber);
+    }
+    const value = Number(match[1]);
+    const unit = match[2] ?? 's';
+    const multipliers: Record<string, number> = {
+      s: 1,
+      m: 60,
+      h: 60 * 60,
+      d: 60 * 60 * 24,
+    };
+    return Math.floor(value * (multipliers[unit] ?? 1));
   }
 
   private handleDuplicateEmailError(err: unknown): never {
