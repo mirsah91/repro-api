@@ -100,6 +100,12 @@ export class AppUserDto {
   })
   password?: string;
 
+  @ApiPropertyOptional({
+    example: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+    description: 'JWT bearer token for authenticated API requests.',
+  })
+  accessToken?: string;
+
   @ApiProperty({ example: true })
   enabled!: boolean;
 

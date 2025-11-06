@@ -9,10 +9,10 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import {
+  ApiBearerAuth,
   ApiHeader,
   ApiOkResponse,
   ApiParam,
-  ApiSecurity,
   ApiTags,
 } from '@nestjs/swagger';
 import { AppUsersService } from './app-users.service';
@@ -37,7 +37,7 @@ export class AppUsersController {
   constructor(private readonly users: AppUsersService) {}
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ type: AppUserDto, isArray: true })
@@ -47,7 +47,7 @@ export class AppUsersController {
   }
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ type: AppUserDto })
@@ -57,7 +57,7 @@ export class AppUsersController {
   }
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ type: AppUserDto })
@@ -67,7 +67,7 @@ export class AppUsersController {
   }
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ type: AppUserDto })
@@ -81,7 +81,7 @@ export class AppUsersController {
   }
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ schema: { example: { deleted: true } } })
@@ -91,7 +91,7 @@ export class AppUsersController {
   }
 
   @ApiParam({ name: 'appId' })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Recorder)
   @ApiOkResponse({ type: AppUserDto })

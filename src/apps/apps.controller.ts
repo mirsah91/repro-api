@@ -1,7 +1,7 @@
 import {
+  ApiBearerAuth,
   ApiHeader,
   ApiOkResponse,
-  ApiSecurity,
   ApiTags,
 } from '@nestjs/swagger';
 import {
@@ -38,7 +38,7 @@ export class AppsController {
   }
 
   @ApiOkResponse({ type: AppDto, isArray: true })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiHeader({
     name: 'X-Tenant-Id',
     description: 'Tenant identifier for the workspace.',
@@ -52,7 +52,7 @@ export class AppsController {
   }
 
   @ApiOkResponse({ type: AppDetailDto })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiHeader({
     name: 'X-Tenant-Id',
     description: 'Tenant identifier for the workspace.',
@@ -66,7 +66,7 @@ export class AppsController {
   }
 
   @ApiOkResponse({ type: AppDetailDto })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiHeader({
     name: 'X-Tenant-Id',
     description: 'Tenant identifier for the workspace.',
@@ -80,7 +80,7 @@ export class AppsController {
   }
 
   @ApiOkResponse({ schema: { example: { deleted: true } } })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiHeader({
     name: 'X-Tenant-Id',
     description: 'Tenant identifier for the workspace.',

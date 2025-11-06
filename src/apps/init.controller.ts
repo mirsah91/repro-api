@@ -10,7 +10,7 @@ import {
   SessionSummaryRequestDto,
   SessionSummaryResponseDto,
 } from '../docs/dto/apps.dto';
-import { SessionSummaryService } from './session-summary.service';
+import { SessionSummaryService } from '../sessions/session-summary.service';
 
 @ApiTags('init')
 @Controller('init')

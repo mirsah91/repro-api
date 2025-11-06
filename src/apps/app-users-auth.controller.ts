@@ -1,5 +1,5 @@
 import { Body, Controller, NotFoundException, Patch, Post, Req, UseGuards } from '@nestjs/common';
-import { ApiHeader, ApiOkResponse, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiHeader, ApiOkResponse, ApiTags } from '@nestjs/swagger';
 import { AppUsersService } from './app-users.service';
 import {
   AppUserLoginDto,
@@ -38,7 +38,7 @@ export class AppUsersAuthController {
     description: 'Tenant identifier for the workspace.',
     required: true,
   })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @Patch('me')
   async updateProfile(

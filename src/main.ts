@@ -20,18 +20,15 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('Repro API')
     .setVersion('0.1.0')
+    .addApiKey({ type: 'apiKey', name: 'x-sdk-token', in: 'header' }, 'sdkToken')
     .addBearerAuth(
       { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
-      'sdk',
+      'appUser',
     )
     .addApiKey({ type: 'apiKey', name: 'x-app-id', in: 'header' }, 'appId')
     .addApiKey(
       { type: 'apiKey', name: 'x-app-secret', in: 'header' },
       'appSecret',
-    )
-    .addApiKey(
-      { type: 'apiKey', name: 'x-app-user-token', in: 'header' },
-      'appUserToken',
     )
     .addApiKey(
       { type: 'apiKey', name: 'x-admin-token', in: 'header' },

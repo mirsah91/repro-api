@@ -21,6 +21,7 @@ describe('Workspace bootstrap and user management', () => {
       process.env.DATA_ENCRYPTION_KEY = Buffer.from(
         'integration-test-key-0123456789abcd',
       ).toString('base64');
+      process.env.APP_USER_JWT_SECRET = 'integration-test-jwt-secret';
 
       moduleFixture = await Test.createTestingModule({
         imports: [AppModule],
@@ -101,6 +102,7 @@ describe('Workspace bootstrap and user management', () => {
           tenantId,
           appId,
           role: AppUserRole.Admin,
+          accessToken: expect.any(String),
         }),
         app: expect.objectContaining({
           tenantId,
@@ -109,10 +111,12 @@ describe('Workspace bootstrap and user management', () => {
       }),
     );
 
+    const adminJwt: string = loginResponse.body.user.accessToken;
+
     await request(server)
       .get('/v1/apps')
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .expect(200)
       .expect((res) => {
         expect(
@@ -126,7 +130,7 @@ describe('Workspace bootstrap and user management', () => {
     const updatedApp = await request(server)
       .patch(`/v1/apps/${appId}`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .send({ name: 'renamed app', enabled: false })
       .expect(200);
 
@@ -142,7 +146,7 @@ describe('Workspace bootstrap and user management', () => {
     await request(server)
       .get(`/v1/apps/${appId}`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .expect(200)
       .expect((res) => {
         expect(res.body).toMatchObject({
@@ -155,7 +159,7 @@ describe('Workspace bootstrap and user management', () => {
     await request(server)
       .post(`/v1/apps/${appId}/users`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .send({
         email: 'viewer@example.com',
         name: 'Viewer One',
@@ -166,7 +170,7 @@ describe('Workspace bootstrap and user management', () => {
     const createdUser = await request(server)
       .post(`/v1/apps/${appId}/users`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .send({
         email: 'recorder@example.com',
         name: 'Recorder One',
@@ -180,7 +184,7 @@ describe('Workspace bootstrap and user management', () => {
     const listUsersResponse = await request(server)
       .get(`/v1/apps/${appId}/users`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .expect(200);
 
     expect(listUsersResponse.body).toEqual(
@@ -200,7 +204,7 @@ describe('Workspace bootstrap and user management', () => {
     const resetResponse = await request(server)
       .patch(`/v1/apps/${appId}/users/${createdUserId}`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .send({ resetPassword: true })
       .expect(200);
 
@@ -219,13 +223,14 @@ describe('Workspace bootstrap and user management', () => {
           email: resetResponse.body.email,
           tenantId,
           role: AppUserRole.Recorder,
+          accessToken: expect.any(String),
         });
       });
 
     await request(server)
       .post(`/v1/apps/${appId}/users/canRecord`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .send({
         email: resetResponse.body.email,
         password: resetResponse.body.password,
@@ -235,7 +240,7 @@ describe('Workspace bootstrap and user management', () => {
     await request(server)
       .delete(`/v1/apps/${appId}/users/${createdUserId}`)
       .set('x-tenant-id', tenantId)
-      .set('x-app-user-token', adminPassword)
+      .set('Authorization', `Bearer ${adminJwt}`)
       .expect(200)
       .expect({ deleted: true });
   });

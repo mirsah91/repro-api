@@ -1,4 +1,4 @@
-import { ApiHeader, ApiOkResponse, ApiParam, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiHeader, ApiOkResponse, ApiParam, ApiSecurity, ApiTags } from '@nestjs/swagger';
 import {
   ActionDetailsRespDto,
   SummaryRespDto,
@@ -22,7 +22,7 @@ export class ViewerController {
 
   @ApiParam({ name: 'sid' })
   @ApiOkResponse({ type: SummaryRespDto })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
@@ -34,7 +34,7 @@ export class ViewerController {
   @ApiParam({ name: 'sid' })
   @ApiParam({ name: 'aid' })
   @ApiOkResponse({ type: ActionDetailsRespDto })
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
@@ -47,7 +47,7 @@ export class ViewerController {
     return this.svc.actionDetails(sid, aid, req.appId);
   }
 
-  @ApiSecurity('appUserToken')
+  @ApiBearerAuth('appUser')
   @ApiSecurity('appId')
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
