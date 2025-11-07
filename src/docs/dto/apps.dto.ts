@@ -223,6 +223,13 @@ export class SessionSummaryRequestDto {
   messages?: SummaryMessageDto[];
 }
 
+export class SessionChatRequestDto {
+  @ApiProperty({ type: [SummaryMessageDto] })
+  @ValidateNested({ each: true })
+  @Type(() => SummaryMessageDto)
+  messages!: SummaryMessageDto[];
+}
+
 export class SessionSummaryResponseDto {
   @ApiProperty({ example: 'S_123456789abcdef' })
   sessionId!: string;
@@ -253,6 +260,39 @@ export class SessionSummaryResponseDto {
       promptTokens: 1200,
       completionTokens: 450,
       totalTokens: 1650,
+    },
+  })
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+export class SessionChatResponseDto {
+  @ApiProperty({ example: 'Requests to /api/checkout began failing after the DB migration…' })
+  reply!: string;
+
+  @ApiProperty({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      actions: 3,
+      requests: 5,
+      dbChanges: 2,
+      emails: 1,
+      traces: 4,
+    },
+  })
+  counts!: Record<string, number>;
+
+  @ApiPropertyOptional({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      promptTokens: 800,
+      completionTokens: 220,
+      totalTokens: 1020,
     },
   })
   usage?: {

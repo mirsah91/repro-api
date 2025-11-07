@@ -21,6 +21,10 @@ import {
   FinishSessionRespDto,
 } from '../docs/dto/sessions.dto';
 import {
+  SessionChatRequestDto,
+  SessionChatResponseDto,
+} from '../docs/dto/apps.dto';
+import {
   Body,
   Controller,
   Get,
@@ -31,6 +35,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { SessionsService } from './sessions.service';
+import { SessionSummaryService } from './session-summary.service';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
@@ -46,7 +51,10 @@ import { AppUserRole } from '../apps/schemas/app-user.schema';
 @ApiExtraModels(RrwebEventDto, ActionEventDto, NetEventDto)
 @Controller('v1')
 export class SessionsController {
-  constructor(private svc: SessionsService) {}
+  constructor(
+    private svc: SessionsService,
+    private summaries: SessionSummaryService,
+  ) {}
 
   @ApiSecurity('sdkToken')
   @ApiBearerAuth('appUser')
@@ -135,6 +143,29 @@ export class SessionsController {
         base64: c.data.toString('base64'),
       })),
       nextAfterSeq: chunks.length ? chunks[chunks.length - 1].seq : a,
+    };
+  }
+
+  @ApiBearerAuth('appUser')
+  @ApiSecurity('appId')
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
+  @ApiBody({ type: SessionChatRequestDto })
+  @ApiOkResponse({ type: SessionChatResponseDto })
+  @Post('sessions/:sessionId/chat')
+  async chatSession(
+    @Param('sessionId') sessionId: string,
+    @Body() body: SessionChatRequestDto,
+    @Req() req: any,
+  ): Promise<SessionChatResponseDto> {
+    const result = await this.summaries.chatSession(sessionId, {
+      appId: req.appId,
+      messages: body?.messages ?? [],
+    });
+    return {
+      reply: result.reply,
+      counts: result.counts,
+      usage: result.usage,
     };
   }
 

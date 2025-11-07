@@ -21,6 +21,7 @@ import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 import { TenantModule } from '../common/tenant/tenant.module';
 import { TraceEmbeddingService } from './trace-embedding.service';
+import { SessionSummaryService } from './session-summary.service';
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { TraceEmbeddingService } from './trace-embedding.service';
     AppSecretGuard,
     AppUserTokenGuard,
     TraceEmbeddingService,
+    SessionSummaryService,
   ],
   exports: [MongooseModule],
 })

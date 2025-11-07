@@ -56,6 +56,182 @@ export class SessionSummaryService {
       throw new BadRequestException('sessionId is required');
     }
 
+    const dataset = await this.buildSessionDataset(sessionId, {
+      appId: opts?.appId,
+      hintMessages: opts?.hintMessages,
+    });
+
+    const client = this.ensureClient();
+    const model =
+      this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
+
+    let summary = '';
+    let usage:
+      | {
+          promptTokens?: number;
+          completionTokens?: number;
+          totalTokens?: number;
+        }
+      | undefined;
+
+    try {
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0.25,
+        max_tokens: 800,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a senior observability analyst. Write concise but comprehensive reports that help technical people understand user impact and give developers specific technical insights. The summary should look like a technical document.',
+          },
+          ...this.normalizeHintMessages(opts?.hintMessages),
+          {
+            role: 'user',
+            content: [
+              'Create a session report with the following structure:',
+              '1. Executive Overview (plain language for non-technical readers).',
+              '2. Detailed Technical Findings (reference concrete actions, requests, DB changes, emails, and traces).',
+              '3. Issues & Anomalies (include errors, failures, slow operations).',
+              '',
+              'Emphasize timelines, performance metrics, and user impact. Tie together correlated events (e.g., which action triggered a request or DB change). Do not suggest any further actions.',
+              '',
+              'Session dataset:',
+              '```json',
+              dataset.serialized,
+              '```',
+            ].join('\n'),
+          },
+        ],
+      });
+
+      summary =
+        completion.choices?.[0]?.message?.content?.trim() ??
+        'No summary returned.';
+      usage = completion.usage
+        ? {
+            promptTokens: completion.usage.prompt_tokens,
+            completionTokens: completion.usage.completion_tokens,
+            totalTokens: completion.usage.total_tokens,
+          }
+        : undefined;
+    } catch (err: any) {
+      const message =
+        err?.message ??
+        'Failed to generate summary with the configured OpenAI model.';
+      throw new InternalServerErrorException(message);
+    }
+
+    return {
+      sessionId,
+      summary,
+      model,
+      counts: dataset.counts,
+      usage,
+    };
+  }
+
+  async chatSession(
+    sessionId: string,
+    opts: { appId?: string; messages?: HintMessageParam[] },
+  ): Promise<{
+    sessionId: string;
+    reply: string;
+    model: string;
+    counts: Record<string, number>;
+    usage?: {
+      promptTokens?: number;
+      completionTokens?: number;
+      totalTokens?: number;
+    };
+  }> {
+    const dataset = await this.buildSessionDataset(sessionId, {
+      appId: opts?.appId,
+      hintMessages: opts?.messages,
+    });
+
+    const client = this.ensureClient();
+    const model =
+      this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
+
+    let reply = '';
+    let usage:
+      | {
+          promptTokens?: number;
+          completionTokens?: number;
+          totalTokens?: number;
+        }
+      | undefined;
+
+    try {
+      const conversation = this.normalizeHintMessages(opts?.messages);
+      const completion = await client.chat.completions.create({
+        model,
+        temperature: 0.2,
+        max_tokens: 700,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a senior observability analyst answering questions about a single session. Base every response solely on the provided dataset. Reference actions, requests, DB changes, emails, and traces when relevant. If the dataset lacks the answer, say you cannot find it.',
+          },
+          ...conversation,
+          {
+            role: 'system',
+            content: [
+              'Session dataset:',
+              '```json',
+              dataset.serialized,
+              '```',
+            ].join('\n'),
+          },
+        ],
+      });
+
+      reply =
+        completion.choices?.[0]?.message?.content?.trim() ??
+        'No response generated.';
+      usage = completion.usage
+        ? {
+            promptTokens: completion.usage.prompt_tokens,
+            completionTokens: completion.usage.completion_tokens,
+            totalTokens: completion.usage.total_tokens,
+          }
+        : undefined;
+    } catch (err: any) {
+      const message =
+        err?.message ??
+        'Failed to generate a chat response with the configured OpenAI model.';
+      throw new InternalServerErrorException(message);
+    }
+
+    return {
+      sessionId,
+      reply,
+      model,
+      counts: dataset.counts,
+      usage,
+    };
+  }
+
+  private ensureClient(): OpenAI {
+    if (this.openai) {
+      return this.openai;
+    }
+    const apiKey = this.config.get<string>('OPENAI_API_KEY')?.trim();
+    if (!apiKey) {
+      throw new BadRequestException(
+        'OPENAI_API_KEY must be configured to generate summaries.',
+      );
+    }
+    this.openai = new OpenAI({ apiKey });
+    return this.openai;
+  }
+
+  private async buildSessionDataset(
+    sessionId: string,
+    opts?: { appId?: string; hintMessages?: HintMessageParam[] },
+  ): Promise<SessionDataset> {
     const sessionDoc = await this.sessions
       .findOne(
         this.tenantFilter({
@@ -122,76 +298,19 @@ export class SessionSummaryService {
 
     const payload = {
       session: this.sanitize(sessionDoc),
-      timeline: scopedTimeline,
+      timeline: {
+        actions: scopedTimeline.actions,
+        requests: scopedTimeline.requests,
+        traces: scopedTimeline.traces,
+        dbChanges,
+        emails,
+      },
     };
 
     const serialized = JSON.stringify(payload, this.promptReplacer, 2);
 
-    const client = this.ensureClient();
-    const model =
-      this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
-
-    let summary = '';
-    let usage:
-      | {
-          promptTokens?: number;
-          completionTokens?: number;
-          totalTokens?: number;
-        }
-      | undefined;
-
-    try {
-      const completion = await client.chat.completions.create({
-        model,
-        temperature: 0.25,
-        max_tokens: 800,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'You are a senior observability analyst. Write concise but comprehensive reports that help technical people understand user impact and give developers specific technical insights. The summary should look like a technical document.',
-          },
-          ...this.normalizeHintMessages(opts?.hintMessages),
-          {
-            role: 'user',
-            content: [
-              'Create a session report with the following structure:',
-              '1. Executive Overview (plain language for non-technical readers).',
-              '2. Detailed Technical Findings (reference concrete actions, requests, DB changes, emails, and traces).',
-              '3. Issues & Anomalies (include errors, failures, slow operations).',
-              '',
-              'Emphasize timelines, performance metrics, and user impact. Tie together correlated events (e.g., which action triggered a request or DB change). Do not suggest any further actions.',
-              '',
-              'Session dataset:',
-              '```json',
-              serialized,
-              '```',
-            ].join('\n'),
-          },
-        ],
-      });
-
-      summary =
-        completion.choices?.[0]?.message?.content?.trim() ??
-        'No summary returned.';
-      usage = completion.usage
-        ? {
-            promptTokens: completion.usage.prompt_tokens,
-            completionTokens: completion.usage.completion_tokens,
-            totalTokens: completion.usage.total_tokens,
-          }
-        : undefined;
-    } catch (err: any) {
-      const message =
-        err?.message ??
-        'Failed to generate summary with the configured OpenAI model.';
-      throw new InternalServerErrorException(message);
-    }
-
     return {
-      sessionId,
-      summary,
-      model,
+      serialized,
       counts: {
         actions: actions.length,
         requests: requests.length,
@@ -199,22 +318,7 @@ export class SessionSummaryService {
         emails: emails.length,
         traces: traces.length,
       },
-      usage,
     };
-  }
-
-  private ensureClient(): OpenAI {
-    if (this.openai) {
-      return this.openai;
-    }
-    const apiKey = this.config.get<string>('OPENAI_API_KEY')?.trim();
-    if (!apiKey) {
-      throw new BadRequestException(
-        'OPENAI_API_KEY must be configured to generate summaries.',
-      );
-    }
-    this.openai = new OpenAI({ apiKey });
-    return this.openai;
   }
 
   private async collectCursor<T, R = T>(
@@ -562,4 +666,9 @@ type HintTokens = {
 type HintMessageParam = {
   role?: string | null;
   content?: any;
+};
+
+type SessionDataset = {
+  serialized: string;
+  counts: Record<string, number>;
 };
