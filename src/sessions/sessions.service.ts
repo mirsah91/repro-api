@@ -16,6 +16,7 @@ import {
   hydrateEmailDoc,
   hydrateRequestDoc,
 } from './utils/session-data-crypto';
+import { TraceEmbeddingService } from './trace-embedding.service';
 
 @Injectable()
 export class SessionsService {
@@ -28,6 +29,7 @@ export class SessionsService {
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     private readonly tenant: TenantContext,
+    private readonly traceEmbeddings: TraceEmbeddingService,
   ) {}
 
   private ensureTraceIndexPromise?: Promise<void>;
@@ -401,6 +403,9 @@ export class SessionsService {
         if (e.trace && e.traceBatch) {
           const batchRid = e.traceBatch?.rid ?? resolvedRid;
           if (batchRid) {
+            const eventsForSummaries = this.normalizeTraceEventsForSummary(
+              e.trace,
+            );
             let tracePayload: any = e.trace;
             if (typeof tracePayload !== 'string') {
               try {
@@ -466,6 +471,26 @@ export class SessionsService {
                   .exec();
               } else {
                 throw err;
+              }
+            }
+
+            if (eventsForSummaries.length) {
+              try {
+                await this.traceEmbeddings.processTraceBatch({
+                  tenantId: this.tenant.tenantId,
+                  sessionId,
+                  requestRid: batchRid,
+                  actionId: normalizedActionId ?? null,
+                  traceId: null,
+                  batchIndex,
+                  totalBatches: hasTotal ? totalValue : null,
+                  events: eventsForSummaries,
+                });
+              } catch (traceErr) {
+                console.warn(
+                  'trace summary pipeline failed',
+                  (traceErr as Error)?.message ?? traceErr,
+                );
               }
             }
           }
@@ -752,6 +777,27 @@ export class SessionsService {
       this.tenantFilter({ _id: sessionId, appId }),
     );
     if (!exists) throw new NotFoundException('Session not found');
+  }
+
+  private normalizeTraceEventsForSummary(raw: any): any[] {
+    if (!raw) {
+      return [];
+    }
+    if (Array.isArray(raw)) {
+      return raw;
+    }
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (typeof raw === 'object' && Array.isArray((raw as any).events)) {
+      return (raw as any).events;
+    }
+    return [];
   }
 
   private tenantFilter<T extends Record<string, any>>(criteria: T): T & {

@@ -51,6 +51,7 @@ export class InitController {
   ): Promise<SessionSummaryResponseDto> {
     return this.summaries.summarizeSession(body.sessionId, {
       appId: body.appId,
+      hintMessages: body.messages ?? [],
     });
   }
 }
