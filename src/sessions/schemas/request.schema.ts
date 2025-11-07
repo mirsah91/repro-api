@@ -18,6 +18,20 @@ export class RequestEvt {
   @Prop({ type: SchemaTypes.Mixed }) body?: any; // captured request payload
   @Prop({ type: SchemaTypes.Mixed }) params?: Record<string, any>; // route params
   @Prop({ type: SchemaTypes.Mixed }) query?: Record<string, any>; // query string params
+  @Prop({
+    type: [
+      {
+        file: { type: String },
+        line: { type: Number },
+        fn: { type: String },
+      },
+    ],
+  })
+  codeRefs?: Array<{
+    file?: string | null;
+    line?: number | null;
+    fn?: string | null;
+  }>;
 }
 
 export type RequestEvtDocument = HydratedDocument<RequestEvt>;

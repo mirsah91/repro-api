@@ -18,6 +18,12 @@ import {
 } from './utils/session-data-crypto';
 import { TraceEmbeddingService } from './trace-embedding.service';
 
+type CodeRefEntry = {
+  file: string;
+  line?: number;
+  fn?: string;
+};
+
 @Injectable()
 export class SessionsService {
   constructor(
@@ -72,6 +78,69 @@ export class SessionsService {
     }
 
     return this.ensureTraceIndexPromise;
+  }
+
+  private collectCodeRefsFromTraceEvents(events: any[]): CodeRefEntry[] {
+    if (!Array.isArray(events) || !events.length) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const refs: CodeRefEntry[] = [];
+    for (const event of events) {
+      const file =
+        typeof event?.file === 'string'
+          ? event.file.trim().replace(/\\/g, '/')
+          : null;
+      if (!file?.length) {
+        continue;
+      }
+      const line =
+        typeof event?.line === 'number' && Number.isFinite(event.line)
+          ? Math.floor(event.line)
+          : undefined;
+      const fn =
+        typeof event?.fn === 'string' && event.fn.trim().length
+          ? event.fn.trim()
+          : undefined;
+      const key = `${file}|${line ?? 'na'}|${fn ?? ''}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      refs.push({ file, line, fn });
+      if (refs.length >= 50) {
+        break;
+      }
+    }
+    return refs;
+  }
+
+  private async appendRequestCodeRefs(
+    sessionId: string,
+    requestRid: string,
+    refs: CodeRefEntry[],
+  ): Promise<void> {
+    if (!refs.length || !requestRid) {
+      return;
+    }
+    const normalized = refs.map((ref) => ({
+      file: ref.file,
+      line: typeof ref.line === 'number' ? ref.line : null,
+      fn: ref.fn ?? null,
+    }));
+    await this.requests
+      .updateOne(
+        this.tenantFilter({ sessionId, rid: requestRid }),
+        {
+          $addToSet: {
+            codeRefs: {
+              $each: normalized,
+            },
+          },
+        },
+      )
+      .exec()
+      .catch(() => undefined);
   }
 
   async startSession(appId: string, clientTime?: number, appUser?: any) {
@@ -437,6 +506,10 @@ export class SessionsService {
                 ? { events: tracePayload, total: totalValue }
                 : tracePayload,
             };
+            const codeRefs = this.collectCodeRefsFromTraceEvents(eventsForSummaries);
+            if (codeRefs.length) {
+              setPayload.codeRefs = codeRefs;
+            }
 
             if (existingRequest?._id) {
               setPayload.request = existingRequest._id;
@@ -492,6 +565,10 @@ export class SessionsService {
                   (traceErr as Error)?.message ?? traceErr,
                 );
               }
+            }
+
+            if (codeRefs.length) {
+              await this.appendRequestCodeRefs(sessionId, batchRid, codeRefs);
             }
           }
         }

@@ -16,6 +16,10 @@ import { RequestEvt, RequestEvtSchema } from '../sessions/schemas/request.schema
 import { DbChange, DbChangeSchema } from '../sessions/schemas/db-change.schema';
 import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
 import { TraceEvt, TraceEvtSchema } from '../sessions/schemas/trace.schema';
+import {
+  TraceSummary,
+  TraceSummarySchema,
+} from '../sessions/schemas/trace-summary.schema';
 import { SessionSummaryService } from '../sessions/session-summary.service';
 
 @Module({
@@ -29,6 +33,7 @@ import { SessionSummaryService } from '../sessions/session-summary.service';
       { name: DbChange.name, schema: DbChangeSchema },
       { name: EmailEvt.name, schema: EmailEvtSchema },
       { name: TraceEvt.name, schema: TraceEvtSchema },
+      { name: TraceSummary.name, schema: TraceSummarySchema },
     ]),
     TenantModule,
   ],
