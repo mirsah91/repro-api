@@ -143,6 +143,54 @@ export class SessionsService {
       .catch(() => undefined);
   }
 
+  private normalizeIncomingCodeRefs(value: any): CodeRefEntry[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const refs: CodeRefEntry[] = [];
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object') continue;
+      const file =
+        typeof entry.file === 'string' && entry.file.trim().length
+          ? entry.file.trim()
+          : null;
+      if (!file) continue;
+      const line =
+        typeof entry.line === 'number' && Number.isFinite(entry.line)
+          ? Math.floor(entry.line)
+          : undefined;
+      const fn =
+        typeof entry.fn === 'string' && entry.fn.trim().length
+          ? entry.fn.trim()
+          : undefined;
+      refs.push({ file, line, fn });
+      if (refs.length >= 100) {
+        break;
+      }
+    }
+    return refs;
+  }
+
+  private mergeCodeRefEntries(
+    primary: CodeRefEntry[],
+    secondary: CodeRefEntry[],
+    limit = 100,
+  ): CodeRefEntry[] {
+    const merged: CodeRefEntry[] = [];
+    const seen = new Set<string>();
+    const push = (ref: CodeRefEntry) => {
+      const key = `${ref.file}|${ref.line ?? 'na'}|${ref.fn ?? ''}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      merged.push(ref);
+    };
+    primary.forEach(push);
+    secondary.forEach(push);
+    return merged.slice(0, limit);
+  }
+
   async startSession(appId: string, clientTime?: number, appUser?: any) {
     const sessionId = 'S_' + randomUUID();
     const serverNow = Date.now();
@@ -497,6 +545,17 @@ export class SessionsService {
               .lean()
               .exec();
 
+            const eventCodeRefs = this.collectCodeRefsFromTraceEvents(
+              eventsForSummaries,
+            );
+            const suppliedCodeRefs = this.normalizeIncomingCodeRefs(
+              e.traceBatch.codeRefs,
+            );
+            const combinedRefs = this.mergeCodeRefEntries(
+              eventCodeRefs,
+              suppliedCodeRefs,
+            );
+
             const setPayload: Record<string, any> = {
               tenantId: this.tenant.tenantId,
               sessionId,
@@ -506,9 +565,8 @@ export class SessionsService {
                 ? { events: tracePayload, total: totalValue }
                 : tracePayload,
             };
-            const codeRefs = this.collectCodeRefsFromTraceEvents(eventsForSummaries);
-            if (codeRefs.length) {
-              setPayload.codeRefs = codeRefs;
+            if (combinedRefs.length) {
+              setPayload.codeRefs = combinedRefs;
             }
 
             if (existingRequest?._id) {
@@ -567,8 +625,8 @@ export class SessionsService {
               }
             }
 
-            if (codeRefs.length) {
-              await this.appendRequestCodeRefs(sessionId, batchRid, codeRefs);
+            if (combinedRefs.length) {
+              await this.appendRequestCodeRefs(sessionId, batchRid, combinedRefs);
             }
           }
         }

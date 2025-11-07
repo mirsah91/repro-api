@@ -446,8 +446,24 @@ export class SessionSummaryService {
       },
     };
 
+    const actionIndex = this.indexActionsById(payload.timeline.actions);
+    const requestIndex = this.indexRequestsByRid(payload.timeline.requests);
+    const traceIndex = this.indexTraceCodeRefs(payload.timeline.traces);
+
     const jsonSnapshot = JSON.stringify(payload, this.promptReplacer, 2);
-    const chunks = this.buildDatasetChunks(payload, jsonSnapshot);
+    const retrievalEntries = await this.retrieveRelevantTraceSummaries(
+      sessionId,
+      opts?.hintMessages ?? [],
+      requestIndex,
+    );
+    const chunks = this.buildDatasetChunks(
+      payload,
+      jsonSnapshot,
+      actionIndex,
+      requestIndex,
+      traceIndex,
+      retrievalEntries,
+    );
     const serialized = chunks.map((chunk) => chunk.text).join('\n\n');
 
     return {
@@ -532,11 +548,13 @@ export class SessionSummaryService {
       };
     },
     jsonSnapshot: string,
+    actionIndex: ActionIndex,
+    requestIndex: RequestIndex,
+    traceIndex: TraceRefIndex,
+    retrievalEntries: TraceSummaryEntry[] = [],
   ): DatasetChunk[] {
-    const actionIndex = this.indexActionsById(payload.timeline.actions);
-    const requestIndex = this.indexRequestsByRid(payload.timeline.requests);
-    const traceIndex = this.indexTraceCodeRefs(payload.timeline.traces);
     const chunks: DatasetChunk[] = [];
+    const seenChunkIds = new Set<string>();
 
     const pushChunk = (
       chunk: Omit<DatasetChunk, 'index' | 'length'> & { text: string },
@@ -545,6 +563,10 @@ export class SessionSummaryService {
       if (!text.length) {
         return;
       }
+      if (seenChunkIds.has(chunk.id)) {
+        return;
+      }
+      seenChunkIds.add(chunk.id);
       chunks.push({
         ...chunk,
         text,
@@ -643,6 +665,24 @@ export class SessionSummaryService {
           files: this.collectTraceFilesFromTraceDoc(trace),
         },
         text: this.formatTraceChunk(trace, index, requestIndex, actionIndex),
+      });
+    });
+
+    retrievalEntries.forEach((entry, idx) => {
+      const chunkId = `traceSummary:${entry.groupId}:${entry.segmentIndex}:${idx}`;
+      pushChunk({
+        id: chunkId,
+        kind: 'trace',
+        metadata: {
+          rid: entry.requestRid ?? undefined,
+          actionId: entry.actionId ?? undefined,
+          files: this.collectFilesFromPreview(entry.previewEvents),
+        },
+        text: this.formatTraceSummaryEntryChunk(
+          entry,
+          requestIndex,
+          actionIndex,
+        ),
       });
     });
 
@@ -1131,6 +1171,67 @@ export class SessionSummaryService {
     return refs.slice(0, 10).map((ref) => this.formatCodeRef(ref));
   }
 
+  private formatTraceSummaryEntryChunk(
+    entry: TraceSummaryEntry,
+    requestIndex: RequestIndex,
+    actionIndex: ActionIndex,
+  ): string {
+    const rid = entry.requestRid ?? 'n/a';
+    const actionId = entry.actionId ?? 'n/a';
+    const requestRef = this.lookupRequest(requestIndex, rid);
+    const actionRef = this.lookupAction(actionIndex, actionId);
+    const preview = (entry.previewEvents ?? [])
+      .slice(0, 5)
+      .map((evt, idx) => {
+        const file = evt?.file ?? 'file';
+        const line =
+          typeof evt?.line === 'number' && Number.isFinite(evt.line)
+            ? evt.line
+            : '?';
+        const fn = evt?.fn ? ` ${evt.fn}` : '';
+        return `  - [${idx + 1}] ${file}:${line}${fn}`;
+      })
+      .join('\n');
+    return [
+      `## Trace Segment`,
+      `requestRid: ${rid}`,
+      `request: ${requestRef ? `${requestRef.method} ${requestRef.url}` : 'unknown'}`,
+      `actionId: ${actionId}`,
+      `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
+      `events: ${entry.eventCount} (segment ${entry.segmentIndex})`,
+      `summary:`,
+      entry.summary,
+      preview ? `preview:\n${preview}` : undefined,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  private collectFilesFromPreview(
+    events?: Array<{ file?: string | null }>,
+  ): string[] {
+    if (!events?.length) {
+      return [];
+    }
+    const files = new Set<string>();
+    for (const event of events) {
+      const file =
+        typeof event?.file === 'string' && event.file.trim().length
+          ? event.file.trim().toLowerCase()
+          : null;
+      if (file) {
+        files.add(file);
+      }
+    }
+    return Array.from(files);
+  }
+
+  private buildKeywordRegex(keywords: string[]): string {
+    return keywords
+      .map((keyword) => keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|');
+  }
+
   private formatTimestamp(value: any): string {
     if (typeof value === 'number' && Number.isFinite(value)) {
       return new Date(value).toISOString();
@@ -1606,6 +1707,83 @@ export class SessionSummaryService {
     return map;
   }
 
+  private async retrieveRelevantTraceSummaries(
+    sessionId: string,
+    hintMessages: HintMessageParam[],
+    requestIndex: RequestIndex,
+    limit = 6,
+  ): Promise<TraceSummaryEntry[]> {
+    const tokens = this.extractHintTokens(hintMessages);
+    const keywords = Array.from(tokens.keywords).filter(Boolean).slice(0, 6);
+    const baseQuery = this.tenantFilter({ sessionId });
+    const queries = keywords.length
+      ? [
+          {
+            ...baseQuery,
+            summary: {
+              $regex: this.buildKeywordRegex(keywords),
+              $options: 'i',
+            },
+          },
+          baseQuery,
+        ]
+      : [baseQuery];
+
+    const collected: TraceSummaryEntry[] = [];
+    const seen = new Set<string>();
+
+    for (const query of queries) {
+      const docs = await this.traceSummaries
+        .find(query)
+        .sort(
+          keywords.length
+            ? { updatedAt: -1 }
+            : { eventCount: -1, segmentIndex: 1 },
+        )
+        .limit(limit * 4)
+        .lean()
+        .exec();
+
+      for (const doc of docs ?? []) {
+        const key = `${doc.groupId}:${doc.segmentIndex}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        collected.push(doc as TraceSummaryEntry);
+        if (collected.length >= limit * 3) {
+          break;
+        }
+      }
+
+      if (collected.length >= limit * 2) {
+        break;
+      }
+    }
+
+    if (!collected.length) {
+      return [];
+    }
+
+    const scored = collected.map((entry, index) => ({
+      entry,
+      index,
+      score: this.scoreTraceSummaryEntry(entry, tokens, requestIndex),
+    }));
+
+    scored.sort((a, b) => {
+      if (b.score === a.score) {
+        return a.index - b.index;
+      }
+      return b.score - a.score;
+    });
+
+    return scored
+      .filter((item) => item.score > 0)
+      .slice(0, limit)
+      .map((item) => item.entry);
+  }
+
   private buildTraceSegmentPayloads(
     entries: TraceSummaryEntry[],
     tokens: HintTokens,
@@ -1984,6 +2162,28 @@ export class SessionSummaryService {
     return score;
   }
 
+  private scoreTraceSummaryEntry(
+    entry: TraceSummaryEntry,
+    tokens: HintTokens,
+    requestIndex: RequestIndex,
+  ): number {
+    let score = this.scoreTextAgainstKeywords(
+      entry.summary ?? '',
+      Array.from(tokens.keywords),
+    );
+    score += this.scoreTrace(
+      (entry.previewEvents ?? []) as TraceEventLike[],
+      tokens,
+    );
+    if (entry.requestRid && requestIndex[entry.requestRid]) {
+      score += 2;
+    }
+    if (entry.actionId) {
+      score += 1;
+    }
+    return score;
+  }
+
   private normalizeTraceEvents(data: any): TraceEventLike[] {
     if (Array.isArray(data)) {
       return data as TraceEventLike[];
@@ -2228,6 +2428,8 @@ type TracePreviewEvent = {
 
 type TraceSummaryEntry = {
   groupId: string;
+  requestRid?: string | null;
+  actionId?: string | null;
   segmentIndex: number;
   eventStart: number;
   eventEnd: number;
