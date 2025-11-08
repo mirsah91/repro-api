@@ -20,7 +20,10 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('Repro API')
     .setVersion('0.1.0')
-    .addApiKey({ type: 'apiKey', name: 'x-sdk-token', in: 'header' }, 'sdkToken')
+    .addApiKey(
+      { type: 'apiKey', name: 'x-sdk-token', in: 'header' },
+      'sdkToken',
+    )
     .addBearerAuth(
       { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
       'appUser',
@@ -55,7 +58,9 @@ function buildHttpsOptions():
 
   if (!keyPath || !certPath) {
     if (!process.env.DISABLE_TLS_WARNING) {
-      console.warn('[tls] TLS disabled - provide TLS_KEY_PATH and TLS_CERT_PATH to enable HTTPS');
+      console.warn(
+        '[tls] TLS disabled - provide TLS_KEY_PATH and TLS_CERT_PATH to enable HTTPS',
+      );
     }
     return undefined;
   }

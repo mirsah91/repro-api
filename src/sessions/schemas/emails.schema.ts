@@ -11,7 +11,10 @@ export class EmailEvt {
   @Prop({ type: String }) provider: string; // e.g. "sendgrid"
   @Prop({ type: String }) kind: string; // "send" | "sendMultiple"
 
-  @Prop({ type: SchemaTypes.Mixed }) from?: { email: string; name?: string } | null;
+  @Prop({ type: SchemaTypes.Mixed }) from?: {
+    email: string;
+    name?: string;
+  } | null;
   @Prop({ type: SchemaTypes.Mixed }) to: Array<{
     email: string;
     name?: string;
@@ -30,7 +33,10 @@ export class EmailEvt {
   @Prop({ type: String }) html?: string | null;
 
   @Prop({ type: String }) templateId?: string | null;
-  @Prop({ type: SchemaTypes.Mixed }) dynamicTemplateData?: Record<string, any> | null;
+  @Prop({ type: SchemaTypes.Mixed }) dynamicTemplateData?: Record<
+    string,
+    any
+  > | null;
   @Prop({ type: SchemaTypes.Mixed }) categories?: string[];
   @Prop({ type: SchemaTypes.Mixed }) customArgs?: Record<string, any> | null;
 

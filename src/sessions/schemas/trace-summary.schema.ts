@@ -45,6 +45,52 @@ export class TraceSummary {
   @Prop({ type: String })
   traceId?: string | null;
 
+  @Prop({ type: String })
+  chunkId?: string | null;
+
+  @Prop({ type: String })
+  parentChunkId?: string | null;
+
+  @Prop({ type: String })
+  chunkKind?: string | null;
+
+  @Prop({ type: Number })
+  depth?: number | null;
+
+  @Prop({ type: [String] })
+  childChunkIds?: string[];
+
+  @Prop({ type: String })
+  lineagePath?: string | null;
+
+  @Prop({ type: Array })
+  lineageTrail?: Array<{
+    chunkId: string;
+    functionName?: string | null;
+    filePath?: string | null;
+    lineNumber?: number | null;
+    depth: number;
+    relation: 'self' | 'parent' | 'child';
+  }>;
+
+  @Prop({ type: Array })
+  childSummaries?: Array<{
+    chunkId: string;
+    functionName?: string | null;
+    filePath?: string | null;
+    lineNumber?: number | null;
+    depth: number;
+  }>;
+
+  @Prop({ type: String })
+  functionName?: string | null;
+
+  @Prop({ type: String })
+  filePath?: string | null;
+
+  @Prop({ type: Number })
+  lineNumber?: number | null;
+
   @Prop({ type: Array })
   previewEvents?: Array<{
     fn?: string | null;
@@ -61,3 +107,6 @@ TraceSummarySchema.index(
   { tenantId: 1, sessionId: 1, groupId: 1, segmentIndex: 1 },
   { unique: true },
 );
+
+TraceSummarySchema.index({ tenantId: 1, sessionId: 1, chunkId: 1 });
+TraceSummarySchema.index({ tenantId: 1, sessionId: 1, parentChunkId: 1 });

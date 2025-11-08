@@ -31,7 +31,10 @@ export function signJwt<T = Record<string, unknown>>(
     iat: issuedAt,
   };
 
-  if (typeof options.expiresInSeconds === 'number' && options.expiresInSeconds > 0) {
+  if (
+    typeof options.expiresInSeconds === 'number' &&
+    options.expiresInSeconds > 0
+  ) {
     fullPayload.exp = issuedAt + Math.floor(options.expiresInSeconds);
   }
   if (options.issuer) fullPayload.iss = options.issuer;
@@ -40,7 +43,10 @@ export function signJwt<T = Record<string, unknown>>(
 
   const headerEncoded = base64UrlEncode(JSON.stringify(header));
   const payloadEncoded = base64UrlEncode(JSON.stringify(fullPayload));
-  const signature = createSignature(`${headerEncoded}.${payloadEncoded}`, secret);
+  const signature = createSignature(
+    `${headerEncoded}.${payloadEncoded}`,
+    secret,
+  );
   return `${headerEncoded}.${payloadEncoded}.${signature}`;
 }
 
@@ -55,15 +61,23 @@ export function verifyJwt<T extends Record<string, unknown>>(
   }
 
   const [headerPart, payloadPart, signaturePart] = parts;
-  if (!BASE64_URL_REGEX.test(headerPart) || !BASE64_URL_REGEX.test(payloadPart)) {
+  if (
+    !BASE64_URL_REGEX.test(headerPart) ||
+    !BASE64_URL_REGEX.test(payloadPart)
+  ) {
     throw new Error('Invalid JWT encoding');
   }
 
-  const expectedSignature = createSignature(`${headerPart}.${payloadPart}`, secret);
+  const expectedSignature = createSignature(
+    `${headerPart}.${payloadPart}`,
+    secret,
+  );
   if (expectedSignature.length !== signaturePart.length) {
     throw new Error('Invalid JWT signature');
   }
-  if (!timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(signaturePart))) {
+  if (
+    !timingSafeEqual(Buffer.from(expectedSignature), Buffer.from(signaturePart))
+  ) {
     throw new Error('Invalid JWT signature');
   }
 

@@ -1,9 +1,4 @@
-import {
-  BadRequestException,
-  Injectable,
-  Scope,
-  Inject,
-} from '@nestjs/common';
+import { BadRequestException, Injectable, Scope, Inject } from '@nestjs/common';
 import { REQUEST } from '@nestjs/core';
 import type { Request } from 'express';
 

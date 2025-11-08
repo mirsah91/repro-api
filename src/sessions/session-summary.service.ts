@@ -32,6 +32,8 @@ const TRACE_SEGMENT_SUMMARY_LENGTH = 800;
 const CHAT_MAX_DATASET_CHUNKS = 6;
 const CHUNK_SUMMARY_MAX_TOKENS = 450;
 const SUMMARY_CHUNK_LIMIT = 40;
+const TRACE_CHILD_EXPANSION_LIMIT = 4;
+const TRACE_PARENT_EXPANSION_LIMIT = 2;
 
 @Injectable()
 export class SessionSummaryService {
@@ -166,7 +168,8 @@ export class SessionSummaryService {
     });
 
     const summary =
-      completion.choices?.[0]?.message?.content?.trim() ?? 'No summary returned.';
+      completion.choices?.[0]?.message?.content?.trim() ??
+      'No summary returned.';
     return { summary, usage: this.mapUsage(completion.usage) };
   }
 
@@ -194,7 +197,7 @@ export class SessionSummaryService {
         messages: [
           {
             role: 'system',
-          content:
+            content:
               'You are an observability analyst generating concise summaries for data chunks. Highlight timelines, performance, user impact, and always mention request IDs, action IDs, and trace filenames with line numbers (file.ts:123) whenever they appear. Only cite file.ts:123 when the chunk includes a filename plus numeric line; otherwise say the code line is unavailable. Keep outputs under 200 words.',
           },
           ...normalizedHints,
@@ -317,7 +320,7 @@ export class SessionSummaryService {
         messages: [
           {
             role: 'system',
-          content:
+            content:
               'You are a senior observability analyst answering questions about a single session. Base every response solely on the provided context chunks. Reference actions, requests, DB changes, emails, and traces when relevant, and include filenames plus line numbers as `file.ts:123` whenever traces supply them. Only cite `file.ts:123` when the context explicitly includes a filename and numeric line; otherwise clearly state that no code location is available. If the dataset lacks the answer, say you cannot find it.',
           },
           ...conversation,
@@ -449,7 +452,6 @@ export class SessionSummaryService {
     const actionIndex = this.indexActionsById(payload.timeline.actions);
     const requestIndex = this.indexRequestsByRid(payload.timeline.requests);
     const traceIndex = this.indexTraceCodeRefs(payload.timeline.traces);
-
     const jsonSnapshot = JSON.stringify(payload, this.promptReplacer, 2);
     const retrievalEntries = await this.retrieveRelevantTraceSummaries(
       sessionId,
@@ -486,11 +488,11 @@ export class SessionSummaryService {
     const out: R[] = [];
     try {
       for await (const item of cursor) {
-        const value = transform ? transform(item) : ((item as any) as R);
+        const value = transform ? transform(item) : (item as R);
         out.push(value);
       }
     } finally {
-      if (!(cursor as any).closed) {
+      if (!cursor.closed) {
         await cursor.close().catch(() => undefined);
       }
     }
@@ -512,7 +514,9 @@ export class SessionSummaryService {
     if ('_id' in cloned) {
       const rawId = cloned._id;
       cloned.id =
-        rawId && typeof rawId === 'object' && typeof rawId.toString === 'function'
+        rawId &&
+        typeof rawId === 'object' &&
+        typeof rawId.toString === 'function'
           ? rawId.toString()
           : rawId;
       delete cloned._id;
@@ -555,6 +559,10 @@ export class SessionSummaryService {
   ): DatasetChunk[] {
     const chunks: DatasetChunk[] = [];
     const seenChunkIds = new Set<string>();
+    const timelineContext: TimelineContext = {
+      dbChanges: payload.timeline.dbChanges ?? [],
+      emails: payload.timeline.emails ?? [],
+    };
 
     const pushChunk = (
       chunk: Omit<DatasetChunk, 'index' | 'length'> & { text: string },
@@ -676,12 +684,16 @@ export class SessionSummaryService {
         metadata: {
           rid: entry.requestRid ?? undefined,
           actionId: entry.actionId ?? undefined,
-          files: this.collectFilesFromPreview(entry.previewEvents),
+          chunkId: entry.chunkId ?? undefined,
+          parentChunkId: entry.parentChunkId ?? undefined,
+          depth: entry.depth ?? undefined,
+          files: this.collectFilesForTraceEntry(entry),
         },
         text: this.formatTraceSummaryEntryChunk(
           entry,
           requestIndex,
           actionIndex,
+          timelineContext,
         ),
       });
     });
@@ -738,7 +750,10 @@ export class SessionSummaryService {
     if (!action || typeof action !== 'object') {
       return `## Action ${index + 1}\nNo data`;
     }
-    const label = this.toShortText(action.label ?? action.type ?? 'action', 120);
+    const label = this.toShortText(
+      action.label ?? action.type ?? 'action',
+      120,
+    );
     const actionId = action.actionId ?? action.id ?? `action_${index + 1}`;
     const tStart = this.formatTimestamp(action.tStart ?? action.t ?? null);
     const tEnd = this.formatTimestamp(action.tEnd ?? null);
@@ -849,10 +864,11 @@ export class SessionSummaryService {
       return `## Email ${index + 1}\nNo data`;
     }
     const subject = this.toShortText(email.subject ?? '(no subject)', 160);
-    const to = Array.isArray(email.to) ? email.to.join(', ') : email.to ?? '';
-    const cc = Array.isArray(email.cc) ? email.cc.join(', ') : email.cc ?? '';
-    const bcc =
-      Array.isArray(email.bcc) ? email.bcc.join(', ') : email.bcc ?? '';
+    const to = Array.isArray(email.to) ? email.to.join(', ') : (email.to ?? '');
+    const cc = Array.isArray(email.cc) ? email.cc.join(', ') : (email.cc ?? '');
+    const bcc = Array.isArray(email.bcc)
+      ? email.bcc.join(', ')
+      : (email.bcc ?? '');
     const textPreview = this.toShortText(email.text, 200);
     return [
       `## Email ${index + 1}`,
@@ -918,7 +934,9 @@ export class SessionSummaryService {
         .slice(0, 5)
         .map((segment: any) => {
           const snippet = this.toShortText(segment.summary, 280);
-          const file = segment.previewEvents?.find((evt: any) => evt.file)?.file;
+          const file = segment.previewEvents?.find(
+            (evt: any) => evt.file,
+          )?.file;
           const line =
             segment.previewEvents?.find((evt: any) => evt.line)?.line ?? null;
           const fileRef = file ? `${file}${line ? `:${line}` : ''}` : '';
@@ -958,7 +976,12 @@ export class SessionSummaryService {
     const out: string[] = [];
     for (let i = 0; i < snapshot.length; i += partSize) {
       out.push(
-        ['## Raw JSON Snapshot', '```json', snapshot.slice(i, i + partSize), '```'].join('\n'),
+        [
+          '## Raw JSON Snapshot',
+          '```json',
+          snapshot.slice(i, i + partSize),
+          '```',
+        ].join('\n'),
       );
     }
     return out;
@@ -980,11 +1003,12 @@ export class SessionSummaryService {
       if (!trace || typeof trace !== 'object') continue;
       const rid = trace.requestRid ?? trace.rid;
       if (!rid) continue;
-      const refs = Array.isArray(trace.codeRefs) && trace.codeRefs.length
-        ? trace.codeRefs
-            .map((ref: any) => this.normalizeStoredCodeRef(ref))
-            .filter((ref): ref is CodeRef => Boolean(ref))
-        : this.extractTraceCodeRefsFromData(trace.data);
+      const refs =
+        Array.isArray(trace.codeRefs) && trace.codeRefs.length
+          ? trace.codeRefs
+              .map((ref: any) => this.normalizeStoredCodeRef(ref))
+              .filter((ref): ref is CodeRef => Boolean(ref))
+          : this.extractTraceCodeRefsFromData(trace.data);
       if (!refs.length) continue;
       map[rid] = {
         rid,
@@ -999,7 +1023,11 @@ export class SessionSummaryService {
     if (!data) {
       return refs;
     }
-    const addRef = (file?: string | null, line?: number | null, fn?: string | null) => {
+    const addRef = (
+      file?: string | null,
+      line?: number | null,
+      fn?: string | null,
+    ) => {
       if (!file) {
         return;
       }
@@ -1175,11 +1203,50 @@ export class SessionSummaryService {
     entry: TraceSummaryEntry,
     requestIndex: RequestIndex,
     actionIndex: ActionIndex,
+    timeline: TimelineContext,
   ): string {
     const rid = entry.requestRid ?? 'n/a';
     const actionId = entry.actionId ?? 'n/a';
     const requestRef = this.lookupRequest(requestIndex, rid);
     const actionRef = this.lookupAction(actionIndex, actionId);
+    const lineage = (entry.lineageTrail ?? [])
+      .filter((trail) => trail.relation === 'parent')
+      .map((trail, idx) => {
+        const file = trail.filePath
+          ? `${trail.filePath}${trail.lineNumber ? `:${trail.lineNumber}` : ''}`
+          : '';
+        return `  - [${idx + 1}] ${trail.functionName ?? 'fn'} ${file} (depth ${trail.depth})`;
+      })
+      .join('\n');
+    const children = (entry.childSummaries ?? [])
+      .map((child, idx) => {
+        const file = child.filePath
+          ? `${child.filePath}${child.lineNumber ? `:${child.lineNumber}` : ''}`
+          : '';
+        return `  - [${idx + 1}] ${child.functionName ?? 'fn'} ${file} (depth ${child.depth})`;
+      })
+      .join('\n');
+    const relatedDbChanges = this.findRelatedDbChanges(
+      entry,
+      timeline.dbChanges,
+    )
+      .map(
+        (change, idx) =>
+          `  - [${idx + 1}] ${(change.op ?? change.operation ?? 'op').toUpperCase()} ${
+            change.collection ?? change.table ?? 'collection'
+          } (request ${change.requestRid ?? change.rid ?? 'n/a'})`,
+      )
+      .join('\n');
+    const relatedEmails = this.findRelatedEmails(entry, timeline.emails)
+      .map(
+        (email, idx) =>
+          `  - [${idx + 1}] ${this.toShortText(email.subject ?? '(no subject)', 80)} -> ${
+            Array.isArray(email.to)
+              ? email.to.join(', ')
+              : (email.to ?? 'unknown')
+          }`,
+      )
+      .join('\n');
     const preview = (entry.previewEvents ?? [])
       .slice(0, 5)
       .map((evt, idx) => {
@@ -1193,18 +1260,71 @@ export class SessionSummaryService {
       })
       .join('\n');
     return [
-      `## Trace Segment`,
+      `## Trace Function Segment`,
+      `chunkId: ${entry.chunkId ?? 'legacy'}`,
+      entry.chunkKind ? `kind: ${entry.chunkKind}` : undefined,
+      typeof entry.depth === 'number' ? `depth: ${entry.depth}` : undefined,
+      entry.functionName
+        ? `function: ${entry.functionName} (${entry.filePath ?? 'file'}${entry.lineNumber ? `:${entry.lineNumber}` : ''})`
+        : undefined,
       `requestRid: ${rid}`,
       `request: ${requestRef ? `${requestRef.method} ${requestRef.url}` : 'unknown'}`,
       `actionId: ${actionId}`,
       `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
       `events: ${entry.eventCount} (segment ${entry.segmentIndex})`,
+      lineage ? `ancestors:\n${lineage}` : undefined,
+      children ? `children:\n${children}` : undefined,
+      relatedDbChanges ? `related DB changes:\n${relatedDbChanges}` : undefined,
+      relatedEmails ? `related emails:\n${relatedEmails}` : undefined,
       `summary:`,
       entry.summary,
       preview ? `preview:\n${preview}` : undefined,
     ]
       .filter(Boolean)
       .join('\n');
+  }
+
+  private findRelatedDbChanges(
+    entry: TraceSummaryEntry,
+    changes: any[],
+  ): any[] {
+    if (!changes?.length) {
+      return [];
+    }
+    const rid = entry.requestRid ?? null;
+    const actionId = entry.actionId ?? null;
+    return changes
+      .filter((change) => {
+        const matchesRid =
+          rid &&
+          (change?.requestRid ?? change?.rid ?? change?.meta?.requestRid) ===
+            rid;
+        const matchesAction =
+          actionId &&
+          (change?.actionId ?? change?.aid ?? change?.meta?.actionId) ===
+            actionId;
+        return matchesRid || matchesAction;
+      })
+      .slice(0, 3);
+  }
+
+  private findRelatedEmails(entry: TraceSummaryEntry, emails: any[]): any[] {
+    if (!emails?.length) {
+      return [];
+    }
+    const rid = entry.requestRid ?? null;
+    const actionId = entry.actionId ?? null;
+    return emails
+      .filter((email) => {
+        const matchesRid =
+          rid &&
+          (email?.requestRid ?? email?.rid ?? email?.meta?.requestRid) === rid;
+        const matchesAction =
+          actionId &&
+          (email?.actionId ?? email?.aid ?? email?.meta?.actionId) === actionId;
+        return matchesRid || matchesAction;
+      })
+      .slice(0, 3);
   }
 
   private collectFilesFromPreview(
@@ -1223,6 +1343,17 @@ export class SessionSummaryService {
         files.add(file);
       }
     }
+    return Array.from(files);
+  }
+
+  private collectFilesForTraceEntry(entry: TraceSummaryEntry): string[] {
+    const files = new Set<string>();
+    if (entry.filePath && entry.filePath.trim().length) {
+      files.add(entry.filePath.trim().toLowerCase());
+    }
+    this.collectFilesFromPreview(entry.previewEvents).forEach((file) =>
+      files.add(file),
+    );
     return Array.from(files);
   }
 
@@ -1275,9 +1406,7 @@ export class SessionSummaryService {
       return chunks.slice(0, maxChunks);
     }
 
-    return selected
-      .map((item) => item.chunk)
-      .sort((a, b) => a.index - b.index);
+    return selected.map((item) => item.chunk).sort((a, b) => a.index - b.index);
   }
 
   private scoreDatasetChunk(chunk: DatasetChunk, tokens: HintTokens): number {
@@ -1304,11 +1433,7 @@ export class SessionSummaryService {
       }
     });
     tokens.lines.forEach((line) => {
-      if (
-        typeof line === 'number' &&
-        line >= 0 &&
-        text.includes(`:${line}`)
-      ) {
+      if (typeof line === 'number' && line >= 0 && text.includes(`:${line}`)) {
         score += 1;
       }
     });
@@ -1338,7 +1463,10 @@ export class SessionSummaryService {
     if (Array.isArray(chunk.metadata?.files)) {
       for (const file of chunk.metadata.files) {
         const normalized = this.normalizeFileHint(file);
-        if (tokens.files.has(normalized) || tokens.fileBases.has(this.getBasename(normalized))) {
+        if (
+          tokens.files.has(normalized) ||
+          tokens.fileBases.has(this.getBasename(normalized))
+        ) {
           score += 5;
         }
         score += this.scoreTextAgainstKeywords(file, keywordList);
@@ -1419,7 +1547,8 @@ export class SessionSummaryService {
     if (meta.actionId) parts.push(`actionId=${meta.actionId}`);
     if (meta.method && meta.url) parts.push(`${meta.method} ${meta.url}`);
     if (meta.collection) parts.push(`collection=${meta.collection}`);
-    if (meta.files?.length) parts.push(`files=${meta.files.slice(0, 2).join(',')}`);
+    if (meta.files?.length)
+      parts.push(`files=${meta.files.slice(0, 2).join(',')}`);
     if (meta.part) parts.push(`rawPart=${meta.part}`);
     return parts.join(' ');
   }
@@ -1437,11 +1566,7 @@ export class SessionSummaryService {
     const baseTraces = prioritizedTraces.length
       ? prioritizedTraces
       : this.sampleEvenly(traces, 25);
-    const scopedTraces = this.mergeCollections(
-      baseTraces,
-      keywordTraces,
-      25,
-    );
+    const scopedTraces = this.mergeCollections(baseTraces, keywordTraces, 25);
 
     const prioritizedRequestIds = new Set(
       prioritizedTraces
@@ -1450,11 +1575,7 @@ export class SessionSummaryService {
     );
 
     const baseRequests = prioritizedRequestIds.size
-      ? this.composePrioritizedRequests(
-          requests,
-          prioritizedRequestIds,
-          tokens,
-        )
+      ? this.composePrioritizedRequests(requests, prioritizedRequestIds, tokens)
       : this.sampleEvenly(requests, 12);
     const keywordRequests = this.filterRequestsByKeywords(requests, tokens);
     const scopedRequests = this.mergeCollections(
@@ -1489,7 +1610,9 @@ export class SessionSummaryService {
       const canInclude =
         included < TRACE_TRACE_SAMPLE_LIMIT && remainingEvents > 0;
       if (!canInclude) {
-        result.push(this.buildTracePlaceholder(trace, 'trace_budget_exhausted'));
+        result.push(
+          this.buildTracePlaceholder(trace, 'trace_budget_exhausted'),
+        );
         continue;
       }
 
@@ -1498,7 +1621,7 @@ export class SessionSummaryService {
       included += 1;
 
       const groupId = this.resolveTraceGroupId(limited.payload);
-      const segmentEntries = groupId ? summaries.get(groupId) ?? [] : [];
+      const segmentEntries = groupId ? (summaries.get(groupId) ?? []) : [];
       const segmentPayload = this.buildTraceSegmentPayloads(
         segmentEntries,
         tokens,
@@ -1778,10 +1901,112 @@ export class SessionSummaryService {
       return b.score - a.score;
     });
 
-    return scored
+    const selected = scored
       .filter((item) => item.score > 0)
       .slice(0, limit)
       .map((item) => item.entry);
+
+    return this.expandTraceSummaryEntries(sessionId, selected);
+  }
+
+  private async expandTraceSummaryEntries(
+    sessionId: string,
+    seeds: TraceSummaryEntry[],
+  ): Promise<TraceSummaryEntry[]> {
+    if (!seeds.length) {
+      return [];
+    }
+
+    const appendedIds = new Set<string>();
+    seeds.forEach((entry) => {
+      if (entry.chunkId) {
+        appendedIds.add(entry.chunkId);
+      }
+    });
+
+    const childCandidates: string[] = [];
+    const parentCandidates: string[] = [];
+    for (const entry of seeds) {
+      const parentId = entry.parentChunkId;
+      if (
+        parentId &&
+        !appendedIds.has(parentId) &&
+        parentCandidates.length < TRACE_PARENT_EXPANSION_LIMIT * seeds.length
+      ) {
+        parentCandidates.push(parentId);
+      }
+      const childIds = (entry.childChunkIds ?? []).filter(Boolean);
+      for (const childId of childIds.slice(0, TRACE_CHILD_EXPANSION_LIMIT)) {
+        if (
+          !appendedIds.has(childId) &&
+          childCandidates.length <
+            TRACE_CHILD_EXPANSION_LIMIT * seeds.length
+        ) {
+          childCandidates.push(childId);
+        }
+      }
+    }
+
+    const [childDocs, parentDocs] = await Promise.all([
+      this.fetchTraceSummariesByChunkIds(sessionId, childCandidates),
+      this.fetchTraceSummariesByChunkIds(sessionId, parentCandidates),
+    ]);
+
+    const expanded: TraceSummaryEntry[] = [];
+    for (const entry of seeds) {
+      expanded.push(entry);
+      const parentId = entry.parentChunkId;
+      if (parentId) {
+        const parent = parentDocs.get(parentId);
+        if (parent?.chunkId && !appendedIds.has(parent.chunkId)) {
+          expanded.push(parent);
+          appendedIds.add(parent.chunkId);
+        }
+      }
+      const childIds = (entry.childChunkIds ?? []).filter(Boolean);
+      for (const childId of childIds.slice(0, TRACE_CHILD_EXPANSION_LIMIT)) {
+        const child = childDocs.get(childId);
+        if (child?.chunkId && !appendedIds.has(child.chunkId)) {
+          expanded.push(child);
+          appendedIds.add(child.chunkId);
+        }
+      }
+    }
+
+    return expanded;
+  }
+
+  private async fetchTraceSummariesByChunkIds(
+    sessionId: string,
+    chunkIds: string[],
+  ): Promise<Map<string, TraceSummaryEntry>> {
+    const map = new Map<string, TraceSummaryEntry>();
+    if (!chunkIds?.length) {
+      return map;
+    }
+    const unique = Array.from(new Set(chunkIds.filter(Boolean)));
+    if (!unique.length) {
+      return map;
+    }
+
+    const docs = await this.traceSummaries
+      .find(
+        this.tenantFilter({
+          sessionId,
+          chunkId: { $in: unique },
+        }),
+      )
+      .limit(unique.length)
+      .lean()
+      .exec();
+
+    for (const doc of docs ?? []) {
+      if (doc?.chunkId) {
+        map.set(doc.chunkId, doc as TraceSummaryEntry);
+      }
+    }
+
+    return map;
   }
 
   private buildTraceSegmentPayloads(
@@ -1821,35 +2046,123 @@ export class SessionSummaryService {
     return scored.map((item) => item.entry);
   }
 
-  private scoreTraceSegment(entry: TraceSummaryEntry, tokens: HintTokens): number {
-    let score = 0;
+  private scoreTraceSegment(
+    entry: TraceSummaryEntry,
+    tokens: HintTokens,
+  ): number {
     if (!tokens.hasDirectHints) {
       return entry.segmentIndex < TRACE_SEGMENT_LIMIT_PER_TRACE ? 1 : 0;
     }
-    const text = entry.summary?.toLowerCase?.() ?? '';
-    tokens.files.forEach((file) => {
-      if (file && text.includes(file)) {
-        score += 3;
-      }
-    });
-    tokens.fileBases.forEach((base) => {
-      if (base && text.includes(base)) {
-        score += 2;
-      }
-    });
+    let score = 0;
+    const summaryText = entry.summary?.toLowerCase?.() ?? '';
+    const functionName = entry.functionName?.toLowerCase?.() ?? '';
+    const filePath = entry.filePath?.toLowerCase?.() ?? '';
+    const fileBase = filePath ? this.getBasename(filePath).toLowerCase() : '';
+    const lineageTrail = entry.lineageTrail ?? [];
+    const childSummaries = entry.childSummaries ?? [];
+    const lineageFunctions = lineageTrail
+      .map((trail) => trail.functionName?.toLowerCase())
+      .filter((value): value is string => Boolean(value));
+    const childFunctions = childSummaries
+      .map((child) => child.functionName?.toLowerCase())
+      .filter((value): value is string => Boolean(value));
+    const lineageFiles = lineageTrail
+      .map((trail) => trail.filePath?.toLowerCase())
+      .filter((value): value is string => Boolean(value));
+    const childFiles = childSummaries
+      .map((child) => child.filePath?.toLowerCase())
+      .filter((value): value is string => Boolean(value));
+    const lineageFileBases = lineageFiles.map((file) =>
+      this.getBasename(file).toLowerCase(),
+    );
+    const childFileBases = childFiles.map((file) =>
+      this.getBasename(file).toLowerCase(),
+    );
+    const lineageLines = lineageTrail
+      .map((trail) =>
+        typeof trail.lineNumber === 'number' && Number.isFinite(trail.lineNumber)
+          ? Math.floor(trail.lineNumber)
+          : null,
+      )
+      .filter((line): line is number => line !== null);
+    const childLines = childSummaries
+      .map((child) =>
+        typeof child.lineNumber === 'number' && Number.isFinite(child.lineNumber)
+          ? Math.floor(child.lineNumber)
+          : null,
+      )
+      .filter((line): line is number => line !== null);
+    const lineNumber =
+      typeof entry.lineNumber === 'number' && Number.isFinite(entry.lineNumber)
+        ? Math.floor(entry.lineNumber)
+        : null;
+    const searchCorpus = [summaryText, functionName, filePath, fileBase].join(' ');
+
+    const includes = (haystack: string, needle?: string) =>
+      needle ? haystack.includes(needle) : false;
+
     tokens.functions.forEach((fn) => {
-      if (fn && text.includes(fn)) {
+      const needle = fn?.toLowerCase();
+      if (!needle) return;
+      if (includes(functionName, needle)) {
+        score += 6;
+      } else if (childFunctions.some((name) => includes(name, needle))) {
+        score += 3;
+      } else if (lineageFunctions.some((name) => includes(name, needle))) {
         score += 2;
-      }
-    });
-    tokens.lines.forEach((line) => {
-      if (
-        typeof line === 'number' &&
-        text.includes(`:${line}`) // heuristically match file:line
-      ) {
+      } else if (summaryText.includes(needle)) {
         score += 1;
       }
     });
+
+    tokens.files.forEach((file) => {
+      const needle = file?.toLowerCase();
+      if (!needle) return;
+      if (includes(filePath, needle)) {
+        score += 5;
+      } else if (includes(fileBase, needle)) {
+        score += 4;
+      } else if (childFiles.some((name) => includes(name, needle))) {
+        score += 2;
+      } else if (lineageFiles.some((name) => includes(name, needle))) {
+        score += 1;
+      }
+    });
+
+    tokens.fileBases.forEach((base) => {
+      const needle = base?.toLowerCase();
+      if (!needle) return;
+      if (includes(fileBase, needle)) {
+        score += 4;
+      } else if (includes(filePath, needle)) {
+        score += 3;
+      } else if (childFileBases.some((name) => includes(name, needle))) {
+        score += 2;
+      } else if (lineageFileBases.some((name) => includes(name, needle))) {
+        score += 1;
+      }
+    });
+
+    tokens.lines.forEach((line) => {
+      if (typeof line !== 'number' || !Number.isFinite(line)) {
+        return;
+      }
+      if (lineNumber === line) {
+        score += 3;
+      } else if (childLines.includes(line)) {
+        score += 2;
+      } else if (lineageLines.includes(line)) {
+        score += 1;
+      }
+    });
+
+    tokens.keywords.forEach((keyword) => {
+      const needle = keyword?.toLowerCase();
+      if (needle && searchCorpus.includes(needle)) {
+        score += 1;
+      }
+    });
+
     const previewScore = this.scoreTrace(
       (entry.previewEvents ?? []) as TraceEventLike[],
       tokens,
@@ -1859,7 +2172,12 @@ export class SessionSummaryService {
   }
 
   private compactPreviewEvents(
-    events?: Array<{ fn?: string | null; file?: string | null; line?: number | null; type?: string | null }>,
+    events?: Array<{
+      fn?: string | null;
+      file?: string | null;
+      line?: number | null;
+      type?: string | null;
+    }>,
   ): TracePreviewEvent[] {
     if (!events?.length) {
       return [];
@@ -1903,8 +2221,7 @@ export class SessionSummaryService {
       totalSegments,
       includedSegments: segments.length,
       segments,
-      note:
-        'Trace events chunked to respect model context limits. Each segment summarizes a chronological block of events.',
+      note: 'Trace events chunked to respect model context limits. Each segment summarizes a chronological block of events.',
     };
     return cloned as TTrace;
   }
@@ -1923,10 +2240,7 @@ export class SessionSummaryService {
     return Object.keys(meta).length ? meta : undefined;
   }
 
-  private buildTracePlaceholder<TTrace>(
-    trace: TTrace,
-    reason: string,
-  ): TTrace {
+  private buildTracePlaceholder<TTrace>(trace: TTrace, reason: string): TTrace {
     if (!trace || typeof trace !== 'object') {
       return trace;
     }
@@ -1935,8 +2249,7 @@ export class SessionSummaryService {
       omitted: true,
       reason,
       totalEvents: events.length,
-      note:
-        'Trace omitted from prompt to stay within model context window. Provide more specific hints to focus on the right trace.',
+      note: 'Trace omitted from prompt to stay within model context window. Provide more specific hints to focus on the right trace.',
     };
     return {
       ...(trace as Record<string, any>),
@@ -2196,8 +2509,8 @@ export class SessionSummaryService {
         return [];
       }
     }
-    if (data && typeof data === 'object' && Array.isArray((data as any).events)) {
-      return (data as any).events as TraceEventLike[];
+    if (data && typeof data === 'object' && Array.isArray(data.events)) {
+      return data.events as TraceEventLike[];
     }
     return [];
   }
@@ -2250,8 +2563,9 @@ export class SessionSummaryService {
       lines,
       functions,
       keywords,
-      hasDirectHints:
-        Boolean(files.size || lines.size || functions.size || fileBases.size),
+      hasDirectHints: Boolean(
+        files.size || lines.size || functions.size || fileBases.size,
+      ),
     };
   }
 
@@ -2292,7 +2606,9 @@ export class SessionSummaryService {
     }
     if (Array.isArray(content)) {
       return content
-        .map((item) => this.flattenMessageContent(item?.text ?? item?.content ?? item))
+        .map((item) =>
+          this.flattenMessageContent(item?.text ?? item?.content ?? item),
+        )
         .filter(Boolean)
         .join('\n');
     }
@@ -2301,7 +2617,9 @@ export class SessionSummaryService {
         return content.text;
       }
       if (Array.isArray(content.text)) {
-        return content.text.map((item: any) => this.flattenMessageContent(item)).join('\n');
+        return content.text
+          .map((item: any) => this.flattenMessageContent(item))
+          .join('\n');
       }
       if (typeof content.content === 'string') {
         return content.content;
@@ -2321,10 +2639,7 @@ export class SessionSummaryService {
       return undefined;
     }
     const rid =
-      (value as any).rid ??
-      (value as any).requestRid ??
-      (value as any).request?.rid ??
-      undefined;
+      value.rid ?? value.requestRid ?? value.request?.rid ?? undefined;
     return typeof rid === 'string' ? rid : undefined;
   }
 
@@ -2332,13 +2647,10 @@ export class SessionSummaryService {
     if (!value || typeof value !== 'object') {
       return undefined;
     }
-    const requestRid =
-      (value as any).requestRid ??
-      (value as any).rid ??
-      (value as any).request?.rid;
-    const actionId = (value as any).actionId ?? (value as any).aid;
-    const traceId = (value as any).traceId ?? (value as any).tid;
-    const sessionId = (value as any).sessionId;
+    const requestRid = value.requestRid ?? value.rid ?? value.request?.rid;
+    const actionId = value.actionId ?? value.aid;
+    const traceId = value.traceId ?? value.tid;
+    const sessionId = value.sessionId;
     return (
       (typeof requestRid === 'string' && requestRid) ||
       (typeof actionId === 'string' && actionId) ||
@@ -2366,7 +2678,9 @@ export class SessionSummaryService {
     return result;
   }
 
-  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+  private tenantFilter<T extends Record<string, any>>(
+    criteria: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
@@ -2426,6 +2740,11 @@ type TracePreviewEvent = {
   type?: string;
 };
 
+type TimelineContext = {
+  dbChanges: any[];
+  emails: any[];
+};
+
 type TraceSummaryEntry = {
   groupId: string;
   requestRid?: string | null;
@@ -2435,6 +2754,30 @@ type TraceSummaryEntry = {
   eventEnd: number;
   eventCount: number;
   summary: string;
+  chunkId?: string | null;
+  parentChunkId?: string | null;
+  chunkKind?: string | null;
+  depth?: number | null;
+  childChunkIds?: string[];
+  lineagePath?: string | null;
+  lineageTrail?: Array<{
+    chunkId: string;
+    functionName?: string | null;
+    filePath?: string | null;
+    lineNumber?: number | null;
+    depth: number;
+    relation: 'self' | 'parent' | 'child';
+  }>;
+  childSummaries?: Array<{
+    chunkId: string;
+    functionName?: string | null;
+    filePath?: string | null;
+    lineNumber?: number | null;
+    depth: number;
+  }>;
+  functionName?: string | null;
+  filePath?: string | null;
+  lineNumber?: number | null;
   previewEvents?: Array<{
     fn?: string | null;
     file?: string | null;

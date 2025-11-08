@@ -106,7 +106,10 @@ export class AppUsersService {
         name,
         enabled,
       });
-      return this.toDto(created.toObject() as unknown as StoredAppUser, password);
+      return this.toDto(
+        created.toObject() as unknown as StoredAppUser,
+        password,
+      );
     } catch (err) {
       if (this.isLegacyTokenIndexError(err)) {
         await this.ensureLegacyTokenIndexDropped();
@@ -144,8 +147,8 @@ export class AppUsersService {
       }
       return user;
     } catch (error) {
-      console.log('error ==>', error)
-      return null as any
+      console.log('error ==>', error);
+      return null as any;
     }
   }
 
@@ -240,7 +243,8 @@ export class AppUsersService {
     }
 
     if (typeof dto.name !== 'undefined') {
-      const trimmed = typeof dto.name === 'string' ? dto.name.trim() : undefined;
+      const trimmed =
+        typeof dto.name === 'string' ? dto.name.trim() : undefined;
       doc.name = trimmed ?? undefined;
     }
 
@@ -313,7 +317,9 @@ export class AppUsersService {
   ): AppUserDtoShape {
     const password =
       passwordOverride ??
-      (typeof doc.tokenEnc === 'string' ? safeDecrypt(doc.tokenEnc) : undefined);
+      (typeof doc.tokenEnc === 'string'
+        ? safeDecrypt(doc.tokenEnc)
+        : undefined);
     return {
       id: String(doc._id),
       tenantId: doc.tenantId,
@@ -373,7 +379,8 @@ export class AppUsersService {
         const collection = this.users.collection;
         const indexes = await collection.indexes();
         const legacy = indexes.find(
-          (idx) => idx.name === 'uniq_app_token' && idx.key?.token !== undefined,
+          (idx) =>
+            idx.name === 'uniq_app_token' && idx.key?.token !== undefined,
         );
         if (legacy) {
           const dropTarget = legacy.name ?? legacy.key;
@@ -451,7 +458,8 @@ export class AppUsersService {
     if (!secret) {
       throw new Error('APP_USER_JWT_SECRET must be configured');
     }
-    const raw = this.config.get<string>('APP_USER_JWT_EXPIRES_IN')?.trim() || '12h';
+    const raw =
+      this.config.get<string>('APP_USER_JWT_EXPIRES_IN')?.trim() || '12h';
     const expiresInSeconds = this.parseDuration(raw);
     return { secret, expiresInSeconds };
   }
@@ -490,7 +498,9 @@ export class AppUsersService {
     throw new Error(typeof err === 'string' ? err : 'Unknown error');
   }
 
-  private withTenantFilter<T extends Record<string, any>>(base: T): T & {
+  private withTenantFilter<T extends Record<string, any>>(
+    base: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...base, tenantId: this.tenant.tenantId };

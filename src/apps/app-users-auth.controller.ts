@@ -1,5 +1,18 @@
-import { Body, Controller, NotFoundException, Patch, Post, Req, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiHeader, ApiOkResponse, ApiTags } from '@nestjs/swagger';
+import {
+  Body,
+  Controller,
+  NotFoundException,
+  Patch,
+  Post,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiHeader,
+  ApiOkResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import { AppUsersService } from './app-users.service';
 import {
   AppUserLoginDto,
@@ -21,7 +34,9 @@ export class AppUsersAuthController {
     @Body() loginDto: AppUserLoginDto,
   ): Promise<AppUserLoginResponseDto> {
     const tenantHeader = req?.headers?.['x-tenant-id'];
-    const headerValue = Array.isArray(tenantHeader) ? tenantHeader[0] : tenantHeader;
+    const headerValue = Array.isArray(tenantHeader)
+      ? tenantHeader[0]
+      : tenantHeader;
     const hasTenant =
       typeof headerValue === 'string' && headerValue.trim().length > 0;
 

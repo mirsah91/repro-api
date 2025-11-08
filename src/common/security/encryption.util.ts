@@ -49,9 +49,7 @@ function deriveKey(): Buffer {
     const buf = fn();
     if (buf && buf.length) {
       const key =
-        buf.length === 32
-          ? buf
-          : createHash('sha256').update(buf).digest(); // squeeze to 32 bytes
+        buf.length === 32 ? buf : createHash('sha256').update(buf).digest(); // squeeze to 32 bytes
       cachedKey = key;
       return key;
     }

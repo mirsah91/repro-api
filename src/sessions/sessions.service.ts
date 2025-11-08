@@ -129,16 +129,13 @@ export class SessionsService {
       fn: ref.fn ?? null,
     }));
     await this.requests
-      .updateOne(
-        this.tenantFilter({ sessionId, rid: requestRid }),
-        {
-          $addToSet: {
-            codeRefs: {
-              $each: normalized,
-            },
+      .updateOne(this.tenantFilter({ sessionId, rid: requestRid }), {
+        $addToSet: {
+          codeRefs: {
+            $each: normalized,
           },
         },
-      )
+      })
       .exec()
       .catch(() => undefined);
   }
@@ -323,10 +320,9 @@ export class SessionsService {
 
         if (ev.aid) {
           await this.actions
-            .updateOne(
-              this.tenantFilter({ sessionId, actionId: ev.aid }),
-              { $set: { hasReq: true } },
-            )
+            .updateOne(this.tenantFilter({ sessionId, actionId: ev.aid }), {
+              $set: { hasReq: true },
+            })
             .exec();
         }
       }
@@ -347,7 +343,9 @@ export class SessionsService {
       return str.length ? str : null;
     };
 
-    const getActionBaseTime = async (actionId: string): Promise<number | null> => {
+    const getActionBaseTime = async (
+      actionId: string,
+    ): Promise<number | null> => {
       if (actionTimeCache.has(actionId)) {
         return actionTimeCache.get(actionId)!;
       }
@@ -365,7 +363,10 @@ export class SessionsService {
         .filter((v): v is number => Number.isFinite(v));
 
       const base = candidates.length
-        ? candidates.reduce((max, cur) => (cur > max ? cur : max), candidates[0])
+        ? candidates.reduce(
+            (max, cur) => (cur > max ? cur : max),
+            candidates[0],
+          )
         : null;
 
       actionTimeCache.set(actionId, base);
@@ -538,16 +539,14 @@ export class SessionsService {
             const hasTotal = Number.isFinite(totalValue);
 
             const existingRequest = await this.requests
-              .findOne(
-                this.tenantFilter({ sessionId, rid: batchRid }),
-                { _id: 1 },
-              )
+              .findOne(this.tenantFilter({ sessionId, rid: batchRid }), {
+                _id: 1,
+              })
               .lean()
               .exec();
 
-            const eventCodeRefs = this.collectCodeRefsFromTraceEvents(
-              eventsForSummaries,
-            );
+            const eventCodeRefs =
+              this.collectCodeRefsFromTraceEvents(eventsForSummaries);
             const suppliedCodeRefs = this.normalizeIncomingCodeRefs(
               e.traceBatch.codeRefs,
             );
@@ -626,7 +625,11 @@ export class SessionsService {
             }
 
             if (combinedRefs.length) {
-              await this.appendRequestCodeRefs(sessionId, batchRid, combinedRefs);
+              await this.appendRequestCodeRefs(
+                sessionId,
+                batchRid,
+                combinedRefs,
+              );
             }
           }
         }
@@ -929,19 +932,23 @@ export class SessionsService {
         return [];
       }
     }
-    if (typeof raw === 'object' && Array.isArray((raw as any).events)) {
-      return (raw as any).events;
+    if (typeof raw === 'object' && Array.isArray(raw.events)) {
+      return raw.events;
     }
     return [];
   }
 
-  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+  private tenantFilter<T extends Record<string, any>>(
+    criteria: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
   }
 
-  private tenantDoc<T extends Record<string, any>>(doc: T): T & {
+  private tenantDoc<T extends Record<string, any>>(
+    doc: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...doc, tenantId: this.tenant.tenantId };

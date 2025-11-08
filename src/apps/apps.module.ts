@@ -12,7 +12,10 @@ import { InitController } from './init.controller';
 import { TenantModule } from '../common/tenant/tenant.module';
 import { Session, SessionSchema } from '../sessions/schemas/session.schema';
 import { Action, ActionSchema } from '../sessions/schemas/action.schema';
-import { RequestEvt, RequestEvtSchema } from '../sessions/schemas/request.schema';
+import {
+  RequestEvt,
+  RequestEvtSchema,
+} from '../sessions/schemas/request.schema';
 import { DbChange, DbChangeSchema } from '../sessions/schemas/db-change.schema';
 import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
 import { TraceEvt, TraceEvtSchema } from '../sessions/schemas/trace.schema';

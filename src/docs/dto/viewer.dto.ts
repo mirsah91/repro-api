@@ -194,7 +194,8 @@ export class DbChangeDto {
     required: false,
     type: Object,
     additionalProperties: true,
-    description: 'Captured query details (filter/update/projection/options/pipeline)',
+    description:
+      'Captured query details (filter/update/projection/options/pipeline)',
   })
   @IsOptional()
   @IsObject()

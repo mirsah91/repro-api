@@ -1,10 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import {
-  IsIn,
-  IsOptional,
-  IsString,
-  ValidateNested,
-} from 'class-validator';
+import { IsIn, IsOptional, IsString, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { AppUserRole } from '../../apps/schemas/app-user.schema';
 
@@ -151,7 +146,8 @@ export class UpdateAppUserDto {
 
   @ApiPropertyOptional({
     example: true,
-    description: 'Reset the user password and return the new value in the response.',
+    description:
+      'Reset the user password and return the new value in the response.',
   })
   resetPassword?: boolean;
 }
@@ -270,7 +266,9 @@ export class SessionSummaryResponseDto {
 }
 
 export class SessionChatResponseDto {
-  @ApiProperty({ example: 'Requests to /api/checkout began failing after the DB migration…' })
+  @ApiProperty({
+    example: 'Requests to /api/checkout began failing after the DB migration…',
+  })
   reply!: string;
 
   @ApiProperty({
