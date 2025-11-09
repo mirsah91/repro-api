@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
@@ -15,6 +16,7 @@ import { DbChange } from './schemas/db-change.schema';
 import { EmailEvt } from './schemas/emails.schema';
 import { TraceEvt } from './schemas/trace.schema';
 import { TraceSummary } from './schemas/trace-summary.schema';
+import { TraceNode } from './schemas/trace-node.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
 import {
   hydrateChangeDoc,
@@ -32,11 +34,45 @@ const TRACE_SEGMENT_SUMMARY_LENGTH = 800;
 const CHAT_MAX_DATASET_CHUNKS = 6;
 const CHUNK_SUMMARY_MAX_TOKENS = 450;
 const SUMMARY_CHUNK_LIMIT = 40;
-const TRACE_CHILD_EXPANSION_LIMIT = 4;
-const TRACE_PARENT_EXPANSION_LIMIT = 2;
+const TRACE_CHILD_EXPANSION_LIMIT = 150;
+const TRACE_PARENT_EXPANSION_LIMIT = 150;
+const FOCUS_CHUNK_EXTRA_LIMIT = 3;
+const FOCUS_NODE_LIMIT = 80;
+const CHAT_SYSTEM_PROMPT = [
+  'You are the lead engineer fully responsible for this session’s codebase and runtime traces.',
+  '',
+  'Goal: answer with surgical precision using only evidence in this session. Never speculate or hedge ("maybe", "likely", etc.).',
+  '',
+  'Behavior rules:',
+  '- Start by naming the exact endpoint (HTTP method + path) and controller file:line when available.',
+  '- Map request bodies to controller arguments when the trace lacks explicit args, and map response bodies to the return value when no explicit result is captured.',
+  '- Surface only the functions, arguments, responses, and side effects that answer the user’s question; do not dump unrelated traces.',
+  '- If the user targets a nested helper, include that helper plus the nearest parent/child functions and offer to expand on it only if the user asks.',
+  '',
+  'When answering:',
+  '1. List every relevant function call in execution order with name, file:line, args (JSON), return value (JSON), and any DB/external operations it performs.',
+  '2. Provide JSON blocks for request/response/params/query whenever they inform the answer or substitute for missing args/results.',
+  '3. Clearly describe DB operations or external calls with the function/file that invoked them.',
+  '4. Summarize the core logic in concise paragraphs after the structured details.',
+  '5. If additional focused functions are available, end the answer with “Need details on <fn list>?” referencing up to three remaining names.',
+  '6. If data is missing, state "Not captured in trace/body/query" instead of guessing.',
+  '',
+  'Formatting guidelines:',
+  '- Use fenced JSON for arguments, request bodies, responses, or params.',
+  '- Include `file.ts:123` exactly when both file and line exist; otherwise say "location unavailable".',
+  '- Never invent filenames, functions, or values.',
+  '',
+  'Tone:',
+  '- Speak as the code owner: confident, technical, zero filler.',
+  '- Answer only what the user asked; do not ask follow-up questions unless the user explicitly requests more detail.',
+  '',
+  'Remember: request body ⇔ controller args, response body ⇔ return value, unless explicit trace data overrides it.'
+].join('\n');
+
 
 @Injectable()
 export class SessionSummaryService {
+  private readonly logger = new Logger(SessionSummaryService.name);
   private openai?: OpenAI;
 
   constructor(
@@ -48,6 +84,8 @@ export class SessionSummaryService {
     @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     @InjectModel(TraceSummary.name)
     private readonly traceSummaries: Model<TraceSummary>,
+    @InjectModel(TraceNode.name)
+    private readonly traceNodes: Model<TraceNode>,
     private readonly tenant: TenantContext,
     private readonly config: ConfigService,
   ) {}
@@ -298,57 +336,77 @@ export class SessionSummaryService {
     try {
       const conversation = this.normalizeHintMessages(opts?.messages);
       const hintTokens = this.extractHintTokens(opts?.messages ?? []);
+      const datasetFocusIds = new Set(dataset.focus?.chunkIds ?? []);
+      const focusFunctions = dataset.focus?.functions ?? [];
+      const focusChunkIds = this.determineFocusChunkIds(
+        dataset.chunks,
+        hintTokens,
+        datasetFocusIds,
+      );
       const selectedChunks = this.selectDatasetChunks(
         dataset.chunks,
         hintTokens,
         CHAT_MAX_DATASET_CHUNKS,
+        focusChunkIds,
       );
       const expandedChunks = this.expandChunksWithRelated(
-        selectedChunks,
+        this.appendFocusChunks(
+          selectedChunks,
+          dataset.chunks,
+          focusChunkIds,
+          CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
+        ),
         dataset.chunks,
-        Math.min(dataset.chunks.length, CHAT_MAX_DATASET_CHUNKS + 4),
+        Math.min(
+          dataset.chunks.length,
+          CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
+        ),
       );
       const datasetContext = this.composeChunkContext(
         expandedChunks,
         dataset.chunks.length,
       );
 
+      const llmMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+        {
+          role: 'system',
+          content: CHAT_SYSTEM_PROMPT,
+        },
+      ];
+
+      const focusFollowups = focusFunctions.slice(0, 5);
+      if (focusFollowups.length) {
+        llmMessages.push({
+          role: 'system',
+          content: [
+            'Focused functions with full context:',
+            focusFollowups.join(', '),
+            'After answering, append "Need details on <fn list>?" referencing up to three of these names if additional detail could help.',
+          ].join(' '),
+        });
+      }
+
+      llmMessages.push(...conversation);
+      llmMessages.push({
+        role: 'system',
+        content: datasetContext,
+      });
+
+      this.logger.debug('chatSession LLM payload', {
+        sessionId,
+        messageCount: llmMessages.length,
+        datasetChunkCount: dataset.chunks.length,
+      });
+      this.logger.verbose('chatSession LLM messages', {
+        sessionId,
+        messages: llmMessages,
+      });
+
       const completion = await client.chat.completions.create({
         model,
         temperature: 0.2,
         max_tokens: 700,
-        messages: [
-          {
-            role: 'system',
-            content: [
-              'You are the lead engineer fully responsible for this specific session’s codebase.',
-              'Respond with expert, surgical precision — give only what is relevant to the user’s question, but make every sentence meaningful and technically complete.',
-              '',
-              'When explaining where or how something happens, always provide:',
-              '- The **exact HTTP method**, **full route**, and if available, **controller file + line** (e.g., PATCH /shipments/:id → controllers/shipment.controller.ts:123).',
-              '- The **service or helper function** responsible, its **file and line**, and the **key operations** performed inside (e.g., DB writes, API calls, internal function calls).',
-              '- Any **important arguments**, **return values**, or **side effects** only if they’re directly relevant to the question.',
-              '- If the context includes nested or related functions (e.g., a service method calling another), summarize the chain of calls and ask: “Would you like details on this inner call as well?”',
-              '',
-              'Always answer like a code owner explaining production logic to a new engineer:',
-              '- Use concise but rich, high-signal paragraphs — no vague summaries.',
-              '- Include all known trace, file, and function info when available.',
-              '- Use `file.ts:123` format **only** when both filename and line are explicitly known; otherwise say “location unavailable”.',
-              '- When something is not in context, clearly state that it’s unavailable, not omitted.',
-              '',
-              'Example:',
-              'Q: “Where does the dispatch action actually happen?”',
-              'A: The dispatch action occurs in the service layer at `services/shipment.service.ts:1034`, within the `dispatch` function. This function first updates the shipment’s status in the database (`Shipment.updateOne`) to mark it as dispatched, then triggers a notification event through `NotificationService.sendDispatchNotice`. It finally returns the updated shipment object. The controller entry point is `PATCH /shipments/:id/dispatch` → `controllers/shipment.controller.ts:142`, which passes `protocolId`, `shipmentId`, and `dispatchData` from the request body. Would you like me to expand on the database update or the notification flow?',
-              '',
-              'Tone: Confident, technical, and direct — you own this code path.'
-            ].join(' ')
-          },
-          ...conversation,
-          {
-            role: 'system',
-            content: datasetContext,
-          },
-        ],
+        messages: llmMessages,
       });
 
       reply =
@@ -389,6 +447,7 @@ export class SessionSummaryService {
     sessionId: string,
     opts?: { appId?: string; hintMessages?: HintMessageParam[] },
   ): Promise<SessionDataset> {
+    const hintTokens = this.extractHintTokens(opts?.hintMessages ?? []);
     const sessionDoc = await this.sessions
       .findOne(
         this.tenantFilter({
@@ -478,13 +537,23 @@ export class SessionSummaryService {
       opts?.hintMessages ?? [],
       requestIndex,
     );
-    const chunks = this.buildDatasetChunks(
+    const focusEntries = await this.fetchFocusTraceEntries(
+      sessionId,
+      hintTokens,
+      FOCUS_NODE_LIMIT,
+    );
+    const {
+      chunks,
+      focusChunkIds,
+      focusFunctions,
+    } = this.buildDatasetChunks(
       payload,
       jsonSnapshot,
       actionIndex,
       requestIndex,
       traceIndex,
       retrievalEntries,
+      focusEntries,
     );
     const serialized = chunks.map((chunk) => chunk.text).join('\n\n');
 
@@ -498,6 +567,10 @@ export class SessionSummaryService {
         traces: traces.length,
       },
       chunks,
+      focus: {
+        chunkIds: Array.from(focusChunkIds),
+        functions: Array.from(focusFunctions),
+      },
     };
   }
 
@@ -576,9 +649,16 @@ export class SessionSummaryService {
     requestIndex: RequestIndex,
     traceIndex: TraceRefIndex,
     retrievalEntries: TraceSummaryEntry[] = [],
-  ): DatasetChunk[] {
+    focusEntries: TraceSummaryEntry[] = [],
+  ): {
+    chunks: DatasetChunk[];
+    focusChunkIds: Set<string>;
+    focusFunctions: Set<string>;
+  } {
     const chunks: DatasetChunk[] = [];
     const seenChunkIds = new Set<string>();
+    const focusChunkIds = new Set<string>();
+    const focusFunctions = new Set<string>();
     const timelineContext: TimelineContext = {
       dbChanges: payload.timeline.dbChanges ?? [],
       emails: payload.timeline.emails ?? [],
@@ -696,8 +776,19 @@ export class SessionSummaryService {
       });
     });
 
-    retrievalEntries.forEach((entry, idx) => {
+    const focusChunkIdSet = new Set(
+      focusEntries
+        .map((entry) => entry.chunkId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const combinedEntries = this.mergeTraceEntriesWithFocus(
+      retrievalEntries,
+      focusEntries,
+    );
+
+    combinedEntries.forEach((entry, idx) => {
       const chunkId = `traceSummary:${entry.groupId}:${entry.segmentIndex}:${idx}`;
+      const isFocus = entry.__focus === true || focusChunkIdSet.has(entry.chunkId ?? '');
       pushChunk({
         id: chunkId,
         kind: 'trace',
@@ -708,6 +799,7 @@ export class SessionSummaryService {
           parentChunkId: entry.parentChunkId ?? undefined,
           depth: entry.depth ?? undefined,
           files: this.collectFilesForTraceEntry(entry),
+          focus: isFocus || undefined,
         },
         text: this.formatTraceSummaryEntryChunk(
           entry,
@@ -716,6 +808,16 @@ export class SessionSummaryService {
           timelineContext,
         ),
       });
+      if (isFocus) {
+        focusChunkIds.add(chunkId);
+        const fn =
+          entry.functionName ??
+          entry.nodeDetail?.functionName ??
+          undefined;
+        if (fn) {
+          focusFunctions.add(fn);
+        }
+      }
     });
 
     this.splitRawSnapshot(jsonSnapshot).forEach((text, part) => {
@@ -727,7 +829,7 @@ export class SessionSummaryService {
       });
     });
 
-    return chunks;
+    return { chunks, focusChunkIds, focusFunctions };
   }
 
   private describeSession(session: Record<string, any>): string {
@@ -1107,6 +1209,18 @@ export class SessionSummaryService {
     }
   }
 
+  private normalizeEndpointPath(path: string): string {
+    if (!path) {
+      return '';
+    }
+    try {
+      const parsed = new URL(path, 'https://dummy');
+      return (parsed.pathname ?? '/').toLowerCase();
+    } catch {
+      return path.startsWith('/') ? path.toLowerCase() : `/${path.toLowerCase()}`;
+    }
+  }
+
   private indexActionsById(actions: any[]): ActionIndex {
     const map: ActionIndex = {};
     for (const action of actions ?? []) {
@@ -1133,10 +1247,21 @@ export class SessionSummaryService {
       }
       const rid = request.rid ?? request.requestRid;
       if (!rid) continue;
+      const bodyPreview = this.previewJson(request.body, 800);
+      const respPreview = this.previewJson(request.respBody, 800);
+      const paramsPreview = this.previewJson(request.params, 400);
+      const queryPreview = this.previewJson(request.query, 400);
+      const headersPreview = this.previewJson(request.headers, 400);
       map[rid] = {
         rid,
         method: (request.method ?? 'GET').toUpperCase(),
         url: this.describeUrl(request.url),
+        actionId: request.actionId ?? request.aid ?? null,
+        bodyPreview,
+        responsePreview: respPreview,
+        paramsPreview,
+        queryPreview,
+        headersPreview,
       };
     }
     return map;
@@ -1227,6 +1352,7 @@ export class SessionSummaryService {
   ): string {
     const rid = entry.requestRid ?? 'n/a';
     const actionId = entry.actionId ?? 'n/a';
+    const node = entry.nodeDetail;
     const requestRef = this.lookupRequest(requestIndex, rid);
     const actionRef = this.lookupAction(actionIndex, actionId);
     const lineage = (entry.lineageTrail ?? [])
@@ -1246,25 +1372,21 @@ export class SessionSummaryService {
         return `  - [${idx + 1}] ${child.functionName ?? 'fn'} ${file} (depth ${child.depth})`;
       })
       .join('\n');
-    const relatedDbChanges = this.findRelatedDbChanges(
+    const relatedDbChangesList = this.findRelatedDbChanges(
       entry,
       timeline.dbChanges,
-    )
+    );
+    const relatedDbChanges = relatedDbChangesList
       .map(
         (change, idx) =>
-          `  - [${idx + 1}] ${(change.op ?? change.operation ?? 'op').toUpperCase()} ${
-            change.collection ?? change.table ?? 'collection'
-          } (request ${change.requestRid ?? change.rid ?? 'n/a'})`,
+          `  - [${idx + 1}] ${change.summary ?? this.toShortText(change.op ?? 'operation', 80)}`,
       )
       .join('\n');
-    const relatedEmails = this.findRelatedEmails(entry, timeline.emails)
+    const relatedEmailsList = this.findRelatedEmails(entry, timeline.emails);
+    const relatedEmails = relatedEmailsList
       .map(
         (email, idx) =>
-          `  - [${idx + 1}] ${this.toShortText(email.subject ?? '(no subject)', 80)} -> ${
-            Array.isArray(email.to)
-              ? email.to.join(', ')
-              : (email.to ?? 'unknown')
-          }`,
+          `  - [${idx + 1}] ${this.describeEmailSummary(email)}`,
       )
       .join('\n');
     const preview = (entry.previewEvents ?? [])
@@ -1279,23 +1401,99 @@ export class SessionSummaryService {
         return `  - [${idx + 1}] ${file}:${line}${fn}`;
       })
       .join('\n');
+    const metadataSection =
+      node?.metadata && node.metadata.length
+        ? node.metadata
+            .slice(0, 10)
+            .map(
+              (item, idx) =>
+                `  - [${idx + 1}] ${item.key}: ${item.value ?? 'n/a'}`,
+            )
+            .join('\n')
+        : undefined;
+    const argsSource =
+      node?.argsPreview ??
+      requestRef?.bodyPreview ??
+      requestRef?.paramsPreview ??
+      requestRef?.queryPreview ??
+      requestRef?.headersPreview;
+    const argsLabel = node?.argsPreview
+      ? 'Function arguments'
+      : requestRef?.bodyPreview
+        ? 'Request body (used as arguments)'
+        : requestRef?.paramsPreview
+          ? 'Request params (used as arguments)'
+          : requestRef?.queryPreview
+            ? 'Request query (used as arguments)'
+            : requestRef?.headersPreview
+              ? 'Request headers (fallback arguments)'
+              : null;
+    const argsBlock =
+      argsSource && argsLabel
+        ? [argsLabel + ':', '```json', argsSource, '```'].join('\n')
+        : undefined;
+    const resultSource = node?.resultPreview ?? requestRef?.responsePreview;
+    const resultLabel = node?.resultPreview
+      ? 'Return value'
+      : requestRef?.responsePreview
+        ? 'Response body (used as return value)'
+        : null;
+    const resultBlock =
+      resultSource && resultLabel
+        ? [resultLabel + ':', '```json', resultSource, '```'].join('\n')
+        : undefined;
+    const effectiveFn =
+      entry.functionName ??
+      node?.functionName ??
+      'function name unavailable';
+    const effectiveFile = entry.filePath ?? node?.filePath ?? 'location unavailable';
+    const effectiveLine =
+      entry.lineNumber ??
+      (typeof node?.lineNumber === 'number' ? node.lineNumber : undefined);
+
     return [
       `## Trace Function Segment`,
       `chunkId: ${entry.chunkId ?? 'legacy'}`,
       entry.chunkKind ? `kind: ${entry.chunkKind}` : undefined,
       typeof entry.depth === 'number' ? `depth: ${entry.depth}` : undefined,
-      entry.functionName
-        ? `function: ${entry.functionName} (${entry.filePath ?? 'file'}${entry.lineNumber ? `:${entry.lineNumber}` : ''})`
-        : undefined,
+      `function: ${effectiveFn} (${effectiveFile}${effectiveLine ? `:${effectiveLine}` : ''})`,
+      node?.durationMs ? `duration: ${node.durationMs}ms` : undefined,
       `requestRid: ${rid}`,
       `request: ${requestRef ? `${requestRef.method} ${requestRef.url}` : 'unknown'}`,
       `actionId: ${actionId}`,
       `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
+      actionRef?.startedAt ? `actionWindow: ${actionRef.startedAt} → ${actionRef.endedAt ?? 'open'}` : undefined,
       `events: ${entry.eventCount} (segment ${entry.segmentIndex})`,
       lineage ? `ancestors:\n${lineage}` : undefined,
       children ? `children:\n${children}` : undefined,
       relatedDbChanges ? `related DB changes:\n${relatedDbChanges}` : undefined,
       relatedEmails ? `related emails:\n${relatedEmails}` : undefined,
+      metadataSection ? `metadata:\n${metadataSection}` : undefined,
+      requestRef?.bodyPreview
+        ? ['request body:', '```json', requestRef.bodyPreview, '```'].join('\n')
+        : undefined,
+      requestRef?.responsePreview
+        ? ['response body:', '```json', requestRef.responsePreview, '```'].join(
+            '\n',
+          )
+        : undefined,
+      requestRef?.paramsPreview
+        ? ['request params:', '```json', requestRef.paramsPreview, '```'].join(
+            '\n',
+          )
+        : undefined,
+      requestRef?.queryPreview
+        ? ['request query:', '```json', requestRef.queryPreview, '```'].join(
+            '\n',
+          )
+        : undefined,
+      requestRef?.headersPreview
+        ? ['request headers:', '```json', requestRef.headersPreview, '```'].join(
+            '\n',
+          )
+        : undefined,
+      argsBlock,
+      resultBlock,
       `summary:`,
       entry.summary,
       preview ? `preview:\n${preview}` : undefined,
@@ -1325,7 +1523,11 @@ export class SessionSummaryService {
             actionId;
         return matchesRid || matchesAction;
       })
-      .slice(0, 3);
+      .slice(0, 3)
+      .map((change) => ({
+        ...change,
+        summary: this.formatDbChangeSummaryInline(change),
+      }));
   }
 
   private findRelatedEmails(entry: TraceSummaryEntry, emails: any[]): any[] {
@@ -1345,6 +1547,67 @@ export class SessionSummaryService {
         return matchesRid || matchesAction;
       })
       .slice(0, 3);
+  }
+
+  private formatDbChangeSummaryInline(change: any): string {
+    if (!change || typeof change !== 'object') {
+      return 'db change (unknown)';
+    }
+    const collection = change.collection ?? change.table ?? 'collection';
+    const op = (change.op ?? change.operation ?? 'operation').toUpperCase();
+    const rid = change.requestRid ?? change.rid ?? 'n/a';
+    const dur =
+      typeof change.durMs === 'number' && Number.isFinite(change.durMs)
+        ? `${Math.round(change.durMs)}ms`
+        : null;
+    const query = this.previewJson(
+      change.query ?? change.filter ?? change.criteria,
+      280,
+    );
+    const result = this.previewJson(change.resultMeta, 280);
+    const before = this.previewJson(change.before, 200);
+    const after = this.previewJson(change.after, 200);
+    const detailLines = [
+      `${collection}.${op} (request ${rid}${dur ? `, ${dur}` : ''})`,
+      query ? `    query: ${query}` : null,
+      before ? `    before: ${before}` : null,
+      after ? `    after: ${after}` : null,
+      result ? `    result: ${result}` : null,
+    ].filter(Boolean);
+    const error =
+      change.error && typeof change.error === 'object'
+        ? this.previewJson(change.error, 200)
+        : change.error
+          ? String(change.error)
+          : null;
+    if (error) {
+      detailLines.push(`    error: ${error}`);
+    }
+    return detailLines.join('\n');
+  }
+
+  private describeEmailSummary(email: any): string {
+    if (!email || typeof email !== 'object') {
+      return '(unknown email)';
+    }
+    const subject = this.toShortText(email.subject ?? '(no subject)', 120);
+    const toList = Array.isArray(email.to)
+      ? email.to.map((addr: any) => addr?.email ?? addr).filter(Boolean)
+      : email.to
+        ? [email.to]
+        : [];
+    const recipients = toList.length ? toList.join(', ') : 'recipients unknown';
+    const status =
+      typeof email.statusCode === 'number'
+        ? `status=${email.statusCode}`
+        : null;
+    const dur =
+      typeof email.durMs === 'number' && Number.isFinite(email.durMs)
+        ? `${Math.round(email.durMs)}ms`
+        : null;
+    return [subject, recipients, status, dur]
+      .filter(Boolean)
+      .join(' | ');
   }
 
   private collectFilesFromPreview(
@@ -1400,6 +1663,7 @@ export class SessionSummaryService {
     chunks: DatasetChunk[],
     tokens: HintTokens,
     maxChunks: number,
+    focusChunkIds?: Set<string>,
   ): DatasetChunk[] {
     if (!chunks?.length) {
       return [];
@@ -1408,9 +1672,13 @@ export class SessionSummaryService {
       return chunks;
     }
 
+    const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+    const forcedIds = focusChunkIds ?? new Set<string>();
+
     const scored = chunks.map((chunk) => ({
       chunk,
       score: this.scoreDatasetChunk(chunk, tokens),
+      forced: forcedIds.has(chunk.id),
     }));
 
     scored.sort((a, b) => {
@@ -1421,12 +1689,70 @@ export class SessionSummaryService {
     });
 
     const selected = scored.slice(0, maxChunks);
-    const hasSignal = selected.some((item) => item.score > 0);
-    if (!hasSignal) {
-      return chunks.slice(0, maxChunks);
+    const selectedIds = new Set(selected.map((entry) => entry.chunk.id));
+
+    const missingForced: typeof scored = [];
+    for (const id of forcedIds) {
+      if (!selectedIds.has(id)) {
+        const chunk = chunkById.get(id);
+        if (chunk) {
+          missingForced.push({
+            chunk,
+            score: Number.MAX_SAFE_INTEGER,
+            forced: true,
+          });
+        }
+      }
     }
 
-    return selected.map((item) => item.chunk).sort((a, b) => a.index - b.index);
+    selected.push(...missingForced);
+
+    const hasSignal = selected.some((item) => item.score > 0);
+    if (!hasSignal) {
+      return chunks.slice(0, Math.min(chunks.length, maxChunks));
+    }
+
+    const effectiveMax = Math.min(
+      chunks.length,
+      maxChunks + Math.min(missingForced.length, FOCUS_CHUNK_EXTRA_LIMIT),
+    );
+
+    selected.sort((a, b) => {
+      if (a.forced && !b.forced) return -1;
+      if (b.forced && !a.forced) return 1;
+      if (b.score === a.score) {
+        return a.chunk.index - b.chunk.index;
+      }
+      return b.score - a.score;
+    });
+
+    const trimmed = selected.slice(0, effectiveMax);
+    trimmed.sort((a, b) => a.chunk.index - b.chunk.index);
+    return trimmed.map((item) => item.chunk);
+  }
+
+  private mergeTraceEntriesWithFocus(
+    baseEntries: TraceSummaryEntry[],
+    focusEntries: TraceSummaryEntry[],
+  ): Array<TraceSummaryEntry & { __focus?: boolean }> {
+    const map = new Map<string, TraceSummaryEntry & { __focus?: boolean }>();
+    const combine = (
+      entry: TraceSummaryEntry,
+      isFocus: boolean,
+    ): void => {
+      const key = `${entry.groupId}:${entry.segmentIndex}`;
+      if (!map.has(key)) {
+        map.set(key, { ...entry, __focus: isFocus || undefined });
+      } else if (isFocus) {
+        const existing = map.get(key);
+        if (existing) {
+          existing.__focus = true;
+        }
+      }
+    };
+    baseEntries?.forEach((entry) => combine(entry, false));
+    focusEntries?.forEach((entry) => combine(entry, true));
+    return Array.from(map.values());
   }
 
   private scoreDatasetChunk(chunk: DatasetChunk, tokens: HintTokens): number {
@@ -1467,18 +1793,36 @@ export class SessionSummaryService {
         String(chunk.metadata.url),
         keywordList,
       );
+      const path = this.normalizeEndpointPath(String(chunk.metadata.url));
+      if (tokens.endpoints.has(path)) {
+        score += 5;
+      }
+    }
+    if (chunk.metadata?.method) {
+      const method = String(chunk.metadata.method).toUpperCase();
+      if (tokens.httpMethods.has(method)) {
+        score += 2;
+      }
     }
     if (chunk.metadata?.rid) {
       score += this.scoreTextAgainstKeywords(
         String(chunk.metadata.rid),
         keywordList,
       );
+      if (tokens.requestIds.has(String(chunk.metadata.rid).toLowerCase())) {
+        score += 4;
+      }
     }
     if (chunk.metadata?.actionId) {
       score += this.scoreTextAgainstKeywords(
         String(chunk.metadata.actionId),
         keywordList,
       );
+      if (
+        tokens.actionIds.has(String(chunk.metadata.actionId).toLowerCase())
+      ) {
+        score += 4;
+      }
     }
     if (Array.isArray(chunk.metadata?.files)) {
       for (const file of chunk.metadata.files) {
@@ -1511,6 +1855,9 @@ export class SessionSummaryService {
     const relatedKeys = new Set<string>();
     selected.forEach((chunk) => {
       const meta = chunk.metadata ?? {};
+      if (meta.focus) {
+        seen.add(chunk.id);
+      }
       if (meta.rid) relatedKeys.add(`rid:${meta.rid}`);
       if (meta.actionId) relatedKeys.add(`action:${meta.actionId}`);
     });
@@ -1529,6 +1876,101 @@ export class SessionSummaryService {
     }
 
     return out;
+  }
+
+  private appendFocusChunks(
+    selected: DatasetChunk[],
+    allChunks: DatasetChunk[],
+    focusIds: Set<string>,
+    limit: number,
+  ): DatasetChunk[] {
+    if (!focusIds?.size) {
+      return selected;
+    }
+    const out = [...selected];
+    const seen = new Set(selected.map((chunk) => chunk.id));
+    const chunkById = new Map(allChunks.map((chunk) => [chunk.id, chunk]));
+
+    for (const id of focusIds) {
+      if (seen.has(id)) continue;
+      const chunk = chunkById.get(id);
+      if (chunk) {
+        out.push(chunk);
+        seen.add(id);
+      }
+      if (out.length >= limit) {
+        break;
+      }
+    }
+    return out;
+  }
+
+  private determineFocusChunkIds(
+    chunks: DatasetChunk[],
+    tokens: HintTokens,
+    extraIds?: Set<string>,
+  ): Set<string> {
+    const focus = new Set<string>(extraIds ?? []);
+    if (!chunks?.length) {
+      return focus;
+    }
+    const ridSet = new Set(Array.from(tokens.requestIds).map((id) => id));
+    const actionSet = new Set(Array.from(tokens.actionIds).map((id) => id));
+    const endpointSet = new Set(Array.from(tokens.endpoints));
+    const methodSet = new Set(Array.from(tokens.httpMethods));
+
+    for (const chunk of chunks) {
+      const meta = chunk.metadata ?? {};
+      if (meta.focus) {
+        focus.add(chunk.id);
+        continue;
+      }
+      const rid =
+        typeof meta.rid === 'string' ? meta.rid.toLowerCase() : undefined;
+      if (rid && ridSet.has(rid)) {
+        focus.add(chunk.id);
+        continue;
+      }
+      const actionId =
+        typeof meta.actionId === 'string'
+          ? meta.actionId.toLowerCase()
+          : undefined;
+      if (actionId && actionSet.has(actionId)) {
+        focus.add(chunk.id);
+        continue;
+      }
+      const urlPath =
+        typeof meta.url === 'string'
+          ? this.normalizeEndpointPath(meta.url)
+          : undefined;
+      const method =
+        typeof meta.method === 'string'
+          ? meta.method.toUpperCase()
+          : undefined;
+      if (urlPath && endpointSet.has(urlPath)) {
+        focus.add(chunk.id);
+        continue;
+      }
+      if (urlPath && endpointSet.size) {
+        for (const endpoint of endpointSet) {
+          if (urlPath.startsWith(endpoint)) {
+            focus.add(chunk.id);
+            break;
+          }
+        }
+        if (focus.has(chunk.id)) continue;
+      }
+      if (
+        method &&
+        methodSet.has(method) &&
+        chunk.kind === 'request' &&
+        endpointSet.size
+      ) {
+        focus.add(chunk.id);
+      }
+    }
+
+    return focus;
   }
 
   private composeChunkContext(
@@ -1587,6 +2029,11 @@ export class SessionSummaryService {
       ? prioritizedTraces
       : this.sampleEvenly(traces, 25);
     const scopedTraces = this.mergeCollections(baseTraces, keywordTraces, 25);
+    const traceRids = new Set(
+      scopedTraces
+        .map((trace: any) => this.resolveRequestId(trace))
+        .filter((rid): rid is string => Boolean(rid)),
+    );
 
     const prioritizedRequestIds = new Set(
       prioritizedTraces
@@ -1598,10 +2045,16 @@ export class SessionSummaryService {
       ? this.composePrioritizedRequests(requests, prioritizedRequestIds, tokens)
       : this.sampleEvenly(requests, 12);
     const keywordRequests = this.filterRequestsByKeywords(requests, tokens);
-    const scopedRequests = this.mergeCollections(
+    const mergedRequests = this.mergeCollections(
       baseRequests,
       keywordRequests,
-      14,
+      20,
+    );
+    const scopedRequests = this.ensureRequestsForTraceRids(
+      mergedRequests,
+      requests,
+      traceRids,
+      24,
     );
 
     return {
@@ -1875,6 +2328,18 @@ export class SessionSummaryService {
     const collected: TraceSummaryEntry[] = [];
     const seen = new Set<string>();
 
+    const nodeEntries = await this.findTraceEntriesFromNodes(
+      sessionId,
+      tokens,
+      limit,
+    );
+    for (const entry of nodeEntries) {
+      const key = `${entry.groupId}:${entry.segmentIndex}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      collected.push(entry);
+    }
+
     for (const query of queries) {
       const docs = await this.traceSummaries
         .find(query)
@@ -1926,7 +2391,330 @@ export class SessionSummaryService {
       .slice(0, limit)
       .map((item) => item.entry);
 
-    return this.expandTraceSummaryEntries(sessionId, selected);
+    const expanded = await this.expandTraceSummaryEntries(sessionId, selected);
+    return this.attachTraceNodeDetails(sessionId, expanded);
+  }
+
+  private async fetchFocusTraceEntries(
+    sessionId: string,
+    tokens: HintTokens,
+    limit: number,
+  ): Promise<TraceSummaryEntry[]> {
+    let seeds: TraceNodeDetail[] = [];
+    if (tokens.functions.size || tokens.files.size) {
+      const orFilters: any[] = [];
+      if (tokens.functions.size) {
+        const fnList = Array.from(tokens.functions).map(
+          (fn) => new RegExp(`^${fn}$`, 'i'),
+        );
+        orFilters.push({ functionName: { $in: fnList } });
+      }
+      if (tokens.files.size) {
+        const fileList = Array.from(tokens.files).map(
+          (file) => new RegExp(this.escapeRegex(file), 'i'),
+        );
+        orFilters.push({ filePath: { $in: fileList } });
+      }
+      const query =
+        orFilters.length === 1
+          ? this.tenantFilter({
+              sessionId,
+              ...orFilters[0],
+            })
+          : this.tenantFilter({
+              sessionId,
+              $or: orFilters,
+            });
+      seeds = await this.traceNodes
+        .find(query)
+        .sort({ updatedAt: -1 })
+        .limit(limit)
+        .lean()
+        .exec();
+    }
+    if (!seeds?.length && tokens.requestIds.size) {
+      seeds = await this.traceNodes
+        .find(
+          this.tenantFilter({
+            sessionId,
+            requestRid: { $in: Array.from(tokens.requestIds) },
+          }),
+        )
+        .sort({ updatedAt: -1 })
+        .limit(limit)
+        .lean()
+        .exec();
+    }
+    if (!seeds?.length && tokens.endpoints.size) {
+      const endpointRegexes = Array.from(tokens.endpoints).map(
+        (endpoint) => new RegExp(this.escapeRegex(endpoint), 'i'),
+      );
+      const matchingRequests = await this.requests
+        .find(
+          this.tenantFilter({
+            sessionId,
+            url: { $in: endpointRegexes },
+          }),
+          { rid: 1 },
+        )
+        .limit(limit * 2)
+        .lean()
+        .exec();
+      const ridList = matchingRequests
+        .map((req: any) => req?.rid)
+        .filter((rid): rid is string => Boolean(rid));
+      if (ridList.length) {
+        seeds = await this.traceNodes
+          .find(
+            this.tenantFilter({
+              sessionId,
+              requestRid: { $in: ridList },
+            }),
+          )
+          .sort({ updatedAt: -1 })
+          .limit(limit)
+          .lean()
+          .exec();
+      }
+    }
+    if (!seeds?.length) {
+      return [];
+    }
+
+    const cache = new Map<string, TraceNodeDetail>();
+    for (const node of seeds) {
+      cache.set(node.chunkId, node as TraceNodeDetail);
+    }
+
+    const parentIds = await this.expandTraceNodeIds(
+      sessionId,
+      seeds
+        .map((node) => node.parentChunkId)
+        .filter((id): id is string => Boolean(id)),
+      'parent',
+      TRACE_PARENT_EXPANSION_LIMIT,
+      cache,
+    );
+    const childIds = await this.expandTraceNodeIds(
+      sessionId,
+      seeds
+        .flatMap((node) => node.childChunkIds ?? [])
+        .filter((id): id is string => Boolean(id)),
+      'child',
+      TRACE_CHILD_EXPANSION_LIMIT,
+      cache,
+    );
+
+    const chunkIdSet = new Set<string>();
+    seeds.forEach((node) => {
+      if (node.chunkId) chunkIdSet.add(node.chunkId);
+    });
+    parentIds.forEach((id) => chunkIdSet.add(id));
+    childIds.forEach((id) => chunkIdSet.add(id));
+
+    const chunkIds = Array.from(chunkIdSet);
+    if (!chunkIds.length) {
+      return [];
+    }
+
+    const summariesMap = await this.fetchTraceSummariesByChunkIds(
+      sessionId,
+      chunkIds,
+    );
+    const entries: TraceSummaryEntry[] = [];
+    for (const id of chunkIds) {
+      const entry = summariesMap.get(id);
+      if (entry) {
+        const nodeDetail = cache.get(id);
+        entries.push({
+          ...entry,
+          nodeDetail,
+          __focus: true,
+        } as TraceSummaryEntry & { __focus?: boolean });
+      }
+    }
+    return entries;
+  }
+
+  private async expandTraceNodeIds(
+    sessionId: string,
+    initialIds: string[],
+    direction: 'parent' | 'child',
+    limit: number,
+    cache: Map<string, TraceNodeDetail>,
+  ): Promise<Set<string>> {
+    const result = new Set<string>();
+    let frontier = initialIds.filter(Boolean);
+    while (frontier.length && result.size < limit) {
+      await this.loadTraceNodes(sessionId, frontier, cache);
+      const next: string[] = [];
+      for (const id of frontier) {
+        if (!id || result.has(id)) continue;
+        const node = cache.get(id);
+        if (!node) continue;
+        result.add(id);
+        if (direction === 'parent' && node.parentChunkId) {
+          next.push(node.parentChunkId);
+        } else if (direction === 'child' && node.childChunkIds?.length) {
+          for (const child of node.childChunkIds) {
+            if (child) next.push(child);
+          }
+        }
+        if (result.size >= limit) {
+          break;
+        }
+      }
+      frontier = next;
+    }
+    return result;
+  }
+
+  private async loadTraceNodes(
+    sessionId: string,
+    chunkIds: string[],
+    cache: Map<string, TraceNodeDetail>,
+  ): Promise<void> {
+    const missing = Array.from(
+      new Set(
+        chunkIds.filter(
+          (id) => id && !cache.has(id),
+        ),
+      ),
+    );
+    if (!missing.length) {
+      return;
+    }
+    const docs = await this.traceNodes
+      .find(
+        this.tenantFilter({
+          sessionId,
+          chunkId: { $in: missing },
+        }),
+      )
+      .lean()
+      .exec();
+    for (const doc of docs ?? []) {
+      if (doc?.chunkId) {
+        cache.set(doc.chunkId, doc as TraceNodeDetail);
+      }
+    }
+  }
+
+  private async findTraceEntriesFromNodes(
+    sessionId: string,
+    tokens: HintTokens,
+    limit: number,
+  ): Promise<TraceSummaryEntry[]> {
+    const functionHints = Array.from(tokens.functions).filter(Boolean);
+    const fileHints = Array.from(
+      new Set([...tokens.files, ...tokens.fileBases]),
+    ).filter(Boolean);
+    if (!functionHints.length && !fileHints.length) {
+      return [];
+    }
+    const orFilters: any[] = [];
+    if (functionHints.length) {
+      orFilters.push({ functionName: { $in: functionHints } });
+    }
+    if (fileHints.length) {
+      const regexes = fileHints.map(
+        (hint) => new RegExp(this.escapeRegex(hint), 'i'),
+      );
+      orFilters.push({ filePath: { $in: regexes } });
+    }
+    const query = this.tenantFilter({
+      sessionId,
+      ...(orFilters.length
+        ? orFilters.length === 1
+          ? orFilters[0]
+          : { $or: orFilters }
+        : {}),
+    });
+    const nodeDocs = await this.traceNodes
+      .find(query)
+      .sort({ updatedAt: -1 })
+      .limit(limit * 4)
+      .lean()
+      .exec();
+    if (!nodeDocs?.length) {
+      return [];
+    }
+    const chunkIds = Array.from(
+      new Set(
+        nodeDocs
+          .map((doc) => doc?.chunkId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    if (!chunkIds.length) {
+      return [];
+    }
+    const summaries = await this.fetchTraceSummariesByChunkIds(
+      sessionId,
+      chunkIds,
+    );
+    const nodeMap = new Map<string, TraceNodeDetail>();
+    nodeDocs.forEach((doc) => {
+      if (doc?.chunkId) {
+        nodeMap.set(doc.chunkId, doc as TraceNodeDetail);
+      }
+    });
+    const entries: TraceSummaryEntry[] = [];
+    for (const chunkId of chunkIds) {
+      const entry = summaries.get(chunkId);
+      if (entry) {
+        entries.push({
+          ...entry,
+          nodeDetail: nodeMap.get(chunkId),
+        });
+      }
+      if (entries.length >= limit) {
+        break;
+      }
+    }
+    return entries;
+  }
+
+  private async attachTraceNodeDetails(
+    sessionId: string,
+    entries: TraceSummaryEntry[],
+  ): Promise<TraceSummaryEntry[]> {
+    if (!entries.length) {
+      return entries;
+    }
+    const chunkIds = Array.from(
+      new Set(
+        entries
+          .map((entry) => entry.chunkId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    if (!chunkIds.length) {
+      return entries;
+    }
+    const docs = await this.traceNodes
+      .find(
+        this.tenantFilter({
+          sessionId,
+          chunkId: { $in: chunkIds },
+        }),
+      )
+      .lean()
+      .exec();
+    const map = new Map<string, TraceNodeDetail>();
+    for (const doc of docs ?? []) {
+      if (doc?.chunkId) {
+        map.set(doc.chunkId, doc as TraceNodeDetail);
+      }
+    }
+    return entries.map((entry) => ({
+      ...entry,
+      nodeDetail: entry.chunkId ? map.get(entry.chunkId) : undefined,
+    }));
+  }
+
+  private escapeRegex(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private async expandTraceSummaryEntries(
@@ -2360,15 +3148,74 @@ export class SessionSummaryService {
       return primary.slice(0, maxItems);
     }
     const merged = [...primary];
+    const seen = new Set(merged);
     for (const item of secondary) {
       if (merged.length >= maxItems) {
         break;
       }
-      if (!merged.includes(item)) {
+      if (!seen.has(item)) {
         merged.push(item);
+        seen.add(item);
       }
     }
     return merged.slice(0, maxItems);
+  }
+
+  private ensureRequestsForTraceRids<TRequest>(
+    selected: TRequest[],
+    allRequests: TRequest[],
+    traceRids: Set<string>,
+    maxItems: number,
+  ): TRequest[] {
+    if (!traceRids.size) {
+      return selected.slice(0, maxItems);
+    }
+    const byRid = new Map<string, TRequest>();
+    selected.forEach((request) => {
+      const rid = this.resolveRequestId(request);
+      if (rid && !byRid.has(rid)) {
+        byRid.set(rid, request);
+      }
+    });
+
+    const needed: TRequest[] = [];
+    if (needed.length < traceRids.size) {
+      for (const rid of traceRids) {
+        if (byRid.has(rid)) {
+          continue;
+        }
+        const match = allRequests.find(
+          (request) => this.resolveRequestId(request) === rid,
+        );
+        if (match) {
+          needed.push(match);
+          byRid.set(rid, match);
+        }
+        if (needed.length >= 16) {
+          break;
+        }
+      }
+    }
+
+    const combined = [...selected, ...needed];
+    if (combined.length <= maxItems) {
+      return combined;
+    }
+    const seen = new Set<string>();
+    const trimmed: TRequest[] = [];
+    for (const request of combined) {
+      const rid = this.resolveRequestId(request);
+      const key = rid ?? JSON.stringify(request);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      trimmed.push(request);
+      if (trimmed.length >= maxItems) {
+        break;
+      }
+    }
+    return trimmed;
   }
 
   private buildRequestSearchText(request: any): string {
@@ -2541,6 +3388,10 @@ export class SessionSummaryService {
     const lines = new Set<number>();
     const functions = new Set<string>();
     const keywords = new Set<string>();
+    const requestIds = new Set<string>();
+    const actionIds = new Set<string>();
+    const endpoints = new Set<string>();
+    const httpMethods = new Set<string>();
 
     for (const msg of messages ?? []) {
       const text = this.flattenMessageContent(msg?.content).trim();
@@ -2565,6 +3416,30 @@ export class SessionSummaryService {
         functions.add(match[1].toLowerCase());
       }
 
+      const endpointRegex =
+        /\b(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+([/][^\s]+)/gi;
+      while ((match = endpointRegex.exec(text))) {
+        httpMethods.add(match[1].toUpperCase());
+        endpoints.add(this.normalizeEndpointPath(match[2]));
+      }
+
+      const ridRegex =
+        /\b(?:rid|requestId|request|req)\s*[:=#-]?\s*([a-z0-9_-]{6,})\b/gi;
+      while ((match = ridRegex.exec(text))) {
+        requestIds.add(match[1].toLowerCase());
+      }
+
+      const hexIdRegex = /\b[a-f0-9]{16,}\b/gi;
+      while ((match = hexIdRegex.exec(text))) {
+        requestIds.add(match[0].toLowerCase());
+      }
+
+      const actionRegex =
+        /\b(?:actionId|action)\s*[:=#-]?\s*([a-z0-9_-]{4,})\b/gi;
+      while ((match = actionRegex.exec(text))) {
+        actionIds.add(match[1].toLowerCase());
+      }
+
       const words = text
         .toLowerCase()
         .split(/[^a-z0-9]+/g)
@@ -2583,8 +3458,18 @@ export class SessionSummaryService {
       lines,
       functions,
       keywords,
+      requestIds,
+      actionIds,
+      endpoints,
+      httpMethods,
       hasDirectHints: Boolean(
-        files.size || lines.size || functions.size || fileBases.size,
+        files.size ||
+          lines.size ||
+          functions.size ||
+          fileBases.size ||
+          requestIds.size ||
+          actionIds.size ||
+          endpoints.size,
       ),
     };
   }
@@ -2715,6 +3600,10 @@ type HintTokens = {
   lines: Set<number>;
   functions: Set<string>;
   keywords: Set<string>;
+  requestIds: Set<string>;
+  actionIds: Set<string>;
+  endpoints: Set<string>;
+  httpMethods: Set<string>;
   hasDirectHints: boolean;
 };
 
@@ -2727,6 +3616,10 @@ type SessionDataset = {
   serialized: string;
   counts: Record<string, number>;
   chunks: DatasetChunk[];
+  focus?: {
+    chunkIds: string[];
+    functions: string[];
+  };
 };
 
 type TraceDataLimitResult = {
@@ -2804,6 +3697,34 @@ type TraceSummaryEntry = {
     line?: number | null;
     type?: string | null;
   }>;
+  nodeDetail?: TraceNodeDetail;
+  __focus?: boolean;
+};
+
+type TraceNodeDetail = {
+  chunkId: string;
+  groupId?: string;
+  requestRid?: string | null;
+  actionId?: string | null;
+  batchIndex?: number | null;
+  parentChunkId?: string | null;
+  childChunkIds?: string[];
+  functionName?: string | null;
+  filePath?: string | null;
+  lineNumber?: number | null;
+  depth?: number | null;
+  argsPreview?: string | null;
+  resultPreview?: string | null;
+  durationMs?: number | null;
+  eventStart?: number | null;
+  eventEnd?: number | null;
+  sampleEvents?: Array<{
+    fn?: string | null;
+    file?: string | null;
+    line?: number | null;
+    type?: string | null;
+  }>;
+  metadata?: Array<{ key: string; value: string }>;
 };
 
 type ActionIndex = Record<string, ActionIndexEntry>;
@@ -2819,6 +3740,12 @@ type RequestIndexEntry = {
   rid: string;
   method: string;
   url: string;
+  actionId?: string | null;
+  bodyPreview?: string;
+  responsePreview?: string;
+  paramsPreview?: string;
+  queryPreview?: string;
+  headersPreview?: string;
 };
 
 type TraceRefIndex = Record<string, { rid: string; codeRefs: CodeRef[] }>;

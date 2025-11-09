@@ -15,6 +15,7 @@ import {
   TraceSummary,
   TraceSummarySchema,
 } from './schemas/trace-summary.schema';
+import { TraceNode, TraceNodeSchema } from './schemas/trace-node.schema';
 import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
@@ -36,6 +37,7 @@ import { SessionSummaryService } from './session-summary.service';
       { name: EmailEvt.name, schema: EmailEvtSchema },
       { name: TraceEvt.name, schema: TraceEvtSchema },
       { name: TraceSummary.name, schema: TraceSummarySchema },
+      { name: TraceNode.name, schema: TraceNodeSchema },
       { name: AppUser.name, schema: AppUserSchema },
     ]),
     TenantModule,

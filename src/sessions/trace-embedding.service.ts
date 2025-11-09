@@ -6,6 +6,7 @@ import { Pinecone, Index } from '@pinecone-database/pinecone';
 import OpenAI from 'openai';
 import { createHash } from 'crypto';
 import { TraceSummary } from './schemas/trace-summary.schema';
+import { TraceNode } from './schemas/trace-node.schema';
 
 const FUNCTION_LINEAGE_LIMIT = 6;
 const FUNCTION_CHILD_LIMIT = 6;
@@ -71,6 +72,7 @@ type TraceSegmentDescriptor = {
   functionName?: string | null;
   filePath?: string | null;
   lineNumber?: number | null;
+  nodeRef?: FunctionCallNode;
 };
 
 type FunctionCallNode = {
@@ -88,6 +90,10 @@ type FunctionCallNode = {
   lineageTrail?: LineageEntry[];
   lineagePath?: string;
   childSummaries?: ChildSummary[];
+  argsPreview?: string;
+  resultPreview?: string;
+  durationMs?: number | null;
+  metadata?: Array<{ key: string; value: string }>;
 };
 
 type SegmentBuildContext = {
@@ -114,6 +120,8 @@ export class TraceEmbeddingService {
   constructor(
     @InjectModel(TraceSummary.name)
     private readonly traceSummaries: Model<TraceSummary>,
+    @InjectModel(TraceNode.name)
+    private readonly traceNodes: Model<TraceNode>,
     private readonly config: ConfigService,
   ) {}
 
@@ -206,6 +214,10 @@ export class TraceEmbeddingService {
         { upsert: true },
       );
 
+      if (segment.chunkKind === 'function') {
+        await this.upsertTraceNodeDocument(payload, groupId, segment);
+      }
+
       const baseRecord = {
         id: this.buildRecordId(
           payload,
@@ -239,6 +251,66 @@ export class TraceEmbeddingService {
       payload.traceId ??
       payload.sessionId
     );
+  }
+
+  private async upsertTraceNodeDocument(
+    payload: TraceBatchPayload,
+    groupId: string,
+    segment: TraceSegmentDescriptor,
+  ): Promise<void> {
+    if (!segment.chunkId || !segment.nodeRef) {
+      return;
+    }
+    const doc = {
+      tenantId: payload.tenantId,
+      sessionId: payload.sessionId,
+      chunkId: segment.chunkId,
+      groupId,
+      requestRid: payload.requestRid ?? null,
+      actionId: payload.actionId ?? null,
+      batchIndex: payload.batchIndex ?? null,
+      parentChunkId: segment.parentChunkId ?? null,
+      childChunkIds: segment.childChunkIds ?? [],
+      functionName: segment.functionName ?? null,
+      filePath: segment.filePath ?? null,
+      lineNumber:
+        typeof segment.lineNumber === 'number' &&
+        Number.isFinite(segment.lineNumber)
+          ? segment.lineNumber
+          : null,
+      depth:
+        typeof segment.depth === 'number' && Number.isFinite(segment.depth)
+          ? segment.depth
+          : null,
+      argsPreview: segment.nodeRef.argsPreview ?? null,
+      resultPreview: segment.nodeRef.resultPreview ?? null,
+      durationMs:
+        typeof segment.nodeRef.durationMs === 'number'
+          ? segment.nodeRef.durationMs
+          : null,
+      eventStart: segment.eventStart ?? null,
+      eventEnd: segment.eventEnd ?? null,
+      sampleEvents: segment.previewEvents ?? [],
+      metadata: segment.nodeRef.metadata ?? [],
+    };
+
+    await this.traceNodes
+      .updateOne(
+        {
+          tenantId: payload.tenantId,
+          sessionId: payload.sessionId,
+          chunkId: segment.chunkId,
+        },
+        doc,
+        { upsert: true },
+      )
+      .catch((err) => {
+        this.logger.warn(
+          `Failed to upsert trace node ${segment.chunkId}: ${
+            err?.message ?? err
+          }`,
+        );
+      });
   }
 
   private getChunkSize(): number {
@@ -361,6 +433,7 @@ export class TraceEmbeddingService {
         typeof node.line === 'number' && Number.isFinite(node.line)
           ? node.line
           : null,
+      nodeRef: node,
     }));
   }
 
@@ -478,6 +551,7 @@ export class TraceEmbeddingService {
           events: [event],
           eventStart: idx,
           eventEnd: idx,
+          metadata: [],
         };
         this.enrichNodeFromEvent(node, event);
         nodes.push(node);
@@ -776,6 +850,56 @@ export class TraceEmbeddingService {
     };
   }
 
+  private extractEventArgsPreview(event: TraceSegmentEvent): string | undefined {
+    if (!event) {
+      return undefined;
+    }
+    const candidate =
+      event.args ??
+      event.arguments ??
+      event.payload?.args ??
+      event.meta?.args ??
+      event.context?.args;
+    const text = this.formatPayload(candidate);
+    return text || undefined;
+  }
+
+  private extractEventResultPreview(
+    event: TraceSegmentEvent,
+  ): string | undefined {
+    if (!event) {
+      return undefined;
+    }
+    const candidate =
+      event.result ??
+      event.return ??
+      event.retVal ??
+      event.response ??
+      event.payload?.result;
+    const text = this.formatPayload(candidate);
+    return text || undefined;
+  }
+
+  private extractEventDurationMs(
+    event: TraceSegmentEvent,
+  ): number | undefined {
+    if (!event) {
+      return undefined;
+    }
+    const candidate =
+      event.dur ??
+      event.duration ??
+      event.durationMs ??
+      event.elapsed ??
+      event.elapsedMs ??
+      event.timing;
+    const num = Number(candidate);
+    if (!Number.isFinite(num)) {
+      return undefined;
+    }
+    return Math.max(0, Math.round(num));
+  }
+
   private extractEventFn(event: TraceSegmentEvent): string | undefined {
     if (!event) {
       return undefined;
@@ -862,6 +986,79 @@ export class TraceEmbeddingService {
     ) {
       node.line = line;
     }
+    const args = this.extractEventArgsPreview(event);
+    if (args && !node.argsPreview) {
+      node.argsPreview = args;
+    }
+    const result = this.extractEventResultPreview(event);
+    if (result && !node.resultPreview) {
+      node.resultPreview = result;
+    }
+    const duration = this.extractEventDurationMs(event);
+    if (typeof duration === 'number') {
+      if (
+        typeof node.durationMs !== 'number' ||
+        !Number.isFinite(node.durationMs) ||
+        duration > node.durationMs
+      ) {
+        node.durationMs = duration;
+      }
+    }
+    this.collectNodeMetadata(node, event);
+  }
+
+  private collectNodeMetadata(
+    node: FunctionCallNode,
+    event: TraceSegmentEvent,
+  ): void {
+    const pairs: Array<[string, string]> = [];
+    const message = this.toShortText(event?.message ?? event?.msg, 240);
+    if (message) {
+      pairs.push(['message', message]);
+    }
+    const status = this.toText(
+      event?.status ?? event?.statusCode ?? event?.httpStatus,
+    );
+    if (status) {
+      pairs.push(['status', status]);
+    }
+    const url = this.toText(event?.url ?? event?.path ?? event?.route);
+    if (url) {
+      pairs.push(['url', url]);
+    }
+    const collection = this.toText(
+      event?.collection ?? event?.table ?? event?.model,
+    );
+    if (collection) {
+      pairs.push(['collection', collection]);
+    }
+    const operation = this.toText(event?.operation ?? event?.op);
+    if (operation) {
+      pairs.push(['operation', operation]);
+    }
+    for (const [key, value] of pairs) {
+      this.appendNodeMetadata(node, key, value);
+    }
+  }
+
+  private appendNodeMetadata(
+    node: FunctionCallNode,
+    key: string,
+    value: string,
+  ): void {
+    if (!key || !value) {
+      return;
+    }
+    if (!node.metadata) {
+      node.metadata = [];
+    }
+    if (node.metadata.length >= 12) {
+      return;
+    }
+    if (node.metadata.some((entry) => entry.key === key && entry.value === value)) {
+      return;
+    }
+    node.metadata.push({ key, value });
   }
 
   private pickTextFromPaths(

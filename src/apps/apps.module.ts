@@ -24,6 +24,7 @@ import {
   TraceSummarySchema,
 } from '../sessions/schemas/trace-summary.schema';
 import { SessionSummaryService } from '../sessions/session-summary.service';
+import { TraceNode, TraceNodeSchema } from '../sessions/schemas/trace-node.schema';
 
 @Module({
   imports: [
@@ -37,6 +38,7 @@ import { SessionSummaryService } from '../sessions/session-summary.service';
       { name: EmailEvt.name, schema: EmailEvtSchema },
       { name: TraceEvt.name, schema: TraceEvtSchema },
       { name: TraceSummary.name, schema: TraceSummarySchema },
+      { name: TraceNode.name, schema: TraceNodeSchema },
     ]),
     TenantModule,
   ],

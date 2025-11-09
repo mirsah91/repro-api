@@ -10,6 +10,8 @@ function createService() {
     null as any,
     null as any,
     null as any,
+    null as any,
+    null as any,
     tenant,
     config,
   );
