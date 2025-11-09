@@ -66,8 +66,9 @@ const CHAT_SYSTEM_PROMPT = [
   '- Speak as the code owner: confident, technical, zero filler.',
   '- Answer only what the user asked; do not ask follow-up questions unless the user explicitly requests more detail.',
   '',
-  'Remember: request body ⇔ controller args, response body ⇔ return value, unless explicit trace data overrides it.'
-].join('\n');
+  'Remember: request body ⇔ controller args, response body ⇔ return value, unless explicit trace data overrides it.',
+  'Do not include unrelated traces, extra commentary, or additional follow-up questions.'
+].join('');
 
 
 @Injectable()
@@ -337,33 +338,46 @@ export class SessionSummaryService {
       const conversation = this.normalizeHintMessages(opts?.messages);
       const hintTokens = this.extractHintTokens(opts?.messages ?? []);
       const datasetFocusIds = new Set(dataset.focus?.chunkIds ?? []);
-      const focusFunctions = dataset.focus?.functions ?? [];
-      const focusChunkIds = this.determineFocusChunkIds(
-        dataset.chunks,
-        hintTokens,
-        datasetFocusIds,
-      );
-      const selectedChunks = this.selectDatasetChunks(
-        dataset.chunks,
-        hintTokens,
-        CHAT_MAX_DATASET_CHUNKS,
-        focusChunkIds,
-      );
-      const expandedChunks = this.expandChunksWithRelated(
-        this.appendFocusChunks(
-          selectedChunks,
+      const datasetFocusFunctions = dataset.focus?.functions ?? [];
+
+      let selectedChunks: DatasetChunk[];
+      let enforcedFocusIds: Set<string> = datasetFocusIds;
+
+      if (datasetFocusIds.size) {
+        selectedChunks = this.ensureFocusChunkContext(
           dataset.chunks,
-          focusChunkIds,
+          datasetFocusIds,
           CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
-        ),
-        dataset.chunks,
-        Math.min(
-          dataset.chunks.length,
-          CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
-        ),
-      );
+        );
+      } else {
+        const derivedFocus = this.determineFocusChunkIds(
+          dataset.chunks,
+          hintTokens,
+        );
+        enforcedFocusIds = derivedFocus;
+        selectedChunks = this.selectDatasetChunks(
+          dataset.chunks,
+          hintTokens,
+          CHAT_MAX_DATASET_CHUNKS,
+          derivedFocus,
+        );
+        selectedChunks = this.expandChunksWithRelated(
+          this.appendFocusChunks(
+            selectedChunks,
+            dataset.chunks,
+            derivedFocus,
+            CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
+          ),
+          dataset.chunks,
+          Math.min(
+            dataset.chunks.length,
+            CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
+          ),
+        );
+      }
+
       const datasetContext = this.composeChunkContext(
-        expandedChunks,
+        selectedChunks,
         dataset.chunks.length,
       );
 
@@ -374,7 +388,10 @@ export class SessionSummaryService {
         },
       ];
 
-      const focusFollowups = focusFunctions.slice(0, 5);
+      const focusFollowups =
+        datasetFocusFunctions.length > 0
+          ? datasetFocusFunctions
+          : this.collectFocusFunctionNamesFromChunks(selectedChunks);
       if (focusFollowups.length) {
         llmMessages.push({
           role: 'system',
@@ -542,11 +559,7 @@ export class SessionSummaryService {
       hintTokens,
       FOCUS_NODE_LIMIT,
     );
-    const {
-      chunks,
-      focusChunkIds,
-      focusFunctions,
-    } = this.buildDatasetChunks(
+    const chunkBuildResult = this.buildDatasetChunks(
       payload,
       jsonSnapshot,
       actionIndex,
@@ -555,6 +568,7 @@ export class SessionSummaryService {
       retrievalEntries,
       focusEntries,
     );
+    const chunks = chunkBuildResult.chunks;
     const serialized = chunks.map((chunk) => chunk.text).join('\n\n');
 
     return {
@@ -568,8 +582,8 @@ export class SessionSummaryService {
       },
       chunks,
       focus: {
-        chunkIds: Array.from(focusChunkIds),
-        functions: Array.from(focusFunctions),
+        chunkIds: Array.from(chunkBuildResult.focusChunkIds),
+        functions: Array.from(chunkBuildResult.focusFunctions),
       },
     };
   }
@@ -1905,6 +1919,57 @@ export class SessionSummaryService {
     return out;
   }
 
+  private ensureFocusChunkContext(
+    allChunks: DatasetChunk[],
+    focusIds: Set<string>,
+    limit: number,
+  ): DatasetChunk[] {
+    if (!focusIds?.size) {
+      return allChunks.slice(0, limit);
+    }
+    const chunkById = new Map(allChunks.map((chunk) => [chunk.id, chunk]));
+    const selected: DatasetChunk[] = [];
+    const seen = new Set<string>();
+    const relatedKeys = new Set<string>();
+
+    const addChunk = (chunk?: DatasetChunk) => {
+      if (!chunk || seen.has(chunk.id)) {
+        return;
+      }
+      selected.push(chunk);
+      seen.add(chunk.id);
+      const meta = chunk.metadata ?? {};
+      if (meta.rid) relatedKeys.add(`rid:${meta.rid}`);
+      if (meta.actionId) relatedKeys.add(`action:${meta.actionId}`);
+    };
+
+    focusIds.forEach((id) => addChunk(chunkById.get(id)));
+
+    if (selected.length < limit) {
+      for (const chunk of allChunks) {
+        if (selected.length >= limit) break;
+        if (seen.has(chunk.id)) continue;
+        const meta = chunk.metadata ?? {};
+        if (
+          (meta.rid && relatedKeys.has(`rid:${meta.rid}`)) ||
+          (meta.actionId && relatedKeys.has(`action:${meta.actionId}`))
+        ) {
+          addChunk(chunk);
+        }
+      }
+    }
+
+    if (selected.length < limit) {
+      for (const chunk of allChunks) {
+        if (selected.length >= limit) break;
+        if (seen.has(chunk.id)) continue;
+        addChunk(chunk);
+      }
+    }
+
+    return selected;
+  }
+
   private determineFocusChunkIds(
     chunks: DatasetChunk[],
     tokens: HintTokens,
@@ -1971,6 +2036,26 @@ export class SessionSummaryService {
     }
 
     return focus;
+  }
+
+  private collectFocusFunctionNamesFromChunks(
+    chunks: DatasetChunk[],
+  ): string[] {
+    const names = new Set<string>();
+    for (const chunk of chunks) {
+      if (chunk.kind !== 'trace') {
+        continue;
+      }
+      const text = chunk.text || '';
+      const match = text.match(/function:\s+([^\n]+)/i);
+      if (match?.[1]) {
+        const name = match[1].trim();
+        if (name && !name.toLowerCase().includes('function name unavailable')) {
+          names.add(name);
+        }
+      }
+    }
+    return Array.from(names);
   }
 
   private composeChunkContext(
