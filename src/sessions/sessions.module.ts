@@ -17,6 +17,10 @@ import {
 } from './schemas/trace-summary.schema';
 import { TraceNode, TraceNodeSchema } from './schemas/trace-node.schema';
 import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
+import {
+  SessionChatMessage,
+  SessionChatMessageSchema,
+} from './schemas/session-chat.schema';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
@@ -39,6 +43,7 @@ import { SessionSummaryService } from './session-summary.service';
       { name: TraceSummary.name, schema: TraceSummarySchema },
       { name: TraceNode.name, schema: TraceNodeSchema },
       { name: AppUser.name, schema: AppUserSchema },
+      { name: SessionChatMessage.name, schema: SessionChatMessageSchema },
     ]),
     TenantModule,
   ],

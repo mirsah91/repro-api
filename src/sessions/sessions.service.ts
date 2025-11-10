@@ -22,6 +22,10 @@ type CodeRefEntry = {
   file: string;
   line?: number;
   fn?: string;
+  argsPreview?: string;
+  resultPreview?: string;
+  durationMs?: number;
+  metadata?: Record<string, any> | null;
 };
 
 @Injectable()
@@ -80,6 +84,94 @@ export class SessionsService {
     return this.ensureTraceIndexPromise;
   }
 
+  private previewCodeRefValue(value: any, maxLength = 400): string | undefined {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    let text: string;
+    if (typeof value === 'string') {
+      text = value;
+    } else {
+      try {
+        text = JSON.stringify(value);
+      } catch {
+        text = String(value);
+      }
+    }
+    const trimmed = text.trim();
+    if (!trimmed.length) {
+      return undefined;
+    }
+    if (trimmed.length <= maxLength) {
+      return trimmed;
+    }
+    return `${trimmed.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+
+  private extractCodeRefArgsPreview(event: any): string | undefined {
+    const candidate =
+      event?.args ??
+      event?.body ??
+      event?.input ??
+      event?.payload ??
+      event?.params ??
+      event?.meta?.args;
+    return this.previewCodeRefValue(candidate);
+  }
+
+  private extractCodeRefResultPreview(event: any): string | undefined {
+    const candidate =
+      event?.result ??
+      event?.response ??
+      event?.output ??
+      event?.return ??
+      event?.meta?.result;
+    return this.previewCodeRefValue(candidate);
+  }
+
+  private extractCodeRefDuration(event: any): number | undefined {
+    const duration =
+      event?.durMs ??
+      event?.durationMs ??
+      event?.dur ??
+      event?.duration ??
+      event?.elapsed ??
+      event?.meta?.durMs;
+    const value = Number(duration);
+    if (Number.isFinite(value)) {
+      return Math.max(0, Math.round(value));
+    }
+    return undefined;
+  }
+
+  private extractCodeRefMetadata(event: any): Record<string, any> | undefined {
+    if (!event || typeof event !== 'object') {
+      return undefined;
+    }
+    const metadata: Record<string, any> = {};
+    const message = this.previewCodeRefValue(event.message ?? event.msg, 200);
+    if (message) {
+      metadata.message = message;
+    }
+    const status = event.status ?? event.statusCode ?? event.httpStatus;
+    if (status !== undefined && status !== null) {
+      metadata.status = status;
+    }
+    const collection = event.collection ?? event.table ?? event.model;
+    if (collection) {
+      metadata.collection = collection;
+    }
+    const operation = event.operation ?? event.op ?? event.method;
+    if (operation) {
+      metadata.operation = operation;
+    }
+    const url = event.url ?? event.path ?? event.route;
+    if (url) {
+      metadata.url = url;
+    }
+    return Object.keys(metadata).length ? metadata : undefined;
+  }
+
   private collectCodeRefsFromTraceEvents(events: any[]): CodeRefEntry[] {
     if (!Array.isArray(events) || !events.length) {
       return [];
@@ -107,7 +199,15 @@ export class SessionsService {
         continue;
       }
       seen.add(key);
-      refs.push({ file, line, fn });
+      refs.push({
+        file,
+        line,
+        fn,
+        argsPreview: this.extractCodeRefArgsPreview(event),
+        resultPreview: this.extractCodeRefResultPreview(event),
+        durationMs: this.extractCodeRefDuration(event),
+        metadata: this.extractCodeRefMetadata(event) ?? null,
+      });
       if (refs.length >= 50) {
         break;
       }
@@ -127,6 +227,13 @@ export class SessionsService {
       file: ref.file,
       line: typeof ref.line === 'number' ? ref.line : null,
       fn: ref.fn ?? null,
+      argsPreview: ref.argsPreview ?? null,
+      resultPreview: ref.resultPreview ?? null,
+      durationMs:
+        typeof ref.durationMs === 'number' && Number.isFinite(ref.durationMs)
+          ? ref.durationMs
+          : null,
+      metadata: ref.metadata ?? null,
     }));
     await this.requests
       .updateOne(this.tenantFilter({ sessionId, rid: requestRid }), {
@@ -160,7 +267,31 @@ export class SessionsService {
         typeof entry.fn === 'string' && entry.fn.trim().length
           ? entry.fn.trim()
           : undefined;
-      refs.push({ file, line, fn });
+      const argsPreview =
+        typeof entry.argsPreview === 'string'
+          ? entry.argsPreview
+          : this.previewCodeRefValue(entry.argsPreview);
+      const resultPreview =
+        typeof entry.resultPreview === 'string'
+          ? entry.resultPreview
+          : this.previewCodeRefValue(entry.resultPreview);
+      const durationMs =
+        typeof entry.durationMs === 'number' && Number.isFinite(entry.durationMs)
+          ? Math.max(0, Math.round(entry.durationMs))
+          : undefined;
+      const metadata =
+        entry.metadata && typeof entry.metadata === 'object'
+          ? entry.metadata
+          : undefined;
+      refs.push({
+        file,
+        line,
+        fn,
+        argsPreview,
+        resultPreview,
+        durationMs,
+        metadata: metadata ?? null,
+      });
       if (refs.length >= 100) {
         break;
       }
@@ -174,17 +305,31 @@ export class SessionsService {
     limit = 100,
   ): CodeRefEntry[] {
     const merged: CodeRefEntry[] = [];
-    const seen = new Set<string>();
-    const push = (ref: CodeRefEntry) => {
+    const map = new Map<string, CodeRefEntry>();
+    const upsert = (ref: CodeRefEntry) => {
       const key = `${ref.file}|${ref.line ?? 'na'}|${ref.fn ?? ''}`;
-      if (seen.has(key)) {
+      const existing = map.get(key);
+      if (!existing) {
+        const clone: CodeRefEntry = { ...ref };
+        map.set(key, clone);
+        merged.push(clone);
         return;
       }
-      seen.add(key);
-      merged.push(ref);
+      existing.argsPreview = existing.argsPreview ?? ref.argsPreview;
+      existing.resultPreview = existing.resultPreview ?? ref.resultPreview;
+      existing.durationMs = existing.durationMs ?? ref.durationMs;
+      if (!existing.metadata && ref.metadata) {
+        existing.metadata = ref.metadata;
+      }
+      if (!existing.fn && ref.fn) {
+        existing.fn = ref.fn;
+      }
+      if (existing.line === undefined && ref.line !== undefined) {
+        existing.line = ref.line;
+      }
     };
-    primary.forEach(push);
-    secondary.forEach(push);
+    primary.forEach(upsert);
+    secondary.forEach(upsert);
     return merged.slice(0, limit);
   }
 

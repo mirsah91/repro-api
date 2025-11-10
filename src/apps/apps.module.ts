@@ -25,6 +25,10 @@ import {
 } from '../sessions/schemas/trace-summary.schema';
 import { SessionSummaryService } from '../sessions/session-summary.service';
 import { TraceNode, TraceNodeSchema } from '../sessions/schemas/trace-node.schema';
+import {
+  SessionChatMessage,
+  SessionChatMessageSchema,
+} from '../sessions/schemas/session-chat.schema';
 
 @Module({
   imports: [
@@ -39,6 +43,7 @@ import { TraceNode, TraceNodeSchema } from '../sessions/schemas/trace-node.schem
       { name: TraceEvt.name, schema: TraceEvtSchema },
       { name: TraceSummary.name, schema: TraceSummarySchema },
       { name: TraceNode.name, schema: TraceNodeSchema },
+      { name: SessionChatMessage.name, schema: SessionChatMessageSchema },
     ]),
     TenantModule,
   ],

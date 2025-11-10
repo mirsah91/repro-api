@@ -28,6 +28,10 @@ export class TraceEvt {
         file: { type: String },
         line: { type: Number },
         fn: { type: String },
+        argsPreview: { type: String },
+        resultPreview: { type: String },
+        durationMs: { type: Number },
+        metadata: { type: SchemaTypes.Mixed },
       },
     ],
   })
@@ -35,6 +39,10 @@ export class TraceEvt {
     file?: string | null;
     line?: number | null;
     fn?: string | null;
+    argsPreview?: string | null;
+    resultPreview?: string | null;
+    durationMs?: number | null;
+    metadata?: Record<string, any> | null;
   }>;
 }
 

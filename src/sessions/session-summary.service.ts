@@ -17,6 +17,10 @@ import { EmailEvt } from './schemas/emails.schema';
 import { TraceEvt } from './schemas/trace.schema';
 import { TraceSummary } from './schemas/trace-summary.schema';
 import { TraceNode } from './schemas/trace-node.schema';
+import {
+  SessionChatMessage,
+  SessionChatRole,
+} from './schemas/session-chat.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
 import {
   hydrateChangeDoc,
@@ -47,6 +51,7 @@ const CHUNK_OBJECT_NESTED_LIMIT = 10;
 const EMBEDDING_CANDIDATE_LIMIT = 120;
 const EMBEDDING_CHUNK_CHAR_LIMIT = 2000;
 const EMBEDDING_HINT_BOOST = 0.05;
+const CODE_REF_CONTEXT_LIMIT = 20;
 const CHAT_SYSTEM_PROMPT = [
   'You are the lead engineer fully responsible for this session’s codebase and runtime traces.',
   '',
@@ -98,6 +103,8 @@ export class SessionSummaryService {
     private readonly traceSummaries: Model<TraceSummary>,
     @InjectModel(TraceNode.name)
     private readonly traceNodes: Model<TraceNode>,
+    @InjectModel(SessionChatMessage.name)
+    private readonly chatMessages: Model<SessionChatMessage>,
     private readonly tenant: TenantContext,
     private readonly config: ConfigService,
   ) {}
@@ -337,6 +344,8 @@ export class SessionSummaryService {
       this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
 
     let reply = '';
+    let datasetContext = '';
+    let questionText = '';
     let usage:
       | {
           promptTokens?: number;
@@ -352,7 +361,7 @@ export class SessionSummaryService {
       const datasetFocusFunctions = dataset.focus?.functions ?? [];
       const { history, latestUser } =
         this.splitConversationForPrompt(conversation);
-      const questionText =
+      questionText =
         latestUser?.content?.toString()?.trim() ||
         conversation[conversation.length - 1]?.content?.toString()?.trim() ||
         'Provide a diagnostic summary for this session.';
@@ -394,10 +403,30 @@ export class SessionSummaryService {
         );
       }
 
-      const datasetContext = this.composeChunkContext(
+      datasetContext = this.composeChunkContext(
         selectedChunks,
         dataset.chunks.length,
       );
+      const codeRefMatches = this.findMatchingCodeRefs(
+        questionText,
+        hintTokens,
+        dataset.codeRefs ?? [],
+      );
+      if (codeRefMatches.length) {
+        const codeRefContext = this.composeCodeRefContext(codeRefMatches);
+        datasetContext = [codeRefContext, datasetContext]
+          .filter(Boolean)
+          .join('\n\n');
+        this.logger.debug('chatSession codeRef matches', {
+          sessionId,
+          matchCount: codeRefMatches.length,
+        });
+      }
+      this.logger.debug('chatSession dataset context', {
+        sessionId,
+        chunkCount: selectedChunks.length,
+        datasetContext,
+      });
 
       const llmMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         {
@@ -458,6 +487,16 @@ export class SessionSummaryService {
         'Failed to generate a chat response with the configured OpenAI model.';
       throw new InternalServerErrorException(message);
     }
+
+    await this.persistChatMessages(sessionId, opts?.appId, [
+      datasetContext
+        ? { role: 'system', content: datasetContext }
+        : undefined,
+      questionText
+        ? { role: 'user', content: questionText }
+        : undefined,
+      reply ? { role: 'assistant', content: reply } : undefined,
+    ]);
 
     return {
       sessionId,
@@ -570,6 +609,10 @@ export class SessionSummaryService {
     const actionIndex = this.indexActionsById(payload.timeline.actions);
     const requestIndex = this.indexRequestsByRid(payload.timeline.requests);
     const traceIndex = this.indexTraceCodeRefs(payload.timeline.traces);
+    const datasetCodeRefs = this.collectDatasetCodeRefs(
+      payload.timeline.requests,
+      payload.timeline.traces,
+    );
     const jsonSnapshot = JSON.stringify(payload, this.promptReplacer, 2);
     const retrievalEntries = await this.retrieveRelevantTraceSummaries(
       sessionId,
@@ -607,6 +650,7 @@ export class SessionSummaryService {
         chunkIds: Array.from(chunkBuildResult.focusChunkIds),
         functions: Array.from(chunkBuildResult.focusFunctions),
       },
+      codeRefs: datasetCodeRefs,
     };
   }
 
@@ -729,11 +773,33 @@ export class SessionSummaryService {
         type: chunk.type,
         ...chunk.body,
       };
+      const metadataExtras: Record<string, any> = {};
+      const codeRefsArray = Array.isArray((body as any)?.codeRefs)
+        ? ((body as any).codeRefs as Array<Record<string, any>>)
+        : undefined;
+      if (codeRefsArray?.length) {
+        const fnWordSet = new Set<string>();
+        codeRefsArray.forEach((ref) => {
+          const name =
+            typeof ref?.functionName === 'string'
+              ? ref.functionName
+              : typeof ref?.fn === 'string'
+                ? ref.fn
+                : undefined;
+          this.tokenizeFunctionName(name).forEach((word) =>
+            fnWordSet.add(word),
+          );
+        });
+        if (fnWordSet.size) {
+          metadataExtras.codeRefFnWords = Array.from(fnWordSet).slice(0, 30);
+        }
+      }
       pushChunk({
         id: chunk.id,
         kind: chunk.kind,
         metadata: {
           ...(chunk.metadata ?? {}),
+          ...metadataExtras,
           chunkType: chunk.type,
         },
         text: this.buildStructuredChunkText(body),
@@ -949,6 +1015,7 @@ export class SessionSummaryService {
     const requestCodeRefs = this.extractStoredCodeRefs(request?.codeRefs);
     const traceRefs = traceIndex[rid ?? '']?.codeRefs ?? [];
     const combinedRefs = this.mergeCodeRefs(requestCodeRefs, traceRefs);
+    const detailedRefs = this.buildCodeRefContextEntries(combinedRefs);
     return {
       id: `request:${rid}`,
       kind: 'request',
@@ -981,11 +1048,7 @@ export class SessionSummaryService {
         body: request.body ?? null,
         response: request.respBody ?? null,
         headers: request.headers ?? null,
-        codeRefs: combinedRefs.slice(0, 6).map((ref) => ({
-          file: ref.file,
-          line: ref.line ?? null,
-          functionName: ref.fn ?? null,
-        })),
+        codeRefs: detailedRefs,
       },
     };
   }
@@ -1303,6 +1366,9 @@ export class SessionSummaryService {
     const actionId = trace.actionId ?? trace.aid ?? null;
     const actionRef = this.lookupAction(actionIndex, actionId ?? undefined);
     const events = this.normalizeTraceEvents(trace.data).slice(0, 12);
+    const codeRefs = this.buildCodeRefContextEntries(
+      this.extractStoredCodeRefs(trace?.codeRefs),
+    );
     return {
       id: `traceFallback:${rid}:${index}`,
       kind: 'trace',
@@ -1328,6 +1394,7 @@ export class SessionSummaryService {
           line: evt?.line ?? null,
           type: evt?.type ?? null,
         })),
+        codeRefs,
         note: 'Trace data included directly because no precomputed function segment was available.',
       },
     };
@@ -1459,6 +1526,21 @@ export class SessionSummaryService {
     return this.extractTraceCodeRefsFromData(trace?.data).map((ref) =>
       ref.file.toLowerCase(),
     );
+  }
+
+  private buildCodeRefContextEntries(refs: CodeRef[]): Array<Record<string, any>> {
+    if (!refs?.length) {
+      return [];
+    }
+    return refs.slice(0, CODE_REF_CONTEXT_LIMIT).map((ref) => ({
+      file: ref.file,
+      line: ref.line ?? null,
+      functionName: ref.fn ?? null,
+      argsPreview: ref.argsPreview ?? null,
+      resultPreview: ref.resultPreview ?? null,
+      durationMs: ref.durationMs ?? null,
+      metadata: ref.metadata ?? null,
+    }));
   }
 
   private indexTraceCodeRefs(traces: any[]): TraceRefIndex {
@@ -1648,7 +1730,31 @@ export class SessionSummaryService {
       typeof entry.fn === 'string' && entry.fn.trim().length
         ? entry.fn.trim()
         : undefined;
-    return { file: this.normalizeFileHint(file) || file, line, fn };
+    const argsPreview =
+      typeof entry.argsPreview === 'string'
+        ? entry.argsPreview
+        : this.previewJson(entry.argsPreview, 400);
+    const resultPreview =
+      typeof entry.resultPreview === 'string'
+        ? entry.resultPreview
+        : this.previewJson(entry.resultPreview, 400);
+    const durationMs =
+      typeof entry.durationMs === 'number' && Number.isFinite(entry.durationMs)
+        ? Math.max(0, Math.round(entry.durationMs))
+        : undefined;
+    const metadata =
+      entry.metadata && typeof entry.metadata === 'object'
+        ? entry.metadata
+        : undefined;
+    return {
+      file: this.normalizeFileHint(file) || file,
+      line,
+      fn,
+      argsPreview: argsPreview ?? undefined,
+      resultPreview: resultPreview ?? undefined,
+      durationMs,
+      metadata,
+    };
   }
 
   private extractStoredCodeRefs(entries: any): CodeRef[] {
@@ -1660,22 +1766,70 @@ export class SessionSummaryService {
       .filter((entry): entry is CodeRef => Boolean(entry));
   }
 
+  private collectDatasetCodeRefs(
+    requests: any[],
+    traces: any[],
+  ): DatasetCodeRef[] {
+    const refs: DatasetCodeRef[] = [];
+    requests?.forEach((request) => {
+      if (!request) return;
+      const rid = request.rid ?? request.requestRid;
+      const actionId = request.actionId ?? request.aid ?? null;
+      this.extractStoredCodeRefs(request.codeRefs).forEach((ref) => {
+        refs.push({
+          ...ref,
+          rid,
+          actionId,
+          source: 'request',
+        });
+      });
+    });
+    traces?.forEach((trace) => {
+      if (!trace) return;
+      const rid = trace.requestRid ?? trace.rid;
+      const actionId = trace.actionId ?? trace.aid ?? null;
+      this.extractStoredCodeRefs(trace.codeRefs).forEach((ref) => {
+        refs.push({
+          ...ref,
+          rid,
+          actionId,
+          source: 'trace',
+        });
+      });
+    });
+    return refs;
+  }
+
   private mergeCodeRefs(primary: CodeRef[], secondary: CodeRef[]): CodeRef[] {
     if (!secondary?.length) {
       return primary.slice();
     }
     const merged: CodeRef[] = [];
-    const seen = new Set<string>();
-    const push = (ref: CodeRef) => {
+    const map = new Map<string, CodeRef>();
+    const upsert = (ref: CodeRef) => {
       const key = `${ref.file}|${ref.line ?? 'na'}|${ref.fn ?? ''}`;
-      if (seen.has(key)) {
+      const existing = map.get(key);
+      if (!existing) {
+        const clone: CodeRef = { ...ref };
+        map.set(key, clone);
+        merged.push(clone);
         return;
       }
-      seen.add(key);
-      merged.push(ref);
+      existing.argsPreview = existing.argsPreview ?? ref.argsPreview;
+      existing.resultPreview = existing.resultPreview ?? ref.resultPreview;
+      existing.durationMs = existing.durationMs ?? ref.durationMs;
+      if (!existing.metadata && ref.metadata) {
+        existing.metadata = ref.metadata;
+      }
+      if (!existing.fn && ref.fn) {
+        existing.fn = ref.fn;
+      }
+      if (existing.line === undefined && ref.line !== undefined) {
+        existing.line = ref.line;
+      }
     };
-    primary.forEach((ref) => push(ref));
-    secondary.forEach((ref) => push(ref));
+    primary.forEach((ref) => upsert(ref));
+    secondary.forEach((ref) => upsert(ref));
     return merged;
   }
 
@@ -2183,6 +2337,18 @@ export class SessionSummaryService {
     if (chunk.kind === 'request' && tokens.keywords.size) {
       score += 1; // slight preference to include request context
     }
+    const codeRefFnWords: string[] = Array.isArray(
+      chunk.metadata?.codeRefFnWords,
+    )
+      ? (chunk.metadata?.codeRefFnWords as string[])
+      : [];
+    if (codeRefFnWords.length && tokens.functionWords.size) {
+      codeRefFnWords.forEach((word) => {
+        if (tokens.functionWords.has(word)) {
+          score += 1.5;
+        }
+      });
+    }
     return score;
   }
 
@@ -2629,6 +2795,108 @@ export class SessionSummaryService {
     return lines.join('\n');
   }
 
+  private findMatchingCodeRefs(
+    question: string,
+    tokens: HintTokens,
+    refs: DatasetCodeRef[] = [],
+    limit = 8,
+  ): DatasetCodeRef[] {
+    if (!refs.length || !question?.trim()) {
+      return [];
+    }
+    const normalizedQuestion = question.toLowerCase();
+    const questionWordSet = new Set<string>();
+    this.tokenizeFunctionName(question).forEach((word) =>
+      questionWordSet.add(word),
+    );
+    tokens.functionWords.forEach((word) => questionWordSet.add(word));
+    const matches = refs
+      .map((ref, index) => {
+        let score = 0;
+        const fnNorm = this.normalizeFunctionName(ref.fn);
+        if (fnNorm && normalizedQuestion.includes(fnNorm)) {
+          score += 8;
+        }
+        const fnWords = this.tokenizeFunctionName(ref.fn);
+        let shared = 0;
+        fnWords.forEach((word) => {
+          if (questionWordSet.has(word)) {
+            shared += 1;
+          }
+        });
+        score += shared * 2;
+        if (
+          fnNorm.includes('findone') &&
+          (normalizedQuestion.includes('findone') || questionWordSet.has('find'))
+        ) {
+          score += 2;
+        }
+        const filePath = ref.file ?? '';
+        const fileBase = this.getBasename(filePath);
+        if (fileBase && normalizedQuestion.includes(fileBase)) {
+          score += 2;
+        }
+        if (tokens.fileBases.has(fileBase)) {
+          score += 3;
+        }
+        if (tokens.files.has(filePath)) {
+          score += 3;
+        }
+        return { ref, score, index };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) =>
+        b.score === a.score ? a.index - b.index : b.score - a.score,
+      )
+      .slice(0, limit)
+      .map((entry) => entry.ref);
+    return matches;
+  }
+
+  private composeCodeRefContext(refs: DatasetCodeRef[]): string {
+    if (!refs?.length) {
+      return '';
+    }
+    const lines = [
+      `--- Direct code references (${refs.length}) ---`,
+      ...refs.map((ref, idx) => {
+        const location = ref.file
+          ? `${ref.file}${ref.line ? `:${ref.line}` : ''}`
+          : 'location unavailable';
+        const parts = [
+          `[#${idx + 1}] ${ref.fn ?? 'function unknown'} (${ref.source}) ${location}`,
+        ];
+        if (ref.argsPreview) {
+          parts.push(`args=${ref.argsPreview}`);
+        }
+        if (ref.resultPreview) {
+          parts.push(`result=${ref.resultPreview}`);
+        }
+        if (ref.durationMs != null) {
+          parts.push(`durationMs=${ref.durationMs}`);
+        }
+        if (ref.metadata?.collection || ref.metadata?.operation) {
+          const metaParts: string[] = [];
+          if (ref.metadata?.collection) {
+            metaParts.push(`collection=${ref.metadata.collection}`);
+          }
+          if (ref.metadata?.operation) {
+            metaParts.push(`operation=${ref.metadata.operation}`);
+          }
+          if (metaParts.length) {
+            parts.push(metaParts.join(' '));
+          }
+        }
+        if (ref.rid) {
+          parts.push(`rid=${ref.rid}`);
+        }
+        return parts.join(' | ');
+      }),
+      '--- End code references ---',
+    ];
+    return lines.join('\n');
+  }
+
   private describeChunkMetadata(chunk: DatasetChunk): string {
     if (!chunk?.metadata) {
       return '';
@@ -3035,7 +3303,7 @@ export class SessionSummaryService {
       const orFilters: any[] = [];
       if (tokens.functions.size) {
         const fnList = Array.from(tokens.functions).map(
-          (fn) => new RegExp(`^${fn}$`, 'i'),
+          (fn) => new RegExp(`^${this.escapeRegex(fn)}$`, 'i'),
         );
         orFilters.push({ functionName: { $in: fnList } });
       }
@@ -3244,7 +3512,10 @@ export class SessionSummaryService {
     }
     const orFilters: any[] = [];
     if (functionHints.length) {
-      orFilters.push({ functionName: { $in: functionHints } });
+      const fnRegexes = functionHints.map(
+        (fn) => new RegExp(`^${this.escapeRegex(fn)}$`, 'i'),
+      );
+      orFilters.push({ functionName: { $in: fnRegexes } });
     }
     if (fileHints.length) {
       const regexes = fileHints.map(
@@ -3345,6 +3616,40 @@ export class SessionSummaryService {
 
   private escapeRegex(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private normalizeFunctionName(value?: string | null): string {
+    if (!value) {
+      return '';
+    }
+    return value
+      .replace(/^this\./i, '')
+      .replace(/[^a-zA-Z0-9]/g, '')
+      .toLowerCase();
+  }
+
+  private tokenizeFunctionName(value?: string | null): string[] {
+    if (!value) {
+      return [];
+    }
+    const cleaned = value
+      .replace(/^this\./i, '')
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/[^a-zA-Z0-9]+/g, ' ')
+      .trim()
+      .toLowerCase();
+    if (!cleaned.length) {
+      return [];
+    }
+    return cleaned
+      .split(/\s+/)
+      .map((word) => {
+        if (word.length > 3 && word.endsWith('s')) {
+          return word.slice(0, -1);
+        }
+        return word;
+      })
+      .filter(Boolean);
   }
 
   private async expandTraceSummaryEntries(
@@ -4017,6 +4322,7 @@ export class SessionSummaryService {
     const fileBases = new Set<string>();
     const lines = new Set<number>();
     const functions = new Set<string>();
+    const functionWords = new Set<string>();
     const keywords = new Set<string>();
     const requestIds = new Set<string>();
     const actionIds = new Set<string>();
@@ -4043,8 +4349,16 @@ export class SessionSummaryService {
 
       const fnRegex = /\b([a-z]+[A-Z][\w]*)\b/g;
       while ((match = fnRegex.exec(text))) {
-        functions.add(match[1].toLowerCase());
+        const rawFn = match[1];
+        functions.add(rawFn.toLowerCase());
+        this.tokenizeFunctionName(rawFn).forEach((word) =>
+          functionWords.add(word),
+        );
       }
+
+      this.tokenizeFunctionName(text).forEach((word) =>
+        functionWords.add(word),
+      );
 
       const endpointRegex =
         /\b(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+([/][^\s]+)/gi;
@@ -4087,6 +4401,7 @@ export class SessionSummaryService {
       fileBases,
       lines,
       functions,
+      functionWords,
       keywords,
       requestIds,
       actionIds,
@@ -4220,6 +4535,55 @@ export class SessionSummaryService {
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
   }
+
+  private async persistChatMessages(
+    sessionId: string,
+    appId: string | undefined,
+    entries: Array<{ role: SessionChatRole; content?: string } | undefined>,
+  ): Promise<void> {
+    if (!entries?.length) {
+      return;
+    }
+    const tenantId = this.tenant.tryGetTenantId();
+    if (!tenantId) {
+      return;
+    }
+    const docs: Array<{
+      tenantId: string;
+      sessionId: string;
+      appId?: string;
+      role: SessionChatRole;
+      content: string;
+      tokenEstimate: number;
+    }> = [];
+    entries.forEach((entry) => {
+      if (!entry || typeof entry.content !== 'string') {
+        return;
+      }
+      if (!entry.content.trim().length) {
+        return;
+      }
+      docs.push({
+        tenantId,
+        sessionId,
+        appId,
+        role: entry.role,
+        content: entry.content,
+        tokenEstimate: Math.ceil(entry.content.length / 4),
+      });
+    });
+    if (!docs.length) {
+      return;
+    }
+    try {
+      await this.chatMessages.insertMany(docs, { ordered: false });
+    } catch (err: any) {
+      this.logger.warn(
+        'Failed to persist chat transcript',
+        err?.message ?? err,
+      );
+    }
+  }
 }
 
 type TraceEventLike = Record<string, any>;
@@ -4229,6 +4593,7 @@ type HintTokens = {
   fileBases: Set<string>;
   lines: Set<number>;
   functions: Set<string>;
+  functionWords: Set<string>;
   keywords: Set<string>;
   requestIds: Set<string>;
   actionIds: Set<string>;
@@ -4250,6 +4615,7 @@ type SessionDataset = {
     chunkIds: string[];
     functions: string[];
   };
+  codeRefs?: DatasetCodeRef[];
 };
 
 type TraceDataLimitResult = {
@@ -4384,6 +4750,16 @@ type CodeRef = {
   file: string;
   line?: number;
   fn?: string;
+  argsPreview?: string;
+  resultPreview?: string;
+  durationMs?: number;
+  metadata?: Record<string, any> | null;
+};
+
+type DatasetCodeRef = CodeRef & {
+  rid?: string;
+  actionId?: string | null;
+  source: 'request' | 'trace';
 };
 
 type DatasetChunk = {
