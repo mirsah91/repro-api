@@ -31,15 +31,26 @@ const TRACE_TOTAL_EVENT_BUDGET =
   TRACE_EVENT_SAMPLE_LIMIT * TRACE_TRACE_SAMPLE_LIMIT;
 const TRACE_SEGMENT_LIMIT_PER_TRACE = 6;
 const TRACE_SEGMENT_SUMMARY_LENGTH = 800;
-const CHAT_MAX_DATASET_CHUNKS = 6;
+const CHAT_MAX_DATASET_CHUNKS = 10;
 const CHUNK_SUMMARY_MAX_TOKENS = 450;
 const SUMMARY_CHUNK_LIMIT = 40;
 const TRACE_CHILD_EXPANSION_LIMIT = 150;
 const TRACE_PARENT_EXPANSION_LIMIT = 150;
 const FOCUS_CHUNK_EXTRA_LIMIT = 3;
 const FOCUS_NODE_LIMIT = 80;
+const CHUNK_STRING_ROOT_LIMIT = 600;
+const CHUNK_STRING_NESTED_LIMIT = 320;
+const CHUNK_ARRAY_ROOT_LIMIT = 12;
+const CHUNK_ARRAY_NESTED_LIMIT = 6;
+const CHUNK_OBJECT_ROOT_LIMIT = 18;
+const CHUNK_OBJECT_NESTED_LIMIT = 10;
+const EMBEDDING_CANDIDATE_LIMIT = 120;
+const EMBEDDING_CHUNK_CHAR_LIMIT = 2000;
+const EMBEDDING_HINT_BOOST = 0.05;
 const CHAT_SYSTEM_PROMPT = [
   'You are the lead engineer fully responsible for this session’s codebase and runtime traces.',
+  '',
+  'You only have the JSON context chunks in the prompt—never invent data. If the answer is missing, respond with “I don’t know based on the available data.” Cite filenames and line numbers exactly as `file.ts:123` whenever the chunk metadata includes them.',
   '',
   'Goal: answer with surgical precision using only evidence in this session. Never speculate or hedge ("maybe", "likely", etc.).',
   '',
@@ -339,40 +350,47 @@ export class SessionSummaryService {
       const hintTokens = this.extractHintTokens(opts?.messages ?? []);
       const datasetFocusIds = new Set(dataset.focus?.chunkIds ?? []);
       const datasetFocusFunctions = dataset.focus?.functions ?? [];
+      const { history, latestUser } =
+        this.splitConversationForPrompt(conversation);
+      const questionText =
+        latestUser?.content?.toString()?.trim() ||
+        conversation[conversation.length - 1]?.content?.toString()?.trim() ||
+        'Provide a diagnostic summary for this session.';
 
-      let selectedChunks: DatasetChunk[];
-      let enforcedFocusIds: Set<string> = datasetFocusIds;
-
-      if (datasetFocusIds.size) {
-        selectedChunks = this.ensureFocusChunkContext(
-          dataset.chunks,
+      let selectedChunks: DatasetChunk[] = [];
+      try {
+        selectedChunks = await this.selectChunksForQuestion({
+          dataset,
+          question: questionText,
+          hintTokens,
+          focusIds: datasetFocusIds,
+          client,
+        });
+      } catch (err) {
+        this.logger.warn(
+          'Embedding chunk retrieval failed; using heuristic fallback.',
+          err?.message ?? err,
+        );
+        selectedChunks = this.selectChunksWithHeuristics(
+          dataset,
+          hintTokens,
           datasetFocusIds,
-          CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
         );
-      } else {
-        const derivedFocus = this.determineFocusChunkIds(
-          dataset.chunks,
+      }
+
+      if (!selectedChunks.length) {
+        selectedChunks = this.selectChunksWithHeuristics(
+          dataset,
           hintTokens,
+          datasetFocusIds,
         );
-        enforcedFocusIds = derivedFocus;
-        selectedChunks = this.selectDatasetChunks(
-          dataset.chunks,
-          hintTokens,
+      }
+
+      selectedChunks = this.filterPromptableChunks(selectedChunks);
+      if (!selectedChunks.length) {
+        selectedChunks = this.filterPromptableChunks(dataset.chunks).slice(
+          0,
           CHAT_MAX_DATASET_CHUNKS,
-          derivedFocus,
-        );
-        selectedChunks = this.expandChunksWithRelated(
-          this.appendFocusChunks(
-            selectedChunks,
-            dataset.chunks,
-            derivedFocus,
-            CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
-          ),
-          dataset.chunks,
-          Math.min(
-            dataset.chunks.length,
-            CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
-          ),
         );
       }
 
@@ -403,10 +421,14 @@ export class SessionSummaryService {
         });
       }
 
-      llmMessages.push(...conversation);
+      llmMessages.push(...history);
       llmMessages.push({
-        role: 'system',
-        content: datasetContext,
+        role: 'user',
+        content: [
+          datasetContext,
+          '',
+          `Question: ${questionText}`,
+        ].join('\n'),
       });
 
       this.logger.debug('chatSession LLM payload', {
@@ -677,6 +699,7 @@ export class SessionSummaryService {
       dbChanges: payload.timeline.dbChanges ?? [],
       emails: payload.timeline.emails ?? [],
     };
+    const requestsByAction = this.groupRequestIndexByAction(requestIndex);
 
     const pushChunk = (
       chunk: Omit<DatasetChunk, 'index' | 'length'> & { text: string },
@@ -697,97 +720,47 @@ export class SessionSummaryService {
       });
     };
 
-    pushChunk({
-      id: 'overview',
-      kind: 'overview',
-      metadata: {
-        sessionId: payload.session.id ?? payload.session.sessionId ?? 'unknown',
-        appId: payload.session.appId ?? 'unknown',
-      },
-      text: ['# Session Overview', this.describeSession(payload.session)].join(
-        '\n',
-      ),
-    });
+    const pushStructuredChunk = (chunk?: StructuredChunk) => {
+      if (!chunk) {
+        return;
+      }
+      const body = {
+        chunkId: chunk.id,
+        type: chunk.type,
+        ...chunk.body,
+      };
+      pushChunk({
+        id: chunk.id,
+        kind: chunk.kind,
+        metadata: {
+          ...(chunk.metadata ?? {}),
+          chunkType: chunk.type,
+        },
+        text: this.buildStructuredChunkText(body),
+      });
+    };
 
-    pushChunk({
-      id: 'counts',
-      kind: 'counts',
-      text: this.buildCountsSection(payload.timeline),
-    });
+    pushStructuredChunk(this.createOverviewChunk(payload.session));
+    pushStructuredChunk(this.createCountsChunk(payload.timeline));
 
     payload.timeline.actions.forEach((action, index) => {
-      pushChunk({
-        id: `action:${action?.actionId ?? action?.id ?? index}`,
-        kind: 'action',
-        metadata: {
-          actionId: action?.actionId ?? action?.id,
-        },
-        text: this.formatActionChunk(action, index),
-      });
+      pushStructuredChunk(
+        this.createActionChunk(action, index, requestsByAction),
+      );
     });
 
     payload.timeline.requests.forEach((request, index) => {
-      const rid = request?.rid ?? request?.requestRid;
-      const requestCodeRefs = this.extractStoredCodeRefs(request?.codeRefs);
-      const traceRefs = traceIndex[rid ?? '']?.codeRefs ?? [];
-      const combinedRefs = this.mergeCodeRefs(requestCodeRefs, traceRefs);
-      pushChunk({
-        id: `request:${rid ?? index}`,
-        kind: 'request',
-        metadata: {
-          rid,
-          actionId: request?.actionId ?? request?.aid,
-          method: request?.method,
-          url: this.describeUrl(request?.url),
-          codeRefs: this.stringifyCodeRefs(combinedRefs),
-        },
-        text: this.formatRequestChunk(
-          request,
-          index,
-          actionIndex,
-          combinedRefs,
-        ),
-      });
+      pushStructuredChunk(
+        this.createRequestChunk(request, index, actionIndex, traceIndex),
+      );
     });
 
     payload.timeline.dbChanges.forEach((change, index) => {
-      pushChunk({
-        id: `db:${index}`,
-        kind: 'dbChange',
-        metadata: {
-          actionId: change?.actionId,
-          collection: change?.collection ?? change?.table,
-          requestRid: change?.requestRid ?? change?.rid,
-        },
-        text: this.formatDbChangeChunk(change, index, actionIndex),
-      });
+      pushStructuredChunk(this.createDbChangeChunk(change, index, requestIndex));
     });
 
     payload.timeline.emails.forEach((email, index) => {
-      pushChunk({
-        id: `email:${index}`,
-        kind: 'email',
-        metadata: {
-          actionId: email?.actionId,
-          to: email?.to,
-          subject: email?.subject,
-        },
-        text: this.formatEmailChunk(email, index),
-      });
-    });
-
-    payload.timeline.traces.forEach((trace, index) => {
-      const rid = trace?.requestRid ?? trace?.rid;
-      pushChunk({
-        id: `trace:${rid ?? index}:${index}`,
-        kind: 'trace',
-        metadata: {
-          rid,
-          actionId: trace?.actionId ?? trace?.aid,
-          files: this.collectTraceFilesFromTraceDoc(trace),
-        },
-        text: this.formatTraceChunk(trace, index, requestIndex, actionIndex),
-      });
+      pushStructuredChunk(this.createEmailChunk(email, index));
     });
 
     const focusChunkIdSet = new Set(
@@ -801,38 +774,38 @@ export class SessionSummaryService {
     );
 
     combinedEntries.forEach((entry, idx) => {
-      const chunkId = `traceSummary:${entry.groupId}:${entry.segmentIndex}:${idx}`;
-      const isFocus = entry.__focus === true || focusChunkIdSet.has(entry.chunkId ?? '');
-      pushChunk({
-        id: chunkId,
-        kind: 'trace',
-        metadata: {
-          rid: entry.requestRid ?? undefined,
-          actionId: entry.actionId ?? undefined,
-          chunkId: entry.chunkId ?? undefined,
-          parentChunkId: entry.parentChunkId ?? undefined,
-          depth: entry.depth ?? undefined,
-          files: this.collectFilesForTraceEntry(entry),
-          focus: isFocus || undefined,
-        },
-        text: this.formatTraceSummaryEntryChunk(
-          entry,
-          requestIndex,
-          actionIndex,
-          timelineContext,
-        ),
-      });
-      if (isFocus) {
-        focusChunkIds.add(chunkId);
-        const fn =
-          entry.functionName ??
-          entry.nodeDetail?.functionName ??
-          undefined;
-        if (fn) {
-          focusFunctions.add(fn);
+      const isFocus =
+        entry.__focus === true || focusChunkIdSet.has(entry.chunkId ?? '');
+      const chunk = this.createTraceSummaryChunk(
+        entry,
+        idx,
+        requestIndex,
+        timelineContext,
+        isFocus,
+      );
+      pushStructuredChunk(chunk);
+      if (isFocus && chunk) {
+        focusChunkIds.add(chunk.id);
+        if (chunk.metadata?.functionName) {
+          focusFunctions.add(chunk.metadata.functionName);
         }
       }
     });
+
+    if (!combinedEntries.length && payload.timeline.traces.length) {
+      payload.timeline.traces
+        .slice(0, TRACE_TRACE_SAMPLE_LIMIT)
+        .forEach((trace, index) => {
+          pushStructuredChunk(
+            this.createFallbackTraceChunk(
+              trace,
+              index,
+              requestIndex,
+              actionIndex,
+            ),
+          );
+        });
+    }
 
     this.splitRawSnapshot(jsonSnapshot).forEach((text, part) => {
       pushChunk({
@@ -846,248 +819,603 @@ export class SessionSummaryService {
     return { chunks, focusChunkIds, focusFunctions };
   }
 
-  private describeSession(session: Record<string, any>): string {
-    if (!session) {
-      return 'No session metadata available.';
-    }
-    const user = session.userEmail ?? session.userId ?? 'unknown user';
-    const started =
-      typeof session.startedAt === 'string' || session.startedAt instanceof Date
-        ? new Date(session.startedAt).toISOString()
-        : 'unknown start';
-    const notes = session.notes ? this.toShortText(session.notes, 240) : 'none';
-    return [
-      `Session ID: ${session.id ?? session.sessionId ?? 'unknown'}`,
-      `App ID: ${session.appId ?? 'unknown app'}`,
-      `User: ${user}`,
-      `Started: ${started}`,
-      `Notes: ${notes}`,
-    ].join('\n');
+
+  private createOverviewChunk(session: Record<string, any>): StructuredChunk {
+    const sessionId = session?.id ?? session?.sessionId ?? 'unknown';
+    const startedAt = this.toIsoTimestamp(session?.startedAt);
+    const finishedAt = this.toIsoTimestamp(
+      session?.finishedAt ?? session?.endedAt,
+    );
+    const user = session?.userEmail ?? session?.userId ?? 'unknown user';
+    return {
+      id: 'overview',
+      kind: 'overview',
+      type: 'SESSION_OVERVIEW',
+      metadata: {
+        sessionId,
+        appId: session?.appId ?? 'unknown',
+      },
+      body: {
+        sessionId,
+        appId: session?.appId ?? 'unknown',
+        user,
+        startedAt,
+        finishedAt,
+        notes: session?.notes ?? null,
+      },
+    };
   }
 
-  private buildCountsSection(timeline: {
+  private createCountsChunk(timeline: {
     actions: any[];
     requests: any[];
     traces: any[];
     dbChanges: any[];
     emails: any[];
-  }): string {
-    return [
-      '## Timeline Counts',
-      `Actions: ${timeline.actions.length}`,
-      `Requests: ${timeline.requests.length}`,
-      `Traces: ${timeline.traces.length}`,
-      `DB Changes: ${timeline.dbChanges.length}`,
-      `Emails: ${timeline.emails.length}`,
-    ].join('\n');
+  }): StructuredChunk {
+    return {
+      id: 'counts',
+      kind: 'counts',
+      type: 'SESSION_COUNTS',
+      body: {
+        counts: {
+          actions: timeline.actions.length,
+          requests: timeline.requests.length,
+          traces: timeline.traces.length,
+          dbChanges: timeline.dbChanges.length,
+          emails: timeline.emails.length,
+        },
+      },
+    };
   }
 
-  private formatActionChunk(action: any, index: number): string {
+  private groupRequestIndexByAction(
+    requestIndex: RequestIndex,
+  ): Map<string, RequestIndexEntry[]> {
+    const map = new Map<string, RequestIndexEntry[]>();
+    Object.values(requestIndex ?? {}).forEach((entry) => {
+      if (!entry?.actionId) {
+        return;
+      }
+      const list = map.get(entry.actionId) ?? [];
+      list.push(entry);
+      map.set(entry.actionId, list);
+    });
+    return map;
+  }
+
+  private createActionChunk(
+    action: any,
+    index: number,
+    requestsByAction: Map<string, RequestIndexEntry[]>,
+  ): StructuredChunk | undefined {
     if (!action || typeof action !== 'object') {
-      return `## Action ${index + 1}\nNo data`;
+      return undefined;
     }
-    const label = this.toShortText(
-      action.label ?? action.type ?? 'action',
-      120,
-    );
     const actionId = action.actionId ?? action.id ?? `action_${index + 1}`;
-    const tStart = this.formatTimestamp(action.tStart ?? action.t ?? null);
-    const tEnd = this.formatTimestamp(action.tEnd ?? null);
-    const flags = [
-      action.hasReq ? 'request' : '',
-      action.hasDb ? 'db' : '',
-      action.error ? 'error' : '',
-    ]
-      .filter(Boolean)
-      .join(',');
-    const duration =
-      typeof action.tStart === 'number' && typeof action.tEnd === 'number'
-        ? `${Math.max(0, action.tEnd - action.tStart)}ms`
-        : '-';
-    return [
-      `## Action ${index + 1}`,
-      `actionId: ${actionId}`,
-      `label: ${label}`,
-      `timeline: ${tStart} → ${tEnd} (${duration})`,
-      `flags: ${flags || 'none'}`,
-    ].join('\n');
+    const relatedRequest = actionId
+      ? requestsByAction.get(actionId)?.[0]
+      : undefined;
+    return {
+      id: `action:${actionId}`,
+      kind: 'action',
+      type: 'FRONTEND_ACTION',
+      metadata: {
+        actionId,
+        rid: relatedRequest?.rid,
+        requestId: relatedRequest?.rid,
+        method: relatedRequest?.method,
+        url: relatedRequest?.url,
+        endpoint: relatedRequest?.url,
+      },
+      body: {
+        actionId,
+        actionName: this.toShortText(
+          action.label ?? action.type ?? 'action',
+          160,
+        ),
+        requestId: relatedRequest?.rid ?? null,
+        endpoint: relatedRequest?.url ?? null,
+        method: relatedRequest?.method ?? null,
+        timeline: {
+          startedAt: this.toIsoTimestamp(action.tStart ?? action.t),
+          endedAt: this.toIsoTimestamp(action.tEnd),
+          durationMs: this.computeDurationMs(action.tStart, action.tEnd),
+        },
+        flags: {
+          hasRequest: Boolean(action.hasReq),
+          hasDbChange: Boolean(action.hasDb),
+          error: Boolean(action.error),
+        },
+        uiContext: action?.ui ?? null,
+      },
+    };
   }
 
-  private formatRequestChunk(
+  private createRequestChunk(
     request: any,
     index: number,
     actionIndex: ActionIndex,
-    refs: CodeRef[],
-  ): string {
+    traceIndex: TraceRefIndex,
+  ): StructuredChunk | undefined {
     if (!request || typeof request !== 'object') {
-      return `## Request ${index + 1}\nNo data`;
+      return undefined;
     }
     const rid = request.rid ?? request.requestRid ?? `req_${index + 1}`;
     const method = (request.method ?? 'GET').toUpperCase();
     const url = this.describeUrl(request.url);
-    const status =
-      typeof request.status === 'number'
-        ? request.status
-        : request.error
-          ? 'error'
-          : 'n/a';
-    const actionId = request.actionId ?? request.aid ?? 'unknown';
-    const actionRef = this.lookupAction(actionIndex, actionId);
-    const codeRefText = refs
-      .slice(0, 5)
-      .map((ref) => this.formatCodeRef(ref))
-      .join(', ');
-    const bodyPreview = this.previewJson(request.body);
-    const respPreview = this.previewJson(request.respBody);
-    const paramsPreview = this.previewJson(request.params);
-    const queryPreview = this.previewJson(request.query);
-    const headersPreview = this.previewJson(request.headers);
-    const duration =
-      typeof request.durMs === 'number'
-        ? `${Math.round(request.durMs)}ms`
-        : request.duration
-          ? `${Math.round(request.duration)}ms`
-          : '-';
-    return [
-      `## Request ${index + 1}`,
-      `rid: ${rid}`,
-      `method: ${method}`,
-      `url: ${url}`,
-      `status: ${status}`,
-      `duration: ${duration}`,
-      `actionId: ${actionId}`,
-      `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
-      actionRef?.startedAt ? `actionStart: ${actionRef.startedAt}` : undefined,
-      bodyPreview ? `body: ${bodyPreview}` : undefined,
-      respPreview ? `response: ${respPreview}` : undefined,
-      paramsPreview ? `params: ${paramsPreview}` : undefined,
-      queryPreview ? `query: ${queryPreview}` : undefined,
-      headersPreview ? `headers: ${headersPreview}` : undefined,
-      codeRefText ? `codeRefs: ${codeRefText}` : undefined,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const actionId = request.actionId ?? request.aid ?? null;
+    const actionRef = this.lookupAction(actionIndex, actionId ?? undefined);
+    const requestCodeRefs = this.extractStoredCodeRefs(request?.codeRefs);
+    const traceRefs = traceIndex[rid ?? '']?.codeRefs ?? [];
+    const combinedRefs = this.mergeCodeRefs(requestCodeRefs, traceRefs);
+    return {
+      id: `request:${rid}`,
+      kind: 'request',
+      type: 'REQUEST',
+      metadata: {
+        rid,
+        requestId: rid,
+        actionId,
+        method,
+        url,
+        endpoint: url,
+        files: combinedRefs.map((ref) => ref.file),
+      },
+      body: {
+        requestId: rid,
+        method,
+        endpoint: url,
+        status:
+          typeof request.status === 'number'
+            ? request.status
+            : request.error
+              ? request.error
+              : null,
+        durationMs: this.resolveRequestDuration(request),
+        timestamp: this.toIsoTimestamp(request.t),
+        actionId,
+        actionLabel: actionRef?.label ?? null,
+        params: request.params ?? null,
+        query: request.query ?? null,
+        body: request.body ?? null,
+        response: request.respBody ?? null,
+        headers: request.headers ?? null,
+        codeRefs: combinedRefs.slice(0, 6).map((ref) => ({
+          file: ref.file,
+          line: ref.line ?? null,
+          functionName: ref.fn ?? null,
+        })),
+      },
+    };
   }
 
-  private formatDbChangeChunk(
+  private resolveRequestDuration(request: any): number | null {
+    if (typeof request?.durMs === 'number' && Number.isFinite(request.durMs)) {
+      return Math.round(request.durMs);
+    }
+    if (
+      typeof request?.duration === 'number' &&
+      Number.isFinite(request.duration)
+    ) {
+      return Math.round(request.duration);
+    }
+    return null;
+  }
+
+  private computeDurationMs(start?: number, end?: number): number | null {
+    if (
+      typeof start === 'number' &&
+      Number.isFinite(start) &&
+      typeof end === 'number' &&
+      Number.isFinite(end)
+    ) {
+      return Math.max(0, Math.round(end - start));
+    }
+    return null;
+  }
+
+  private toIsoTimestamp(value: any): string | null {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      try {
+        return new Date(value).toISOString();
+      } catch {
+        return null;
+      }
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    if (typeof value === 'string' && value.length) {
+      return value;
+    }
+    return null;
+  }
+
+  private createDbChangeChunk(
     change: any,
     index: number,
-    actionIndex: ActionIndex,
-  ): string {
+    requestIndex: RequestIndex,
+  ): StructuredChunk | undefined {
     if (!change || typeof change !== 'object') {
-      return `## DB Change ${index + 1}\nNo data`;
+      return undefined;
     }
+    const changeId = change.id ?? `db_${index + 1}`;
+    const rid = change.requestRid ?? change.rid ?? null;
+    const requestRef = rid ? requestIndex[rid] : undefined;
     const collection = change.collection ?? change.table ?? 'unknown';
-    const op = change.op ?? change.operation ?? 'op';
-    const rid = change.requestRid ?? change.rid ?? 'n/a';
-    const actionId = change.actionId ?? 'n/a';
-    const actionRef = this.lookupAction(actionIndex, actionId);
-    return [
-      `## DB Change ${index + 1}`,
-      `operation: ${op}`,
-      `collection: ${collection}`,
-      `requestRid: ${rid}`,
-      `actionId: ${actionId}`,
-      `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
-      change.error ? `error: ${this.previewJson(change.error)}` : undefined,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const op = (change.op ?? change.operation ?? 'operation').toUpperCase();
+    return {
+      id: `db:${changeId}`,
+      kind: 'dbChange',
+      type: 'DB_CHANGE',
+      metadata: {
+        changeId,
+        actionId: change.actionId ?? null,
+        rid,
+        requestId: rid,
+        endpoint: requestRef?.url,
+        method: requestRef?.method,
+        collection,
+      },
+      body: {
+        changeId,
+        requestId: rid ?? null,
+        actionId: change.actionId ?? null,
+        endpoint: requestRef?.url ?? null,
+        table: collection,
+        operation: op,
+        timestamp: this.toIsoTimestamp(change.t),
+        durationMs:
+          typeof change.durMs === 'number' && Number.isFinite(change.durMs)
+            ? Math.round(change.durMs)
+            : null,
+        before: change.before ?? null,
+        after: change.after ?? null,
+        query: change.query ?? null,
+        resultMeta: change.resultMeta ?? null,
+        error: change.error ?? null,
+      },
+    };
   }
 
-  private formatEmailChunk(email: any, index: number): string {
+  private createEmailChunk(email: any, index: number): StructuredChunk | undefined {
     if (!email || typeof email !== 'object') {
-      return `## Email ${index + 1}\nNo data`;
+      return undefined;
     }
-    const subject = this.toShortText(email.subject ?? '(no subject)', 160);
-    const to = Array.isArray(email.to) ? email.to.join(', ') : (email.to ?? '');
-    const cc = Array.isArray(email.cc) ? email.cc.join(', ') : (email.cc ?? '');
-    const bcc = Array.isArray(email.bcc)
-      ? email.bcc.join(', ')
-      : (email.bcc ?? '');
-    const textPreview = this.toShortText(email.text, 200);
-    return [
-      `## Email ${index + 1}`,
-      `subject: ${subject}`,
-      `to: ${to || 'unknown'}`,
-      cc ? `cc: ${cc}` : undefined,
-      bcc ? `bcc: ${bcc}` : undefined,
-      textPreview ? `bodyPreview: ${textPreview}` : undefined,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const emailId = email.id ?? `email_${index + 1}`;
+    return {
+      id: `email:${emailId}`,
+      kind: 'email',
+      type: 'EMAIL',
+      metadata: {
+        actionId: email.actionId ?? null,
+        rid: email.requestRid ?? email.rid ?? null,
+        subject: this.toShortText(email.subject ?? '(no subject)', 160),
+      },
+      body: {
+        emailId,
+        subject: email.subject ?? '(no subject)',
+        to: email.to ?? null,
+        cc: email.cc ?? null,
+        bcc: email.bcc ?? null,
+        timestamp: this.toIsoTimestamp(email.t),
+        statusCode: email.statusCode ?? null,
+        durationMs:
+          typeof email.durMs === 'number' && Number.isFinite(email.durMs)
+            ? Math.round(email.durMs)
+            : null,
+        textPreview: email.text ?? null,
+      },
+    };
   }
 
-  private formatTraceChunk(
+  private createTraceSummaryChunk(
+    entry: TraceSummaryEntry,
+    index: number,
+    requestIndex: RequestIndex,
+    timeline: TimelineContext,
+    isFocus: boolean,
+  ): StructuredChunk | undefined {
+    if (!entry) {
+      return undefined;
+    }
+    const rid = entry.requestRid ?? undefined;
+    const requestRef = rid ? requestIndex[rid] : undefined;
+    const chunkId =
+      entry.chunkId ??
+      `trace-summary:${entry.groupId}:${entry.segmentIndex ?? index}`;
+    const functionName =
+      entry.functionName ?? entry.nodeDetail?.functionName ?? undefined;
+    const filename = entry.filePath ?? entry.nodeDetail?.filePath ?? undefined;
+    const lineNumber = this.deriveLineNumberFromEntry(entry);
+    const args = this.resolveTraceArgs(entry, requestRef);
+    const dbChanges = this.findRelatedDbChanges(entry, timeline.dbChanges).map(
+      (change) => ({
+        changeId: change.id ?? null,
+        table: change.collection ?? change.table ?? null,
+        operation: change.op ?? change.operation ?? null,
+        summary: change.summary ?? null,
+      }),
+    );
+    const emails = this.findRelatedEmails(entry, timeline.emails).map(
+      (email) => ({
+        subject: this.toShortText(email.subject ?? '(no subject)', 160),
+        to: email.to ?? null,
+        statusCode: email.statusCode ?? null,
+      }),
+    );
+    return {
+      id: chunkId,
+      kind: 'trace',
+      type: 'TRACE_CALL',
+      metadata: {
+        rid,
+        requestId: rid,
+        actionId: entry.actionId ?? undefined,
+        traceId: entry.groupId,
+        files: this.collectFilesForTraceEntry(entry),
+        functionName,
+        endpoint: requestRef?.url,
+        method: requestRef?.method,
+        depth: entry.depth ?? entry.nodeDetail?.depth ?? null,
+        focus: isFocus || undefined,
+      },
+      body: {
+        chunkId,
+        traceId: entry.groupId,
+        requestId: rid ?? null,
+        endpoint: requestRef ? `${requestRef.method} ${requestRef.url}` : null,
+        actionId: entry.actionId ?? null,
+        functionName: functionName ?? null,
+        filename: filename ?? null,
+        lineStart: lineNumber ?? null,
+        lineEnd: lineNumber ?? null,
+        depth: entry.depth ?? entry.nodeDetail?.depth ?? null,
+        args: args ?? null,
+        result: this.parseJsonPreview(entry.nodeDetail?.resultPreview),
+        summary: entry.summary ?? null,
+        eventRange: {
+          start: entry.eventStart,
+          end: entry.eventEnd,
+          count: entry.eventCount,
+        },
+        callStack: this.buildTraceCallStack(entry.lineageTrail),
+        childrenCalls: this.buildTraceChildCalls(entry.childSummaries),
+        previewEvents: this.buildTracePreviewEvents(entry.previewEvents),
+        durationMs: entry.nodeDetail?.durationMs ?? null,
+        dbChanges,
+        emails,
+      },
+    };
+  }
+
+  private resolveTraceArgs(
+    entry: TraceSummaryEntry,
+    requestRef?: RequestIndexEntry,
+  ): any {
+    const traceArgs = this.parseJsonPreview(entry.nodeDetail?.argsPreview);
+    if (traceArgs !== undefined) {
+      return traceArgs;
+    }
+    const fallback =
+      requestRef?.bodyPreview ??
+      requestRef?.paramsPreview ??
+      requestRef?.queryPreview ??
+      requestRef?.headersPreview;
+    return this.parseJsonPreview(fallback);
+  }
+
+  private parseJsonPreview(value?: string | null): any {
+    if (value == null) {
+      return undefined;
+    }
+    if (typeof value === 'object') {
+      return value;
+    }
+    if (typeof value !== 'string' || !value.trim().length) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+
+  private buildTraceCallStack(
+    lineage?: TraceSummaryEntry['lineageTrail'],
+  ): Array<Record<string, any>> | null {
+    if (!lineage?.length) {
+      return null;
+    }
+    return lineage.slice(0, 8).map((trail) => ({
+      chunkId: trail.chunkId ?? null,
+      relation: trail.relation,
+      functionName: trail.functionName ?? null,
+      filename: trail.filePath ?? null,
+      lineNumber: trail.lineNumber ?? null,
+      depth: trail.depth ?? null,
+    }));
+  }
+
+  private buildTraceChildCalls(
+    children?: TraceSummaryEntry['childSummaries'],
+  ): Array<Record<string, any>> | null {
+    if (!children?.length) {
+      return null;
+    }
+    return children.slice(0, 8).map((child) => ({
+      chunkId: child.chunkId ?? null,
+      functionName: child.functionName ?? null,
+      filename: child.filePath ?? null,
+      lineNumber: child.lineNumber ?? null,
+      depth: child.depth ?? null,
+    }));
+  }
+
+  private buildTracePreviewEvents(
+    events?: TraceSummaryEntry['previewEvents'],
+  ): Array<Record<string, any>> | null {
+    if (!events?.length) {
+      return null;
+    }
+    return events.slice(0, 8).map((event) => ({
+      fn: event?.fn ?? null,
+      file: event?.file ?? null,
+      line: event?.line ?? null,
+      type: event?.type ?? null,
+    }));
+  }
+
+  private deriveLineNumberFromEntry(
+    entry: TraceSummaryEntry,
+  ): number | undefined {
+    if (
+      typeof entry.lineNumber === 'number' &&
+      Number.isFinite(entry.lineNumber)
+    ) {
+      return Math.floor(entry.lineNumber);
+    }
+    if (
+      typeof entry.nodeDetail?.lineNumber === 'number' &&
+      Number.isFinite(entry.nodeDetail.lineNumber)
+    ) {
+      return Math.floor(entry.nodeDetail.lineNumber);
+    }
+    const previewLine = entry.previewEvents?.find(
+      (evt) => typeof evt?.line === 'number' && Number.isFinite(evt.line),
+    )?.line;
+    return typeof previewLine === 'number' ? Math.floor(previewLine) : undefined;
+  }
+
+  private createFallbackTraceChunk(
     trace: any,
     index: number,
     requestIndex: RequestIndex,
     actionIndex: ActionIndex,
-  ): string {
+  ): StructuredChunk | undefined {
     if (!trace || typeof trace !== 'object') {
-      return `## Trace ${index + 1}\nNo data`;
+      return undefined;
     }
-    const rid = trace.requestRid ?? trace.rid ?? 'n/a';
-    const actionId = trace.actionId ?? trace.aid ?? 'n/a';
+    const rid = trace.requestRid ?? trace.rid ?? `trace_${index + 1}`;
     const requestRef = this.lookupRequest(requestIndex, rid);
-    const actionRef = this.lookupAction(actionIndex, actionId);
-    const segments = this.describeTraceSegmentsDetailed(trace.data);
-    const codeRefs = this.mergeCodeRefs(
-      this.extractStoredCodeRefs(trace.codeRefs),
-      this.extractTraceCodeRefsFromData(trace.data),
-    )
-      .map((ref) => this.formatCodeRef(ref))
-      .slice(0, 8)
-      .join(', ');
-    return [
-      `## Trace ${index + 1}`,
-      `requestRid: ${rid}`,
-      `request: ${requestRef ? `${requestRef.method} ${requestRef.url}` : 'unknown'}`,
-      `actionId: ${actionId}`,
-      `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
-      `segments:`,
-      segments,
-      codeRefs ? `codeRefs: ${codeRefs}` : undefined,
-    ]
-      .filter(Boolean)
-      .join('\n');
+    const actionId = trace.actionId ?? trace.aid ?? null;
+    const actionRef = this.lookupAction(actionIndex, actionId ?? undefined);
+    const events = this.normalizeTraceEvents(trace.data).slice(0, 12);
+    return {
+      id: `traceFallback:${rid}:${index}`,
+      kind: 'trace',
+      type: 'TRACE_CALL',
+      metadata: {
+        rid,
+        requestId: rid,
+        actionId,
+        files: this.collectTraceFilesFromTraceDoc(trace),
+      },
+      body: {
+        requestId: rid,
+        endpoint: requestRef ? `${requestRef.method} ${requestRef.url}` : null,
+        actionId,
+        actionLabel: actionRef?.label ?? null,
+        functionName: events[0]?.fn ?? null,
+        filename: events[0]?.file ?? null,
+        lineStart: events[0]?.line ?? null,
+        lineEnd: events[events.length - 1]?.line ?? null,
+        previewEvents: events.map((evt) => ({
+          fn: evt?.fn ?? null,
+          file: evt?.file ?? null,
+          line: evt?.line ?? null,
+          type: evt?.type ?? null,
+        })),
+        note: 'Trace data included directly because no precomputed function segment was available.',
+      },
+    };
   }
 
-  private describeTraceSegmentsDetailed(data: any): string {
-    if (!data) {
-      return '  - No trace data.';
-    }
-    if (Array.isArray(data.events)) {
-      return data.events
-        .map(
-          (event: any, idx: number) =>
-            `  - [${idx + 1}] ${event.fn ?? 'fn'} (${event.file ?? 'file'}:${event.line ?? '?'}) ${event.message ?? event.type ?? ''}`,
-        )
-        .join('\n');
-    }
-    if (Array.isArray(data.segments)) {
-      return data.segments
-        .slice(0, 5)
-        .map((segment: any) => {
-          const snippet = this.toShortText(segment.summary, 280);
-          const file = segment.previewEvents?.find(
-            (evt: any) => evt.file,
-          )?.file;
-          const line =
-            segment.previewEvents?.find((evt: any) => evt.line)?.line ?? null;
-          const fileRef = file ? `${file}${line ? `:${line}` : ''}` : '';
-          return `  - segment ${segment.segmentIndex} (events=${segment.eventCount}) ${fileRef} ${snippet}`;
-        })
-        .join('\n');
-    }
-    if (data.omitted) {
-      return `  - omitted (${data.reason ?? 'budget'})`;
-    }
-    if (data.events && Array.isArray(data.events.events)) {
-      return this.describeTraceSegmentsDetailed(data.events);
-    }
-    return '  - No readable segments.';
+  private buildStructuredChunkText(payload: Record<string, any>): string {
+    const normalized = this.normalizeChunkValue(payload, 0);
+    return JSON.stringify(normalized, null, 2);
   }
+
+  private normalizeChunkValue(value: any, depth = 0): any {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (value === null) {
+      return null;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      const limit =
+        depth === 0 ? CHUNK_STRING_ROOT_LIMIT : CHUNK_STRING_NESTED_LIMIT;
+      if (trimmed.length <= limit) {
+        return trimmed;
+      }
+      return `${trimmed.slice(0, limit)}... (truncated)`;
+    }
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return value;
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    if (Buffer.isBuffer(value)) {
+      return value.toString('base64');
+    }
+    if (Array.isArray(value)) {
+      const limit =
+        depth === 0 ? CHUNK_ARRAY_ROOT_LIMIT : CHUNK_ARRAY_NESTED_LIMIT;
+      const normalized = value
+        .slice(0, limit)
+        .map((item) => this.normalizeChunkValue(item, depth + 1))
+        .filter((item) => item !== undefined);
+      if (value.length > limit) {
+        normalized.push('...(truncated list)');
+      }
+      return normalized;
+    }
+    if (typeof value === 'object') {
+      const entries = Object.entries(value).filter(
+        ([, v]) => v !== undefined,
+      );
+      const limit =
+        depth === 0 ? CHUNK_OBJECT_ROOT_LIMIT : CHUNK_OBJECT_NESTED_LIMIT;
+      const result: Record<string, any> = {};
+      entries.slice(0, limit).forEach(([key, val]) => {
+        const normalized = this.normalizeChunkValue(val, depth + 1);
+        if (normalized !== undefined) {
+          result[key] = normalized;
+        }
+      });
+      if (entries.length > limit) {
+        result.__truncated = true;
+      }
+      return result;
+    }
+    return String(value);
+  }
+
+  private cosineSimilarity(a?: number[], b?: number[]): number {
+    if (!a?.length || !b?.length || a.length !== b.length) {
+      return 0;
+    }
+    let dot = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      const va = a[i];
+      const vb = b[i];
+      dot += va * vb;
+      normA += va * va;
+      normB += vb * vb;
+    }
+    if (!normA || !normB) {
+      return 0;
+    }
+    return dot / Math.sqrt(normA * normB);
+  }
+
 
   private previewJson(value: any, maxLength = 400): string | undefined {
     if (value === undefined || value === null) {
@@ -1802,12 +2130,14 @@ export class SessionSummaryService {
         score += 1;
       }
     });
-    if (chunk.metadata?.url) {
+    const requestId = chunk.metadata?.requestId ?? chunk.metadata?.rid;
+    if (chunk.metadata?.url || chunk.metadata?.endpoint) {
+      const urlValue = String(chunk.metadata.url ?? chunk.metadata.endpoint);
       score += this.scoreTextAgainstKeywords(
-        String(chunk.metadata.url),
+        urlValue,
         keywordList,
       );
-      const path = this.normalizeEndpointPath(String(chunk.metadata.url));
+      const path = this.normalizeEndpointPath(urlValue);
       if (tokens.endpoints.has(path)) {
         score += 5;
       }
@@ -1818,12 +2148,12 @@ export class SessionSummaryService {
         score += 2;
       }
     }
-    if (chunk.metadata?.rid) {
+    if (requestId) {
       score += this.scoreTextAgainstKeywords(
-        String(chunk.metadata.rid),
+        String(requestId),
         keywordList,
       );
-      if (tokens.requestIds.has(String(chunk.metadata.rid).toLowerCase())) {
+      if (tokens.requestIds.has(String(requestId).toLowerCase())) {
         score += 4;
       }
     }
@@ -1873,7 +2203,9 @@ export class SessionSummaryService {
         seen.add(chunk.id);
       }
       if (meta.rid) relatedKeys.add(`rid:${meta.rid}`);
+      if (meta.requestId) relatedKeys.add(`rid:${meta.requestId}`);
       if (meta.actionId) relatedKeys.add(`action:${meta.actionId}`);
+      if (meta.traceId) relatedKeys.add(`trace:${meta.traceId}`);
     });
 
     for (const chunk of allChunks) {
@@ -1882,7 +2214,9 @@ export class SessionSummaryService {
       const meta = chunk.metadata ?? {};
       if (
         (meta.rid && relatedKeys.has(`rid:${meta.rid}`)) ||
-        (meta.actionId && relatedKeys.has(`action:${meta.actionId}`))
+        (meta.requestId && relatedKeys.has(`rid:${meta.requestId}`)) ||
+        (meta.actionId && relatedKeys.has(`action:${meta.actionId}`)) ||
+        (meta.traceId && relatedKeys.has(`trace:${meta.traceId}`))
       ) {
         out.push(chunk);
         seen.add(chunk.id);
@@ -1940,7 +2274,9 @@ export class SessionSummaryService {
       seen.add(chunk.id);
       const meta = chunk.metadata ?? {};
       if (meta.rid) relatedKeys.add(`rid:${meta.rid}`);
+      if (meta.requestId) relatedKeys.add(`rid:${meta.requestId}`);
       if (meta.actionId) relatedKeys.add(`action:${meta.actionId}`);
+      if (meta.traceId) relatedKeys.add(`trace:${meta.traceId}`);
     };
 
     focusIds.forEach((id) => addChunk(chunkById.get(id)));
@@ -1952,7 +2288,9 @@ export class SessionSummaryService {
         const meta = chunk.metadata ?? {};
         if (
           (meta.rid && relatedKeys.has(`rid:${meta.rid}`)) ||
-          (meta.actionId && relatedKeys.has(`action:${meta.actionId}`))
+          (meta.requestId && relatedKeys.has(`rid:${meta.requestId}`)) ||
+          (meta.actionId && relatedKeys.has(`action:${meta.actionId}`)) ||
+          (meta.traceId && relatedKeys.has(`trace:${meta.traceId}`))
         ) {
           addChunk(chunk);
         }
@@ -1990,8 +2328,13 @@ export class SessionSummaryService {
         focus.add(chunk.id);
         continue;
       }
-      const rid =
-        typeof meta.rid === 'string' ? meta.rid.toLowerCase() : undefined;
+      const ridCandidate =
+        typeof meta.requestId === 'string'
+          ? meta.requestId
+          : typeof meta.rid === 'string'
+            ? meta.rid
+            : undefined;
+      const rid = ridCandidate ? ridCandidate.toLowerCase() : undefined;
       if (rid && ridSet.has(rid)) {
         focus.add(chunk.id);
         continue;
@@ -2004,9 +2347,10 @@ export class SessionSummaryService {
         focus.add(chunk.id);
         continue;
       }
+      const urlHint = meta.url ?? meta.endpoint;
       const urlPath =
-        typeof meta.url === 'string'
-          ? this.normalizeEndpointPath(meta.url)
+        typeof urlHint === 'string'
+          ? this.normalizeEndpointPath(urlHint)
           : undefined;
       const method =
         typeof meta.method === 'string'
@@ -2046,16 +2390,216 @@ export class SessionSummaryService {
       if (chunk.kind !== 'trace') {
         continue;
       }
-      const text = chunk.text || '';
-      const match = text.match(/function:\s+([^\n]+)/i);
-      if (match?.[1]) {
-        const name = match[1].trim();
-        if (name && !name.toLowerCase().includes('function name unavailable')) {
-          names.add(name);
+      const metadataName =
+        typeof chunk.metadata?.functionName === 'string'
+          ? chunk.metadata.functionName
+          : undefined;
+      if (metadataName) {
+        names.add(metadataName);
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(chunk.text ?? '{}');
+        const fn =
+          typeof parsed?.functionName === 'string'
+            ? parsed.functionName
+            : typeof parsed?.body?.functionName === 'string'
+              ? parsed.body.functionName
+              : undefined;
+        if (fn) {
+          names.add(fn);
         }
+      } catch {
+        continue;
       }
     }
     return Array.from(names);
+  }
+
+  private filterPromptableChunks(chunks: DatasetChunk[]): DatasetChunk[] {
+    if (!chunks?.length) {
+      return [];
+    }
+    return chunks.filter((chunk) => chunk.kind !== 'raw');
+  }
+
+  private buildEmbeddingText(chunk: DatasetChunk): string {
+    const header = [
+      `chunkId=${chunk.id}`,
+      `kind=${chunk.kind}`,
+      this.describeChunkMetadata(chunk),
+    ]
+      .filter(Boolean)
+      .join(' | ');
+    const body = chunk.text ?? '';
+    const combined = `${header}\n${body}`;
+    if (combined.length <= EMBEDDING_CHUNK_CHAR_LIMIT) {
+      return combined;
+    }
+    return combined.slice(0, EMBEDDING_CHUNK_CHAR_LIMIT);
+  }
+
+  private async selectChunksForQuestion(params: {
+    dataset: SessionDataset;
+    question: string;
+    hintTokens: HintTokens;
+    focusIds: Set<string>;
+    client: OpenAI;
+  }): Promise<DatasetChunk[]> {
+    const promptable = this.filterPromptableChunks(params.dataset.chunks);
+    if (!promptable.length) {
+      return [];
+    }
+    const normalizedQuestion =
+      params.question?.trim().length > 0
+        ? params.question.trim()
+        : 'Summarize the most relevant session artifacts.';
+    const rankedByHints = promptable
+      .map((chunk) => ({
+        chunk,
+        hintScore: this.scoreDatasetChunk(chunk, params.hintTokens),
+      }))
+      .sort((a, b) => b.hintScore - a.hintScore);
+    const candidateLimit = Math.max(
+      EMBEDDING_CANDIDATE_LIMIT,
+      CHAT_MAX_DATASET_CHUNKS * 4,
+      params.focusIds.size,
+    );
+    let candidates = rankedByHints
+      .slice(0, Math.min(candidateLimit, rankedByHints.length))
+      .map((entry) => entry.chunk);
+    const candidateSet = new Set(candidates.map((chunk) => chunk.id));
+    params.focusIds.forEach((id) => {
+      if (candidateSet.has(id)) {
+        return;
+      }
+      const chunk = params.dataset.chunks.find((item) => item.id === id);
+      if (chunk && chunk.kind !== 'raw') {
+        candidates.push(chunk);
+        candidateSet.add(chunk.id);
+      }
+    });
+    if (!candidates.length) {
+      return [];
+    }
+
+    const embeddingModel =
+      this.config.get<string>('OPENAI_EMBEDDING_MODEL')?.trim() ||
+      'text-embedding-3-small';
+
+    const inputs = [
+      normalizedQuestion,
+      ...candidates.map((chunk) => this.buildEmbeddingText(chunk)),
+    ];
+    const response = await params.client.embeddings.create({
+      model: embeddingModel,
+      input: inputs,
+    });
+    if (response.data.length !== inputs.length) {
+      throw new Error('Embedding response size mismatch.');
+    }
+    const questionVector = response.data[0]?.embedding;
+    const scored = candidates
+      .map((chunk, index) => {
+        const embedding = response.data[index + 1]?.embedding;
+        const similarity = this.cosineSimilarity(questionVector, embedding);
+        const hintBoost =
+          this.scoreDatasetChunk(chunk, params.hintTokens) *
+          EMBEDDING_HINT_BOOST;
+        const focusBoost = params.focusIds.has(chunk.id) ? 0.2 : 0;
+        return {
+          chunk,
+          score: similarity + hintBoost + focusBoost,
+        };
+      })
+      .filter((entry) => Number.isFinite(entry.score));
+    if (!scored.length) {
+      return [];
+    }
+    scored.sort((a, b) => b.score - a.score);
+    let selected = scored
+      .slice(0, CHAT_MAX_DATASET_CHUNKS)
+      .map((entry) => entry.chunk);
+    selected = this.appendFocusChunks(
+      selected,
+      params.dataset.chunks,
+      params.focusIds,
+      CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
+    );
+    selected = this.expandChunksWithRelated(
+      selected,
+      params.dataset.chunks,
+      Math.min(
+        params.dataset.chunks.length,
+        CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
+      ),
+    );
+    return selected;
+  }
+
+  private selectChunksWithHeuristics(
+    dataset: SessionDataset,
+    hintTokens: HintTokens,
+    focusIds: Set<string>,
+  ): DatasetChunk[] {
+    if (focusIds.size) {
+      return this.ensureFocusChunkContext(
+        dataset.chunks,
+        focusIds,
+        Math.min(
+          dataset.chunks.length,
+          CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
+        ),
+      );
+    }
+    const derivedFocus = this.determineFocusChunkIds(
+      dataset.chunks,
+      hintTokens,
+      focusIds,
+    );
+    let selected = this.selectDatasetChunks(
+      dataset.chunks,
+      hintTokens,
+      CHAT_MAX_DATASET_CHUNKS,
+      derivedFocus,
+    );
+    selected = this.expandChunksWithRelated(
+      this.appendFocusChunks(
+        selected,
+        dataset.chunks,
+        derivedFocus,
+        CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT,
+      ),
+      dataset.chunks,
+      Math.min(
+        dataset.chunks.length,
+        CHAT_MAX_DATASET_CHUNKS + FOCUS_CHUNK_EXTRA_LIMIT + 4,
+      ),
+    );
+    return selected;
+  }
+
+  private splitConversationForPrompt(
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+  ): {
+    history: OpenAI.Chat.Completions.ChatCompletionMessageParam[];
+    latestUser?: OpenAI.Chat.Completions.ChatCompletionMessageParam;
+  } {
+    if (!messages?.length) {
+      return { history: [], latestUser: undefined };
+    }
+    let lastUserIndex = -1;
+    for (let idx = messages.length - 1; idx >= 0; idx--) {
+      if (messages[idx].role === 'user') {
+        lastUserIndex = idx;
+        break;
+      }
+    }
+    if (lastUserIndex === -1) {
+      return { history: messages, latestUser: undefined };
+    }
+    const history = messages.slice(0, lastUserIndex);
+    return { history, latestUser: messages[lastUserIndex] };
   }
 
   private composeChunkContext(
@@ -2065,23 +2609,24 @@ export class SessionSummaryService {
     if (!chunks?.length) {
       return 'Session dataset context unavailable: no chunks selected.';
     }
-    const header = [
-      `Session dataset context (selected ${chunks.length} of ${totalChunks} chunk(s)).`,
-      'Chunks preserve logical entities such as requests, actions, changes and traces.',
-    ].join(' ');
-
-    const body = chunks
-      .map((chunk) =>
+    const lines: string[] = [
+      `--- Context (selected ${chunks.length} of ${totalChunks} chunks) ---`,
+    ];
+    chunks.forEach((chunk, idx) => {
+      const label =
+        chunk.metadata?.chunkType ??
+        chunk.kind.toUpperCase().replace(/[^A-Z_]/g, '');
+      lines.push(
         [
-          `Chunk ${chunk.index + 1}/${totalChunks} [${chunk.kind}] ${this.describeChunkMetadata(chunk)}`,
-          '```',
+          `Chunk #${idx + 1} [${label}] ${this.describeChunkMetadata(chunk)}`,
+          '```json',
           chunk.text,
           '```',
         ].join('\n'),
-      )
-      .join('\n\n');
-
-    return [header, body].join('\n\n');
+      );
+    });
+    lines.push('--- End context ---');
+    return lines.join('\n');
   }
 
   private describeChunkMetadata(chunk: DatasetChunk): string {
@@ -3849,6 +4394,23 @@ type DatasetChunk = {
   length: number;
   metadata?: Record<string, any>;
 };
+
+type StructuredChunk = {
+  id: string;
+  kind: DatasetChunkKind;
+  type: SessionChunkType;
+  metadata?: Record<string, any>;
+  body: Record<string, any>;
+};
+
+type SessionChunkType =
+  | 'SESSION_OVERVIEW'
+  | 'SESSION_COUNTS'
+  | 'FRONTEND_ACTION'
+  | 'REQUEST'
+  | 'DB_CHANGE'
+  | 'TRACE_CALL'
+  | 'EMAIL';
 
 type DatasetChunkKind =
   | 'overview'
