@@ -19,6 +19,22 @@ export class RequestEvt {
   @Prop({ type: SchemaTypes.Mixed }) params?: Record<string, any>; // route params
   @Prop({ type: SchemaTypes.Mixed }) query?: Record<string, any>; // query string params
   @Prop({
+    type: {
+      fn: { type: String },
+      file: { type: String },
+      line: { type: Number },
+      functionType: { type: String },
+      _id: { type: SchemaTypes.Mixed },
+    },
+  })
+  entryPoint?: {
+    fn?: string | null;
+    file?: string | null;
+    line?: number | null;
+    functionType?: string | null;
+    _id?: any;
+  };
+  @Prop({
     type: [
       {
         file: { type: String },
@@ -47,3 +63,9 @@ export const RequestEvtSchema = SchemaFactory.createForClass(RequestEvt);
 
 RequestEvtSchema.index({ tenantId: 1, sessionId: 1, t: 1 });
 RequestEvtSchema.index({ tenantId: 1, sessionId: 1, key: 1, t: 1 });
+RequestEvtSchema.index({
+  tenantId: 1,
+  sessionId: 1,
+  'entryPoint.fn': 1,
+  t: 1,
+});

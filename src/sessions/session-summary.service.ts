@@ -53,39 +53,65 @@ const EMBEDDING_CHUNK_CHAR_LIMIT = 2000;
 const EMBEDDING_HINT_BOOST = 0.05;
 const CODE_REF_CONTEXT_LIMIT = 20;
 const CHAT_SYSTEM_PROMPT = [
-  'You are the lead engineer fully responsible for this session’s codebase and runtime traces.',
+  'You are the on-call engineer answering questions about a single debugging session.',
+  'Context will only contain data from the actions, requests, traces, and changes collections—never cite other sources or invent events.',
+  'Honor the target collection noted in the context: describe only actions when the target is actions, requests (plus entryPoint fn/file:line) when the target is requests, traces and their call graph when the target is traces, and DB operations when the target is changes.',
+  'When traces are provided, treat them as authoritative call graphs: describe the parent function with file:line plus args/returns, and mention at most three notable child calls—anything deeper should be pushed into the follow-up suggestions.',
+  'When requests are provided, always cite method, URL, status, and entryPoint.fn file.ts:line before summarizing any attached traces.',
+  'When actions are provided, focus on the action label, timing, and whether it triggered requests or DB work only if the data explicitly links it.',
+  'When changes are provided, document the collection, operation, key filter/update fields, and result metadata, tying them back to the triggering identifiers if present.',
+  'If information is missing, say "Not available in context." Do not speculate.',
+  'If forwardSuggestions are listed in the context, end the answer with `Follow-ups: suggestion; ...` using that exact text, treating those suggestions as the place to explore the highlighted child functions.',
+  'Never mention that a planning model was used; just answer confidently from the JSON context.',
+].join('\n');
+const SYSTEM_PROMPT = [
+  'You convert natural-language debugging questions into a single MongoDB query plan targeting exactly one of four collections.',
   '',
-  'You only have the JSON context chunks in the prompt—never invent data. If the answer is missing, respond with “I don’t know based on the available data.” Cite filenames and line numbers exactly as `file.ts:123` whenever the chunk metadata includes them.',
+  'SCHEMAS (use these exact field names):',
+  '- actions: { sessionId, actionId, label, tStart, tEnd, hasReq, hasDb, error, ui }',
+  '- requests: { sessionId, actionId, rid, method, url, key, status, t, durMs, headers, body, params, query, respBody, entryPoint:{ fn, file, line, functionType }, codeRefs:[{ fn, file, line }] }',
+  '- traces: { sessionId, requestRid, actionId?, batchIndex, codeRefs:[{ fn, file, line }], data, metadata }',
+  '- changes: { sessionId, actionId, collection, op, query:{ filter, update, projection, options, pipeline, bulk }, before, after, pk, resultMeta, durMs, error, t }',
   '',
-  'Goal: answer with surgical precision using only evidence in this session. Never speculate or hedge ("maybe", "likely", etc.).',
+  'RELATIONS:',
+  '- actions.actionId == requests.actionId',
+  '- changes.actionId == actions.actionId',
+  '- traces.requestRid == requests.rid',
+  '- requests.entryPoint.fn is the root function for traces when no explicit trace hint is provided.',
   '',
-  'Behavior rules:',
-  '- Start by naming the exact endpoint (HTTP method + path) and controller file:line when available.',
-  '- Map request bodies to controller arguments when the trace lacks explicit args, and map response bodies to the return value when no explicit result is captured.',
-  '- Surface only the functions, arguments, responses, and side effects that answer the user’s question; do not dump unrelated traces.',
-  '- If the user targets a nested helper, include that helper plus the nearest parent/child functions and offer to expand on it only if the user asks.',
+  'OUTPUT (JSON only):',
+  '{',
+  '  "target": "actions|requests|traces|changes",',
+  '  "limit": <int>,',
+  '  "mongo": {',
+  '    "collection": "actions|requests|traces|changes",',
+  '    "filter": { ... valid Mongo filter using the schema fields ... },',
+  '    "limit"?: <int>,',
+  '    "sort"?: { "<field>": 1|-1 }',
+  '  },',
+  '  "functionName"?: string,',
+  '  "action"?: { "actionId"?: string, "label"?: string, "labelContains"?: string, "hasReq"?: boolean, "hasDb"?: boolean, "error"?: boolean },',
+  '  "request"?: { "rid"?: string, "status"?: number },',
+  '  "endpoint"?: { "method"?: string, "url"?: string, "key"?: string },',
+  '  "entryPoint"?: { "fn"?: string, "file"?: string, "line"?: number },',
+  '  "change"?: { "collection"?: string, "op"?: string },',
+  '  "reason": string',
+  '}',
   '',
-  'When answering:',
-  '1. List every relevant function call in execution order with name, file:line, args (JSON), return value (JSON), and any DB/external operations it performs.',
-  '2. Provide JSON blocks for request/response/params/query whenever they inform the answer or substitute for missing args/results.',
-  '3. Clearly describe DB operations or external calls with the function/file that invoked them.',
-  '4. Summarize the core logic in concise paragraphs after the structured details.',
-  '5. If additional focused functions are available, end the answer with “Need details on <fn list>?” referencing up to three remaining names.',
-  '6. If data is missing, state "Not captured in trace/body/query" instead of guessing.',
-  '',
-  'Formatting guidelines:',
-  '- Use fenced JSON for arguments, request bodies, responses, or params.',
-  '- Include `file.ts:123` exactly when both file and line exist; otherwise say "location unavailable".',
-  '- Never invent filenames, functions, or values.',
-  '',
-  'Tone:',
-  '- Speak as the code owner: confident, technical, zero filler.',
-  '- Answer only what the user asked; do not ask follow-up questions unless the user explicitly requests more detail.',
-  '',
-  'Remember: request body ⇔ controller args, response body ⇔ return value, unless explicit trace data overrides it.',
-  'Do not include unrelated traces, extra commentary, or additional follow-up questions.'
-].join('');
-
+  'RULES:',
+  '- Use only the fields listed in the schemas; do NOT invent aliases like urlFragment or functionName.',
+  '- When matching endpoint text with multiple words (e.g. "dispatch shipment"), split into words and require ALL of them on url using $and of case-insensitive regexes, e.g.:',
+  '  { "$and": [ { "url": { "$regex": "dispatch", "$options": "i" } }, { "url": { "$regex": "shipment", "$options": "i" } } ] }',
+  '- Do NOT merge the words into a single regex like "dispatch.*shipment".',
+  '- When matching functions in traces, use codeRefs.fn. For requests, use entryPoint.fn.',
+  '- Always include concrete filters; never leave mongo.filter empty.',
+  '- Function/file/line/trace questions → target "traces".',
+  '- HTTP endpoint/body/response questions → target "requests".',
+  '- UI/user-action questions → target "actions".',
+  '- Database collection/op/filter/update questions → target "changes".',
+  '- Echo any detected function name verbatim in functionName and/or entryPoint.fn.',
+  '- Respond with JSON only.',
+].join('\\n');
 
 @Injectable()
 export class SessionSummaryService {
@@ -334,141 +360,68 @@ export class SessionSummaryService {
       totalTokens?: number;
     };
   }> {
-    const dataset = await this.buildSessionDataset(sessionId, {
-      appId: opts?.appId,
-      hintMessages: opts?.messages,
-    });
+    if (!sessionId?.trim()) {
+      throw new BadRequestException('sessionId is required');
+    }
 
+    const sessionDoc = await this.sessions
+      .findOne(
+        this.tenantFilter({
+          _id: sessionId,
+          ...(opts?.appId ? { appId: opts.appId } : {}),
+        }),
+      )
+      .lean()
+      .exec();
+
+    if (!sessionDoc) {
+      throw new NotFoundException('Session not found');
+    }
+
+    const countsPromise = this.fetchSessionCounts(sessionId);
     const client = this.ensureClient();
     const model =
       this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
 
+    const conversation = this.normalizeHintMessages(opts?.messages);
+    const { history, latestUser } =
+      this.splitConversationForPrompt(conversation);
+    const questionText =
+      latestUser?.content?.toString()?.trim() ||
+      conversation[conversation.length - 1]?.content?.toString()?.trim() ||
+      'Explain the most relevant details for this session.';
+
     let reply = '';
     let datasetContext = '';
-    let questionText = '';
-    let usage:
-      | {
-          promptTokens?: number;
-          completionTokens?: number;
-          totalTokens?: number;
-        }
-      | undefined;
+    let usage: UsageTotals | undefined;
 
     try {
-      const conversation = this.normalizeHintMessages(opts?.messages);
-      const hintTokens = this.extractHintTokens(opts?.messages ?? []);
-      const datasetFocusIds = new Set(dataset.focus?.chunkIds ?? []);
-      const datasetFocusFunctions = dataset.focus?.functions ?? [];
-      const { history, latestUser } =
-        this.splitConversationForPrompt(conversation);
-      questionText =
-        latestUser?.content?.toString()?.trim() ||
-        conversation[conversation.length - 1]?.content?.toString()?.trim() ||
-        'Provide a diagnostic summary for this session.';
-
-      let selectedChunks: DatasetChunk[] = [];
-      try {
-        selectedChunks = await this.selectChunksForQuestion({
-          dataset,
-          question: questionText,
-          hintTokens,
-          focusIds: datasetFocusIds,
-          client,
-        });
-      } catch (err) {
-        this.logger.warn(
-          'Embedding chunk retrieval failed; using heuristic fallback.',
-          err?.message ?? err,
-        );
-        selectedChunks = this.selectChunksWithHeuristics(
-          dataset,
-          hintTokens,
-          datasetFocusIds,
-        );
-      }
-
-      if (!selectedChunks.length) {
-        selectedChunks = this.selectChunksWithHeuristics(
-          dataset,
-          hintTokens,
-          datasetFocusIds,
-        );
-      }
-
-      selectedChunks = this.filterPromptableChunks(selectedChunks);
-      if (!selectedChunks.length) {
-        selectedChunks = this.filterPromptableChunks(dataset.chunks).slice(
-          0,
-          CHAT_MAX_DATASET_CHUNKS,
-        );
-      }
-
-      datasetContext = this.composeChunkContext(
-        selectedChunks,
-        dataset.chunks.length,
-      );
-      const codeRefMatches = this.findMatchingCodeRefs(
+      const plan = await this.buildChatQueryPlan(
         questionText,
-        hintTokens,
-        dataset.codeRefs ?? [],
+        conversation,
+        sessionDoc,
       );
-      if (codeRefMatches.length) {
-        const codeRefContext = this.composeCodeRefContext(codeRefMatches);
-        datasetContext = [codeRefContext, datasetContext]
-          .filter(Boolean)
-          .join('\n\n');
-        this.logger.debug('chatSession codeRef matches', {
-          sessionId,
-          matchCount: codeRefMatches.length,
-        });
-      }
-      this.logger.debug('chatSession dataset context', {
+      console.log('plan --->', JSON.stringify(plan, null, 2));
+
+      const execution = await this.executeChatQueryPlan(
         sessionId,
-        chunkCount: selectedChunks.length,
-        datasetContext,
-      });
+        plan,
+        opts?.messages ?? [],
+      );
 
-      const llmMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
-        {
-          role: 'system',
-          content: CHAT_SYSTEM_PROMPT,
-        },
-      ];
+      datasetContext = this.composeChatExecutionContext(sessionDoc, execution);
 
-      const focusFollowups =
-        datasetFocusFunctions.length > 0
-          ? datasetFocusFunctions
-          : this.collectFocusFunctionNamesFromChunks(selectedChunks);
-      if (focusFollowups.length) {
-        llmMessages.push({
-          role: 'system',
-          content: [
-            'Focused functions with full context:',
-            focusFollowups.join(', '),
-            'After answering, append "Need details on <fn list>?" referencing up to three of these names if additional detail could help.',
-          ].join(' '),
-        });
-      }
-
-      llmMessages.push(...history);
-      llmMessages.push({
-        role: 'user',
-        content: [
-          datasetContext,
-          '',
-          `Question: ${questionText}`,
-        ].join('\n'),
-      });
-
-      this.logger.debug('chatSession LLM payload', {
-        sessionId,
-        messageCount: llmMessages.length,
-        datasetChunkCount: dataset.chunks.length,
-      });
-      this.logger.verbose('chatSession LLM messages', {
-        sessionId,
-        messages: llmMessages,
-      });
+      const llmMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
+        [
+          { role: 'system', content: CHAT_SYSTEM_PROMPT },
+          ...history,
+          {
+            role: 'user',
+            content: [datasetContext, '', `Question: ${questionText}`].join(
+              '\n',
+            ),
+          },
+        ];
 
       const completion = await client.chat.completions.create({
         model,
@@ -481,6 +434,15 @@ export class SessionSummaryService {
         completion.choices?.[0]?.message?.content?.trim() ??
         'No response generated.';
       usage = this.mapUsage(completion.usage);
+
+      if (execution.forwardSuggestions.length) {
+        const followupLine = `Follow-ups: ${execution.forwardSuggestions.join(
+          '; ',
+        )}`;
+        if (!reply.toLowerCase().includes('follow-ups')) {
+          reply = [reply, followupLine].filter(Boolean).join('\n\n');
+        }
+      }
     } catch (err: any) {
       const message =
         err?.message ??
@@ -488,13 +450,11 @@ export class SessionSummaryService {
       throw new InternalServerErrorException(message);
     }
 
+    const counts = await countsPromise;
+
     await this.persistChatMessages(sessionId, opts?.appId, [
-      datasetContext
-        ? { role: 'system', content: datasetContext }
-        : undefined,
-      questionText
-        ? { role: 'user', content: questionText }
-        : undefined,
+      datasetContext ? { role: 'system', content: datasetContext } : undefined,
+      questionText ? { role: 'user', content: questionText } : undefined,
       reply ? { role: 'assistant', content: reply } : undefined,
     ]);
 
@@ -502,9 +462,1025 @@ export class SessionSummaryService {
       sessionId,
       reply,
       model,
-      counts: dataset.counts,
+      counts,
       usage,
     };
+  }
+
+  private async buildChatQueryPlan(
+    question: string,
+    conversation: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    sessionDoc: Session,
+  ): Promise<ChatQueryPlan> {
+    const fallback = this.buildFallbackChatQueryPlan(question);
+    const trimmedQuestion = question?.trim();
+    if (!trimmedQuestion) {
+      return fallback;
+    }
+    try {
+      const client = this.ensureClient();
+      const builderModel =
+        this.config.get<string>('OPENAI_QUERY_MODEL')?.trim() ||
+        this.config.get<string>('OPENAI_MODEL')?.trim() ||
+        'gpt-4o-mini';
+
+      // Build the exact JSON payload the model will see as the "user" message.
+      const userPayload = {
+        conversation: this.buildConversationSummary(conversation),
+        latestQuestion: trimmedQuestion,
+        session: {
+          sessionId: String(sessionDoc._id),
+          appId: String(sessionDoc.appId),
+        },
+      };
+
+      const completion = await client.chat.completions.create({
+        model: builderModel,
+        temperature: 0,
+        max_tokens: 600,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: JSON.stringify(userPayload, null, 2) },
+        ],
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim();
+      if (!raw) {
+        return fallback;
+      }
+      const parsed = this.tryParseJson<any>(raw);
+      if (!parsed) {
+        return fallback;
+      }
+      return this.normalizeChatQueryPlan(parsed, fallback);
+    } catch (err: any) {
+      this.logger.warn(
+        'LLM query-plan builder failed; using fallback.',
+        err?.message ?? err,
+      );
+      return fallback;
+    }
+  }
+
+  private buildConversationSummary(
+    conversation: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    limit = 8,
+  ): Array<{ role: string; content: string }> {
+    if (!conversation?.length) {
+      return [];
+    }
+    return conversation
+      .map((msg) => ({
+        role: msg.role ?? 'user',
+        content: this.flattenMessageContent(msg.content ?? ''),
+      }))
+      .filter((entry) => entry.content && entry.content.trim().length)
+      .slice(-limit);
+  }
+
+  private normalizeChatQueryPlan(
+    parsed: any,
+    fallback: ChatQueryPlan,
+  ): ChatQueryPlan {
+    const mongo =
+      this.normalizePlanMongo(parsed?.mongo) ?? fallback.mongo ?? undefined;
+    const target =
+      this.parseChatCollection(parsed?.target) ??
+      mongo?.collection ??
+      fallback.target ??
+      'requests';
+    const result: ChatQueryPlan = {
+      target,
+      limit:
+        typeof parsed?.limit === 'number' && Number.isFinite(parsed.limit)
+          ? parsed.limit
+          : fallback.limit,
+      reason:
+        typeof parsed?.reason === 'string' && parsed.reason.trim().length
+          ? parsed.reason.trim()
+          : fallback.reason,
+      mongo,
+    };
+
+    const functionName =
+      typeof parsed?.functionName === 'string'
+        ? parsed.functionName.trim()
+        : undefined;
+    if (functionName) {
+      result.functionName = functionName;
+    } else if (fallback.functionName) {
+      result.functionName = fallback.functionName;
+    }
+
+    result.action = this.normalizePlanAction(parsed?.action) ?? fallback.action;
+    result.request =
+      this.normalizePlanRequest(parsed?.request) ?? fallback.request;
+    result.endpoint =
+      this.normalizePlanEndpoint(parsed?.endpoint) ?? fallback.endpoint;
+    result.entryPoint =
+      this.normalizePlanEntryPoint(
+        parsed?.entryPoint ?? parsed?.request?.entryPoint,
+      ) ?? fallback.entryPoint;
+    result.change = this.normalizePlanChange(parsed?.change) ?? fallback.change;
+
+    const includeValues =
+      (Array.isArray(parsed?.include) && parsed.include) ||
+      (Array.isArray(parsed?.includes) && parsed.includes) ||
+      undefined;
+    if (includeValues?.length) {
+      const includeSet = new Set<ChatCollection>();
+      includeValues.forEach((item: any) => {
+        const parsedTarget = this.parseChatCollection(item);
+        if (parsedTarget && parsedTarget !== target) {
+          includeSet.add(parsedTarget);
+        }
+      });
+      if (includeSet.size) {
+        result.include = Array.from(includeSet);
+      }
+    } else if (fallback.include?.length) {
+      result.include = fallback.include;
+    }
+
+    result.limit = this.resolvePlanLimit(result);
+    return result;
+  }
+
+  private parseChatCollection(value: any): ChatCollection | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === 'actions' ||
+      normalized === 'requests' ||
+      normalized === 'traces' ||
+      normalized === 'changes'
+    ) {
+      return normalized as ChatCollection;
+    }
+    return undefined;
+  }
+
+  private normalizePlanAction(raw: any): ChatPlanAction | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const action: ChatPlanAction = {};
+    if (typeof raw.actionId === 'string' && raw.actionId.trim()) {
+      action.actionId = raw.actionId.trim();
+    }
+    if (typeof raw.label === 'string' && raw.label.trim()) {
+      action.label = raw.label.trim();
+    }
+    if (typeof raw.labelContains === 'string' && raw.labelContains.trim()) {
+      action.labelContains = raw.labelContains.trim();
+    }
+    if (typeof raw.hasReq === 'boolean') {
+      action.hasReq = raw.hasReq;
+    }
+    if (typeof raw.hasDb === 'boolean') {
+      action.hasDb = raw.hasDb;
+    }
+    if (typeof raw.error === 'boolean') {
+      action.error = raw.error;
+    }
+    return Object.keys(action).length ? action : undefined;
+  }
+
+  private normalizePlanRequest(raw: any): ChatPlanRequest | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const request: ChatPlanRequest = {};
+    if (typeof raw.rid === 'string' && raw.rid.trim()) {
+      request.rid = raw.rid.trim();
+    }
+    if (typeof raw.status === 'number' && Number.isFinite(raw.status)) {
+      request.status = Math.round(raw.status);
+    }
+    return Object.keys(request).length ? request : undefined;
+  }
+
+  private normalizePlanEndpoint(raw: any): ChatPlanEndpoint | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const endpoint: ChatPlanEndpoint = {};
+    if (typeof raw.method === 'string' && raw.method.trim()) {
+      endpoint.method = raw.method.trim();
+    }
+    if (typeof raw.urlFragment === 'string' && raw.urlFragment.trim()) {
+      endpoint.urlFragment = raw.urlFragment.trim();
+    }
+    if (typeof raw.exactUrl === 'string' && raw.exactUrl.trim()) {
+      endpoint.exactUrl = raw.exactUrl.trim();
+    }
+    if (typeof raw.key === 'string' && raw.key.trim()) {
+      endpoint.key = raw.key.trim();
+    }
+    return Object.keys(endpoint).length ? endpoint : undefined;
+  }
+
+  private normalizePlanEntryPoint(raw: any): ChatPlanEntryPoint | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const entryPoint: ChatPlanEntryPoint = {};
+    if (typeof raw.fn === 'string' && raw.fn.trim()) {
+      entryPoint.fn = raw.fn.trim();
+    }
+    if (typeof raw.file === 'string' && raw.file.trim()) {
+      entryPoint.file = raw.file.trim();
+    }
+    if (typeof raw.line === 'number' && Number.isFinite(raw.line)) {
+      entryPoint.line = Math.round(raw.line);
+    }
+    return Object.keys(entryPoint).length ? entryPoint : undefined;
+  }
+
+  private normalizePlanChange(raw: any): ChatPlanChange | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const change: ChatPlanChange = {};
+    if (typeof raw.collection === 'string' && raw.collection.trim()) {
+      change.collection = raw.collection.trim();
+    }
+    if (typeof raw.op === 'string' && raw.op.trim()) {
+      change.op = raw.op.trim();
+    }
+    return Object.keys(change).length ? change : undefined;
+  }
+
+  private normalizePlanMongo(raw: any): ChatPlanMongoQuery | undefined {
+    if (!raw || typeof raw !== 'object') {
+      return undefined;
+    }
+    const mongo: ChatPlanMongoQuery = {};
+    const collection = this.parseChatCollection(raw.collection);
+    if (collection) {
+      mongo.collection = collection;
+    }
+    if (
+      typeof raw.limit === 'number' &&
+      Number.isFinite(raw.limit) &&
+      raw.limit > 0
+    ) {
+      mongo.limit = Math.min(8, Math.max(1, Math.floor(raw.limit)));
+    }
+    const normalizedFilter = this.normalizeFilterAliases(raw.filter);
+    const filter = this.sanitizePlanFilter(normalizedFilter);
+    if (filter) {
+      mongo.filter = filter;
+    }
+    const sort = this.sanitizePlanSort(raw.sort);
+    if (sort) {
+      mongo.sort = sort;
+    }
+    if (!mongo.collection && !mongo.filter && !mongo.limit && !mongo.sort) {
+      return undefined;
+    }
+    return mongo;
+  }
+
+  private buildFallbackChatQueryPlan(question: string): ChatQueryPlan {
+    const normalized = (question ?? '').toLowerCase();
+    let target: ChatCollection = 'requests';
+    if (
+      /database|db|query|insert|update|delete|mongo|collection/.test(normalized)
+    ) {
+      target = 'changes';
+    } else if (/trace|stack|function|call|parent|child|line/.test(normalized)) {
+      target = 'traces';
+    } else if (/action|click|button|tap|gesture/.test(normalized)) {
+      target = 'actions';
+    } else if (/request|endpoint|http|route|status/.test(normalized)) {
+      target = 'requests';
+    }
+    const [fnCandidate] = this.extractFunctionCandidates(question);
+    return {
+      target,
+      functionName: fnCandidate,
+      reason: 'fallback',
+    };
+  }
+
+  private resolvePlanLimit(plan: ChatQueryPlan): number {
+    const defaults: Record<ChatCollection, number> = {
+      actions: 5,
+      requests: 4,
+      traces: 4,
+      changes: 5,
+    };
+    const mongoLimit = plan.mongo?.limit;
+    if (typeof mongoLimit === 'number' && Number.isFinite(mongoLimit)) {
+      return Math.min(8, Math.max(1, Math.floor(mongoLimit)));
+    }
+    const raw = Number(plan.limit);
+    if (Number.isFinite(raw) && raw > 0) {
+      return Math.min(8, Math.max(1, Math.floor(raw)));
+    }
+    return defaults[plan.target] ?? 4;
+  }
+
+  private pickPlanMongo(
+    plan: ChatQueryPlan,
+    collection: ChatCollection,
+  ): ChatPlanMongoQuery | undefined {
+    if (!plan.mongo) {
+      return undefined;
+    }
+    if (plan.target !== collection) {
+      return undefined;
+    }
+    if (plan.mongo.collection && plan.mongo.collection !== collection) {
+      return undefined;
+    }
+    return plan.mongo;
+  }
+
+  private buildTenantCriteria(
+    base: Record<string, any>,
+    ...filters: Array<Record<string, any> | undefined>
+  ): Record<string, any> {
+    const primary = { ...base, tenantId: this.tenant.tenantId };
+    const extras = filters.filter(
+      (filter): filter is Record<string, any> =>
+        this.hasFilterContent(filter),
+    );
+    if (!extras.length) {
+      return primary;
+    }
+    return { $and: [primary, ...extras] };
+  }
+
+  private sanitizePlanFilter(
+    filter: any,
+    depth = 0,
+  ): Record<string, any> | undefined {
+    if (!filter || typeof filter !== 'object' || Array.isArray(filter)) {
+      return undefined;
+    }
+    if (depth > 8) {
+      return undefined;
+    }
+    const allowedOperators = new Set([
+      '$and',
+      '$or',
+      '$in',
+      '$nin',
+      '$eq',
+      '$ne',
+      '$gt',
+      '$gte',
+      '$lt',
+      '$lte',
+      '$regex',
+      '$options',
+      '$all',
+      '$elemMatch',
+      '$exists',
+      '$size',
+    ]);
+    const sanitized: Record<string, any> = {};
+    for (const [rawKey, rawValue] of Object.entries(filter)) {
+      if (typeof rawKey !== 'string') {
+        continue;
+      }
+      const key = rawKey.trim();
+      if (!key.length) {
+        continue;
+      }
+      if (key.toLowerCase() === '$where') {
+        continue;
+      }
+      if (key.startsWith('$') && !allowedOperators.has(key)) {
+        continue;
+      }
+      const value = this.sanitizePlanValue(rawValue, depth + 1);
+      if (value === undefined) {
+        continue;
+      }
+      sanitized[key] = value;
+    }
+    return Object.keys(sanitized).length ? sanitized : undefined;
+  }
+
+  private normalizeFilterAliases(filter: any): any {
+    if (Array.isArray(filter)) {
+      return filter.map((item) => this.normalizeFilterAliases(item));
+    }
+    if (!filter || typeof filter !== 'object') {
+      return filter;
+    }
+    const normalized: Record<string, any> = {};
+    for (const [rawKey, rawValue] of Object.entries(filter)) {
+      if (rawKey === 'urlFragment' && typeof rawValue === 'string') {
+        normalized.url = {
+          ...(typeof normalized.url === 'object' ? normalized.url : {}),
+          $regex: rawValue,
+          $options: 'i',
+        };
+        continue;
+      }
+      normalized[rawKey] = this.normalizeFilterAliases(rawValue);
+    }
+    return normalized;
+  }
+
+  private sanitizePlanValue(value: any, depth: number): any {
+    if (value === null) {
+      return null;
+    }
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean'
+    ) {
+      if (typeof value === 'string' && value.length > 600) {
+        return value.slice(0, 600);
+      }
+      return value;
+    }
+    if (Array.isArray(value)) {
+      if (depth > 8) {
+        return undefined;
+      }
+      const sanitized = value
+        .map((item) => this.sanitizePlanValue(item, depth + 1))
+        .filter((item) => item !== undefined);
+      return sanitized.length ? sanitized : undefined;
+    }
+    if (typeof value === 'object') {
+      return this.sanitizePlanFilter(value, depth + 1);
+    }
+    return undefined;
+  }
+
+  private sanitizePlanSort(
+    sort: any,
+  ): Record<string, 1 | -1> | undefined {
+    if (!sort || typeof sort !== 'object') {
+      return undefined;
+    }
+    const result: Record<string, 1 | -1> = {};
+    for (const [rawKey, rawValue] of Object.entries(sort)) {
+      if (typeof rawKey !== 'string') {
+        continue;
+      }
+      const key = rawKey.trim();
+      if (!key.length) {
+        continue;
+      }
+      const dir = Number(rawValue);
+      if (dir === 1 || dir === -1) {
+        result[key] = dir;
+      }
+    }
+    return Object.keys(result).length ? result : undefined;
+  }
+
+  private hasFilterContent(
+    filter?: Record<string, any>,
+  ): filter is Record<string, any> {
+    return Boolean(filter && Object.keys(filter).length);
+  }
+
+  private async executeChatQueryPlan(
+    sessionId: string,
+    plan: ChatQueryPlan,
+    hintMessages: HintMessageParam[],
+  ): Promise<ChatPlanExecution> {
+    const collections: ChatPlanCollections = {};
+    const forwardSeed: ChatForwardSeed = {};
+    const limit = this.resolvePlanLimit(plan);
+    plan.limit = limit;
+
+    if (plan.target === 'actions') {
+      const branchPlan = this.pickPlanMongo(plan, 'actions');
+      const filter = this.buildActionFilter(plan);
+      const query = this.buildTenantCriteria(
+        { sessionId },
+        branchPlan?.filter,
+        filter,
+      );
+      const actionDocs = await this.actions
+        .find(query)
+        .sort(branchPlan?.sort ?? { tStart: 1 })
+        .limit(branchPlan?.limit ?? limit)
+        .lean()
+        .exec();
+      const actionResults = actionDocs.map((doc) => this.sanitize(doc));
+      collections.actions = actionResults;
+
+      if (actionResults.length) {
+        const actionIds = Array.from(
+          new Set(
+            actionResults
+              .map((action: any) => action?.actionId)
+              .filter((id): id is string => Boolean(id)),
+          ),
+        );
+        if (actionIds.length) {
+          const relatedRequests = await this.requests
+            .find(
+              this.buildTenantCriteria({
+                sessionId,
+                actionId: { $in: actionIds },
+              }),
+            )
+            .sort({ t: 1 })
+            .limit(limit * 3)
+            .lean()
+            .exec();
+          forwardSeed.requests = relatedRequests.map((doc) =>
+            this.sanitize(hydrateRequestDoc(doc)),
+          );
+        }
+      }
+    } else if (plan.target === 'requests') {
+      const branchPlan = this.pickPlanMongo(plan, 'requests');
+      const filter = this.buildRequestFilter(plan);
+      const query = this.buildTenantCriteria(
+        { sessionId },
+        branchPlan?.filter,
+        filter,
+      );
+
+      console.log('query --->', JSON.stringify(query, null, 2))
+      const requestDocs = await this.requests
+        .find(query)
+        .sort(branchPlan?.sort ?? { t: 1 })
+        .limit(branchPlan?.limit ?? limit)
+        .lean()
+        .exec();
+      const hydratedRequests = requestDocs.map((doc) =>
+        this.sanitize(hydrateRequestDoc(doc)),
+      );
+      collections.requests = hydratedRequests;
+
+      const fnSet = new Set<string>();
+      const requestRids = new Set<string>();
+      hydratedRequests.forEach((req) => {
+        const entryFn =
+          (req?.entryPoint?.fn as string | undefined)?.trim() ||
+          plan.functionName;
+        if (entryFn) {
+          fnSet.add(entryFn);
+        }
+        if (typeof req?.rid === 'string' && req.rid) {
+          requestRids.add(req.rid);
+        }
+      });
+      if (plan.functionName && !fnSet.size) {
+        fnSet.add(plan.functionName);
+      }
+
+      if (fnSet.size || requestRids.size) {
+        const traceDocs = await this.fetchTracesForFunctions(
+          sessionId,
+          Array.from(fnSet),
+          Array.from(requestRids),
+          limit,
+          hintMessages,
+          undefined,
+          undefined,
+        );
+        collections.traces = traceDocs;
+        forwardSeed.childFunctions = this.collectTraceChildFunctions(
+          traceDocs,
+          fnSet,
+        );
+      }
+    } else if (plan.target === 'traces') {
+      const branchPlan = this.pickPlanMongo(plan, 'traces');
+      const traces = await this.fetchTracesForPlan(
+        sessionId,
+        plan,
+        branchPlan?.limit ?? limit,
+        hintMessages,
+        branchPlan?.filter,
+        branchPlan?.sort,
+      );
+      collections.traces = traces;
+
+      const requestRids = Array.from(
+        new Set(
+          traces
+            .map((trace: any) => trace?.requestRid)
+            .filter((rid): rid is string => Boolean(rid)),
+        ),
+      );
+      if (requestRids.length) {
+        const relatedRequests = await this.requests
+          .find(
+            this.buildTenantCriteria({
+              sessionId,
+              rid: { $in: requestRids },
+            }),
+          )
+          .lean()
+          .exec();
+        const actionIds = Array.from(
+          new Set(
+            relatedRequests
+              .map((req) => req?.actionId)
+              .filter((id): id is string => Boolean(id)),
+          ),
+        );
+        if (actionIds.length) {
+          const changeDocs = await this.changes
+            .find(
+              this.buildTenantCriteria({
+                sessionId,
+                actionId: { $in: actionIds },
+              }),
+            )
+            .sort({ t: 1 })
+            .limit(limit)
+            .lean()
+            .exec();
+          forwardSeed.changes = changeDocs.map((doc) =>
+            this.sanitize(hydrateChangeDoc(doc)),
+          );
+        }
+      }
+    } else if (plan.target === 'changes') {
+      const branchPlan = this.pickPlanMongo(plan, 'changes');
+      const filter = this.buildChangeFilter(plan);
+      const query = this.buildTenantCriteria(
+        { sessionId },
+        branchPlan?.filter,
+        filter,
+      );
+      const changeDocs = await this.changes
+        .find(query)
+        .sort(branchPlan?.sort ?? { t: 1 })
+        .limit(branchPlan?.limit ?? limit)
+        .lean()
+        .exec();
+      collections.changes = changeDocs.map((doc) =>
+        this.sanitize(hydrateChangeDoc(doc)),
+      );
+    }
+
+    const forwardSuggestions = this.buildForwardSuggestions(
+      plan.target,
+      forwardSeed,
+    );
+    return {
+      plan,
+      collections,
+      forwardSuggestions,
+    };
+  }
+
+  private composeChatExecutionContext(
+    sessionDoc: Session,
+    execution: ChatPlanExecution,
+  ): string {
+    const sessionSummary = {
+      sessionId: sessionDoc._id,
+      appId: sessionDoc.appId,
+      userId: sessionDoc.userId,
+      userEmail: sessionDoc.userEmail,
+      startedAt: sessionDoc.startedAt,
+      finishedAt: sessionDoc.finishedAt,
+    };
+    const payload = {
+      target: execution.plan.target,
+      plan: execution.plan,
+      session: sessionSummary,
+      data: execution.collections,
+      forwardSuggestions: execution.forwardSuggestions,
+    };
+    return [
+      `--- Query context (${execution.plan.target}) ---`,
+      '```json',
+      JSON.stringify(payload, this.promptReplacer, 2),
+      '```',
+      '--- End context ---',
+    ].join('\n');
+  }
+
+  private buildActionFilter(plan: ChatQueryPlan): Record<string, any> {
+    const filter: Record<string, any> = {};
+    if (plan.action?.actionId) {
+      filter.actionId = plan.action.actionId;
+    }
+    if (plan.action?.label) {
+      filter.label = new RegExp(
+        `^${this.escapeRegex(plan.action.label)}$`,
+        'i',
+      );
+    } else if (plan.action?.labelContains) {
+      filter.label = new RegExp(
+        this.escapeRegex(plan.action.labelContains),
+        'i',
+      );
+    }
+    if (typeof plan.action?.hasReq === 'boolean') {
+      filter.hasReq = plan.action.hasReq;
+    }
+    if (typeof plan.action?.hasDb === 'boolean') {
+      filter.hasDb = plan.action.hasDb;
+    }
+    if (typeof plan.action?.error === 'boolean') {
+      filter.error = plan.action.error;
+    }
+    return filter;
+  }
+
+  private buildRequestFilter(plan: ChatQueryPlan): Record<string, any> {
+    const filter: Record<string, any> = {};
+    if (plan.request?.rid) {
+      filter.rid = plan.request.rid;
+    }
+    if (typeof plan.request?.status === 'number') {
+      filter.status = plan.request.status;
+    }
+    if (plan.endpoint?.exactUrl) {
+      filter.url = plan.endpoint.exactUrl;
+    } else if (plan.endpoint?.urlFragment) {
+      filter.url = new RegExp(this.escapeRegex(plan.endpoint.urlFragment), 'i');
+    }
+    if (plan.endpoint?.method) {
+      filter.method = new RegExp(
+        `^${this.escapeRegex(plan.endpoint.method)}$`,
+        'i',
+      );
+    }
+    if (plan.endpoint?.key) {
+      filter.key = new RegExp(`^${this.escapeRegex(plan.endpoint.key)}$`, 'i');
+    }
+    if (plan.entryPoint?.fn) {
+      filter['entryPoint.fn'] = new RegExp(
+        `^${this.escapeRegex(plan.entryPoint.fn)}$`,
+        'i',
+      );
+    }
+    if (plan.entryPoint?.file) {
+      filter['entryPoint.file'] = new RegExp(
+        this.escapeRegex(plan.entryPoint.file),
+        'i',
+      );
+    }
+    if (typeof plan.entryPoint?.line === 'number') {
+      filter['entryPoint.line'] = Math.max(0, Math.round(plan.entryPoint.line));
+    }
+    if (plan.action?.actionId) {
+      filter.actionId = plan.action.actionId;
+    }
+    return filter;
+  }
+
+  private buildChangeFilter(plan: ChatQueryPlan): Record<string, any> {
+    const filter: Record<string, any> = {};
+    if (plan.change?.collection) {
+      filter.collection = new RegExp(
+        `^${this.escapeRegex(plan.change.collection)}$`,
+        'i',
+      );
+    }
+    if (plan.change?.op) {
+      filter.op = new RegExp(`^${this.escapeRegex(plan.change.op)}$`, 'i');
+    }
+    if (plan.action?.actionId) {
+      filter.actionId = plan.action.actionId;
+    }
+    return filter;
+  }
+
+  private async fetchTracesForPlan(
+    sessionId: string,
+    plan: ChatQueryPlan,
+    limit: number,
+    hintMessages: HintMessageParam[],
+    planFilter?: Record<string, any>,
+    planSort?: Record<string, 1 | -1>,
+  ): Promise<any[]> {
+    const fnSet = new Set<string>();
+    if (plan.functionName) {
+      fnSet.add(plan.functionName);
+    }
+    if (plan.entryPoint?.fn) {
+      fnSet.add(plan.entryPoint.fn);
+    }
+    const requestRidList: string[] = [];
+    if (plan.request?.rid) {
+      requestRidList.push(plan.request.rid);
+    }
+    const traces = await this.fetchTracesForFunctions(
+      sessionId,
+      Array.from(fnSet),
+      requestRidList,
+      limit,
+      hintMessages,
+      planFilter,
+      planSort,
+    );
+    if (traces.length || planFilter || fnSet.size || requestRidList.length) {
+      return traces;
+    }
+    return this.fetchTracesForFunctions(
+      sessionId,
+      [],
+      [],
+      limit,
+      hintMessages,
+    );
+  }
+
+  private async fetchTracesForFunctions(
+    sessionId: string,
+    functionNames: string[],
+    requestRids: string[],
+    limit: number,
+    hintMessages: HintMessageParam[],
+    planFilter?: Record<string, any>,
+    planSort?: Record<string, 1 | -1>,
+  ): Promise<any[]> {
+    const fnRegexes = Array.from(
+      new Set(
+        functionNames
+          .map((fn) => fn?.trim())
+          .filter(Boolean)
+          .map((fn) => new RegExp(`^${this.escapeRegex(fn)}$`, 'i')),
+      ),
+    );
+    const filter: Record<string, any> = {};
+    if (fnRegexes.length === 1) {
+      filter['codeRefs.fn'] = fnRegexes[0];
+    } else if (fnRegexes.length > 1) {
+      filter['codeRefs.fn'] = { $in: fnRegexes };
+    }
+    if (requestRids.length === 1) {
+      filter.requestRid = requestRids[0];
+    } else if (requestRids.length > 1) {
+      filter.requestRid = { $in: requestRids };
+    }
+    const query = this.buildTenantCriteria(
+      { sessionId },
+      planFilter,
+      filter,
+    );
+    const docs = await this.traces
+      .find(query)
+      .sort(planSort ?? { batchIndex: 1 })
+      .limit(
+        Math.max(limit, fnRegexes.length ? limit * fnRegexes.length : limit),
+      )
+      .lean()
+      .exec();
+    if (!docs?.length) {
+      return [];
+    }
+    const trimmed = await this.limitTracePayloads(
+      sessionId,
+      docs,
+      hintMessages,
+    );
+    return trimmed.map((doc) => this.sanitize(doc));
+  }
+
+  private collectTraceChildFunctions(
+    traces: any[],
+    entryFnSet: Set<string>,
+  ): Array<{ fn: string; file?: string; line?: number }> {
+    if (!traces?.length) {
+      return [];
+    }
+    const normalizedEntryFns = new Set(
+      Array.from(entryFnSet).map((fn) => this.normalizeFunctionName(fn)),
+    );
+    const suggestions: Array<{ fn: string; file?: string; line?: number }> = [];
+    for (const trace of traces) {
+      const events: Array<Record<string, any>> = Array.isArray(
+        trace?.data?.events,
+      )
+        ? trace.data.events
+        : [];
+      for (const event of events) {
+        const fn =
+          typeof event?.fn === 'string' && event.fn.trim()
+            ? event.fn.trim()
+            : undefined;
+        if (!fn) {
+          continue;
+        }
+        const normalized = this.normalizeFunctionName(fn);
+        if (!normalized || normalizedEntryFns.has(normalized)) {
+          continue;
+        }
+        if (
+          suggestions.some(
+            (item) => this.normalizeFunctionName(item.fn) === normalized,
+          )
+        ) {
+          continue;
+        }
+        suggestions.push({
+          fn,
+          file: event?.file,
+          line:
+            typeof event?.line === 'number' && Number.isFinite(event.line)
+              ? Math.round(event.line)
+              : undefined,
+        });
+      }
+    }
+    return suggestions.slice(0, 5);
+  }
+
+  private buildForwardSuggestions(
+    target: ChatCollection,
+    seed: ChatForwardSeed,
+  ): string[] {
+    if (target === 'actions') {
+      return (seed.requests ?? []).slice(0, 3).map((req) => {
+        const method = req.method ?? 'REQUEST';
+        const url =
+          this.toShortText(req.url ?? req.key ?? req.rid, 80) ??
+          'unknown endpoint';
+        return `${method} ${url}`.trim();
+      });
+    }
+    if (target === 'requests') {
+      return (seed.childFunctions ?? []).slice(0, 3).map((fn) => {
+        const location = fn.file
+          ? `${fn.file}${fn.line ? `:${fn.line}` : ''}`
+          : 'location unavailable';
+        return `Inspect ${fn.fn} (${location})`;
+      });
+    }
+    if (target === 'traces') {
+      return (seed.changes ?? []).slice(0, 3).map((change) => {
+        const op = change.op ?? 'operation';
+        const collection = change.collection ?? 'collection';
+        return `${op} on ${collection}`;
+      });
+    }
+    return [];
+  }
+
+  private async fetchSessionCounts(
+    sessionId: string,
+  ): Promise<Record<string, number>> {
+    const [actions, requests, traces, dbChanges, emails] = await Promise.all([
+      this.actions.countDocuments(this.tenantFilter({ sessionId })),
+      this.requests.countDocuments(this.tenantFilter({ sessionId })),
+      this.traces.countDocuments(this.tenantFilter({ sessionId })),
+      this.changes.countDocuments(this.tenantFilter({ sessionId })),
+      this.emails.countDocuments(this.tenantFilter({ sessionId })),
+    ]);
+    return { actions, requests, traces, dbChanges, emails };
+  }
+
+  private extractFunctionCandidates(text: string): string[] {
+    if (!text) {
+      return [];
+    }
+    const candidates = new Set<string>();
+    const callRegex = /([A-Za-z0-9_$]+\.[A-Za-z0-9_$]+|[A-Za-z0-9_$]+)\s*\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = callRegex.exec(text))) {
+      const fn = match[1]?.trim();
+      if (fn) {
+        candidates.add(fn);
+      }
+    }
+    const camelRegex = /\b([a-z]+[A-Z][A-Za-z0-9_$]+)\b/g;
+    while ((match = camelRegex.exec(text))) {
+      if (match[1]) {
+        candidates.add(match[1]);
+      }
+    }
+    return Array.from(candidates).slice(0, 3);
+  }
+
+  private tryParseJson<T = any>(payload: string): T | undefined {
+    if (!payload) {
+      return undefined;
+    }
+    let text = payload.trim();
+    if (text.startsWith('```')) {
+      text = text
+        .replace(/```json/gi, '')
+        .replace(/```/g, '')
+        .trim();
+    }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1 || end <= start) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text.slice(start, end + 1)) as T;
+    } catch {
+      return undefined;
+    }
   }
 
   private ensureClient(): OpenAI {
@@ -608,7 +1584,17 @@ export class SessionSummaryService {
 
     const actionIndex = this.indexActionsById(payload.timeline.actions);
     const requestIndex = this.indexRequestsByRid(payload.timeline.requests);
-    const traceIndex = this.indexTraceCodeRefs(payload.timeline.traces);
+    const requestPayloadLookup = this.buildRequestPayloadLookup(
+      payload.timeline.requests,
+    );
+    this.attachRequestContextToTraceCodeRefs(
+      payload.timeline.traces,
+      requestPayloadLookup,
+    );
+    const traceIndex = this.indexTraceCodeRefs(
+      payload.timeline.traces,
+      requestPayloadLookup,
+    );
     const datasetCodeRefs = this.collectDatasetCodeRefs(
       payload.timeline.requests,
       payload.timeline.traces,
@@ -822,7 +1808,9 @@ export class SessionSummaryService {
     });
 
     payload.timeline.dbChanges.forEach((change, index) => {
-      pushStructuredChunk(this.createDbChangeChunk(change, index, requestIndex));
+      pushStructuredChunk(
+        this.createDbChangeChunk(change, index, requestIndex),
+      );
     });
 
     payload.timeline.emails.forEach((email, index) => {
@@ -884,7 +1872,6 @@ export class SessionSummaryService {
 
     return { chunks, focusChunkIds, focusFunctions };
   }
-
 
   private createOverviewChunk(session: Record<string, any>): StructuredChunk {
     const sessionId = session?.id ?? session?.sessionId ?? 'unknown';
@@ -1142,7 +2129,10 @@ export class SessionSummaryService {
     };
   }
 
-  private createEmailChunk(email: any, index: number): StructuredChunk | undefined {
+  private createEmailChunk(
+    email: any,
+    index: number,
+  ): StructuredChunk | undefined {
     if (!email || typeof email !== 'object') {
       return undefined;
     }
@@ -1308,7 +2298,7 @@ export class SessionSummaryService {
     if (!children?.length) {
       return null;
     }
-    return children.slice(0, 8).map((child) => ({
+    return children.slice(0, 3).map((child) => ({
       chunkId: child.chunkId ?? null,
       functionName: child.functionName ?? null,
       filename: child.filePath ?? null,
@@ -1349,7 +2339,9 @@ export class SessionSummaryService {
     const previewLine = entry.previewEvents?.find(
       (evt) => typeof evt?.line === 'number' && Number.isFinite(evt.line),
     )?.line;
-    return typeof previewLine === 'number' ? Math.floor(previewLine) : undefined;
+    return typeof previewLine === 'number'
+      ? Math.floor(previewLine)
+      : undefined;
   }
 
   private createFallbackTraceChunk(
@@ -1443,9 +2435,7 @@ export class SessionSummaryService {
       return normalized;
     }
     if (typeof value === 'object') {
-      const entries = Object.entries(value).filter(
-        ([, v]) => v !== undefined,
-      );
+      const entries = Object.entries(value).filter(([, v]) => v !== undefined);
       const limit =
         depth === 0 ? CHUNK_OBJECT_ROOT_LIMIT : CHUNK_OBJECT_NESTED_LIMIT;
       const result: Record<string, any> = {};
@@ -1482,7 +2472,6 @@ export class SessionSummaryService {
     }
     return dot / Math.sqrt(normA * normB);
   }
-
 
   private previewJson(value: any, maxLength = 400): string | undefined {
     if (value === undefined || value === null) {
@@ -1528,7 +2517,9 @@ export class SessionSummaryService {
     );
   }
 
-  private buildCodeRefContextEntries(refs: CodeRef[]): Array<Record<string, any>> {
+  private buildCodeRefContextEntries(
+    refs: CodeRef[],
+  ): Array<Record<string, any>> {
     if (!refs?.length) {
       return [];
     }
@@ -1543,7 +2534,10 @@ export class SessionSummaryService {
     }));
   }
 
-  private indexTraceCodeRefs(traces: any[]): TraceRefIndex {
+  private indexTraceCodeRefs(
+    traces: any[],
+    requestLookup: Record<string, RequestPayloadContext> = {},
+  ): TraceRefIndex {
     const map: TraceRefIndex = {};
     for (const trace of traces ?? []) {
       if (!trace || typeof trace !== 'object') continue;
@@ -1556,9 +2550,13 @@ export class SessionSummaryService {
               .filter((ref): ref is CodeRef => Boolean(ref))
           : this.extractTraceCodeRefsFromData(trace.data);
       if (!refs.length) continue;
+      const context = requestLookup[rid];
+      const enrichedRefs = context
+        ? refs.map((ref) => this.enrichCodeRefWithRequestContext(ref, context))
+        : refs;
       map[rid] = {
         rid,
-        codeRefs: refs,
+        codeRefs: enrichedRefs,
       };
     }
     return map;
@@ -1641,7 +2639,9 @@ export class SessionSummaryService {
       const parsed = new URL(path, 'https://dummy');
       return (parsed.pathname ?? '/').toLowerCase();
     } catch {
-      return path.startsWith('/') ? path.toLowerCase() : `/${path.toLowerCase()}`;
+      return path.startsWith('/')
+        ? path.toLowerCase()
+        : `/${path.toLowerCase()}`;
     }
   }
 
@@ -1689,6 +2689,78 @@ export class SessionSummaryService {
       };
     }
     return map;
+  }
+
+  private buildRequestPayloadLookup(
+    requests: any[],
+  ): Record<string, RequestPayloadContext> {
+    const lookup: Record<string, RequestPayloadContext> = {};
+    for (const request of requests ?? []) {
+      if (!request || typeof request !== 'object') {
+        continue;
+      }
+      const rid = request.rid ?? request.requestRid;
+      if (!rid) {
+        continue;
+      }
+      lookup[rid] = {
+        bodyPreview: this.previewJson(request.body, 1200),
+        responsePreview: this.previewJson(request.respBody, 1200),
+      };
+    }
+    return lookup;
+  }
+
+  private attachRequestContextToTraceCodeRefs(
+    traces: any[],
+    lookup: Record<string, RequestPayloadContext>,
+  ): void {
+    if (!traces?.length) {
+      return;
+    }
+    traces.forEach((trace) => {
+      if (!trace || typeof trace !== 'object') {
+        return;
+      }
+      if (!Array.isArray(trace.codeRefs) || !trace.codeRefs.length) {
+        return;
+      }
+      const rid = trace.requestRid ?? trace.rid;
+      if (!rid) {
+        return;
+      }
+      const context = lookup[rid];
+      if (!context || (!context.bodyPreview && !context.responsePreview)) {
+        return;
+      }
+      trace.codeRefs = trace.codeRefs.map((ref: any) => ({
+        ...(ref ?? {}),
+        metadata: {
+          ...(ref?.metadata && typeof ref.metadata === 'object'
+            ? ref.metadata
+            : {}),
+          requestBody: context.bodyPreview ?? undefined,
+          responseBody: context.responsePreview ?? undefined,
+        },
+      }));
+    });
+  }
+
+  private enrichCodeRefWithRequestContext(
+    ref: CodeRef,
+    context?: RequestPayloadContext,
+  ): CodeRef {
+    if (!context || (!context.bodyPreview && !context.responsePreview)) {
+      return ref;
+    }
+    return {
+      ...ref,
+      metadata: {
+        ...(ref.metadata ?? {}),
+        requestBody: context.bodyPreview ?? undefined,
+        responseBody: context.responsePreview ?? undefined,
+      },
+    };
   }
 
   private lookupAction(
@@ -1860,7 +2932,8 @@ export class SessionSummaryService {
         return `  - [${idx + 1}] ${trail.functionName ?? 'fn'} ${file} (depth ${trail.depth})`;
       })
       .join('\n');
-    const children = (entry.childSummaries ?? [])
+    const limitedChildren = (entry.childSummaries ?? []).slice(0, 3);
+    const children = limitedChildren
       .map((child, idx) => {
         const file = child.filePath
           ? `${child.filePath}${child.lineNumber ? `:${child.lineNumber}` : ''}`
@@ -1881,8 +2954,7 @@ export class SessionSummaryService {
     const relatedEmailsList = this.findRelatedEmails(entry, timeline.emails);
     const relatedEmails = relatedEmailsList
       .map(
-        (email, idx) =>
-          `  - [${idx + 1}] ${this.describeEmailSummary(email)}`,
+        (email, idx) => `  - [${idx + 1}] ${this.describeEmailSummary(email)}`,
       )
       .join('\n');
     const preview = (entry.previewEvents ?? [])
@@ -1939,10 +3011,9 @@ export class SessionSummaryService {
         ? [resultLabel + ':', '```json', resultSource, '```'].join('\n')
         : undefined;
     const effectiveFn =
-      entry.functionName ??
-      node?.functionName ??
-      'function name unavailable';
-    const effectiveFile = entry.filePath ?? node?.filePath ?? 'location unavailable';
+      entry.functionName ?? node?.functionName ?? 'function name unavailable';
+    const effectiveFile =
+      entry.filePath ?? node?.filePath ?? 'location unavailable';
     const effectiveLine =
       entry.lineNumber ??
       (typeof node?.lineNumber === 'number' ? node.lineNumber : undefined);
@@ -1958,7 +3029,9 @@ export class SessionSummaryService {
       `request: ${requestRef ? `${requestRef.method} ${requestRef.url}` : 'unknown'}`,
       `actionId: ${actionId}`,
       `actionLabel: ${actionRef?.label ?? 'unknown action'}`,
-      actionRef?.startedAt ? `actionWindow: ${actionRef.startedAt} → ${actionRef.endedAt ?? 'open'}` : undefined,
+      actionRef?.startedAt
+        ? `actionWindow: ${actionRef.startedAt} → ${actionRef.endedAt ?? 'open'}`
+        : undefined,
       `events: ${entry.eventCount} (segment ${entry.segmentIndex})`,
       lineage ? `ancestors:\n${lineage}` : undefined,
       children ? `children:\n${children}` : undefined,
@@ -1984,9 +3057,12 @@ export class SessionSummaryService {
           )
         : undefined,
       requestRef?.headersPreview
-        ? ['request headers:', '```json', requestRef.headersPreview, '```'].join(
-            '\n',
-          )
+        ? [
+            'request headers:',
+            '```json',
+            requestRef.headersPreview,
+            '```',
+          ].join('\n')
         : undefined,
       argsBlock,
       resultBlock,
@@ -2101,9 +3177,7 @@ export class SessionSummaryService {
       typeof email.durMs === 'number' && Number.isFinite(email.durMs)
         ? `${Math.round(email.durMs)}ms`
         : null;
-    return [subject, recipients, status, dur]
-      .filter(Boolean)
-      .join(' | ');
+    return [subject, recipients, status, dur].filter(Boolean).join(' | ');
   }
 
   private collectFilesFromPreview(
@@ -2232,10 +3306,7 @@ export class SessionSummaryService {
     focusEntries: TraceSummaryEntry[],
   ): Array<TraceSummaryEntry & { __focus?: boolean }> {
     const map = new Map<string, TraceSummaryEntry & { __focus?: boolean }>();
-    const combine = (
-      entry: TraceSummaryEntry,
-      isFocus: boolean,
-    ): void => {
+    const combine = (entry: TraceSummaryEntry, isFocus: boolean): void => {
       const key = `${entry.groupId}:${entry.segmentIndex}`;
       if (!map.has(key)) {
         map.set(key, { ...entry, __focus: isFocus || undefined });
@@ -2287,10 +3358,7 @@ export class SessionSummaryService {
     const requestId = chunk.metadata?.requestId ?? chunk.metadata?.rid;
     if (chunk.metadata?.url || chunk.metadata?.endpoint) {
       const urlValue = String(chunk.metadata.url ?? chunk.metadata.endpoint);
-      score += this.scoreTextAgainstKeywords(
-        urlValue,
-        keywordList,
-      );
+      score += this.scoreTextAgainstKeywords(urlValue, keywordList);
       const path = this.normalizeEndpointPath(urlValue);
       if (tokens.endpoints.has(path)) {
         score += 5;
@@ -2303,10 +3371,7 @@ export class SessionSummaryService {
       }
     }
     if (requestId) {
-      score += this.scoreTextAgainstKeywords(
-        String(requestId),
-        keywordList,
-      );
+      score += this.scoreTextAgainstKeywords(String(requestId), keywordList);
       if (tokens.requestIds.has(String(requestId).toLowerCase())) {
         score += 4;
       }
@@ -2316,9 +3381,7 @@ export class SessionSummaryService {
         String(chunk.metadata.actionId),
         keywordList,
       );
-      if (
-        tokens.actionIds.has(String(chunk.metadata.actionId).toLowerCase())
-      ) {
+      if (tokens.actionIds.has(String(chunk.metadata.actionId).toLowerCase())) {
         score += 4;
       }
     }
@@ -2519,9 +3582,7 @@ export class SessionSummaryService {
           ? this.normalizeEndpointPath(urlHint)
           : undefined;
       const method =
-        typeof meta.method === 'string'
-          ? meta.method.toUpperCase()
-          : undefined;
+        typeof meta.method === 'string' ? meta.method.toUpperCase() : undefined;
       if (urlPath && endpointSet.has(urlPath)) {
         focus.add(chunk.id);
         continue;
@@ -2631,7 +3692,7 @@ export class SessionSummaryService {
       CHAT_MAX_DATASET_CHUNKS * 4,
       params.focusIds.size,
     );
-    let candidates = rankedByHints
+    const candidates = rankedByHints
       .slice(0, Math.min(candidateLimit, rankedByHints.length))
       .map((entry) => entry.chunk);
     const candidateSet = new Set(candidates.map((chunk) => chunk.id));
@@ -2827,7 +3888,8 @@ export class SessionSummaryService {
         score += shared * 2;
         if (
           fnNorm.includes('findone') &&
-          (normalizedQuestion.includes('findone') || questionWordSet.has('find'))
+          (normalizedQuestion.includes('findone') ||
+            questionWordSet.has('find'))
         ) {
           score += 2;
         }
@@ -3381,7 +4443,7 @@ export class SessionSummaryService {
 
     const cache = new Map<string, TraceNodeDetail>();
     for (const node of seeds) {
-      cache.set(node.chunkId, node as TraceNodeDetail);
+      cache.set(node.chunkId, node);
     }
 
     const parentIds = await this.expandTraceNodeIds(
@@ -3473,11 +4535,7 @@ export class SessionSummaryService {
     cache: Map<string, TraceNodeDetail>,
   ): Promise<void> {
     const missing = Array.from(
-      new Set(
-        chunkIds.filter(
-          (id) => id && !cache.has(id),
-        ),
-      ),
+      new Set(chunkIds.filter((id) => id && !cache.has(id))),
     );
     if (!missing.length) {
       return;
@@ -3682,8 +4740,7 @@ export class SessionSummaryService {
       for (const childId of childIds.slice(0, TRACE_CHILD_EXPANSION_LIMIT)) {
         if (
           !appendedIds.has(childId) &&
-          childCandidates.length <
-            TRACE_CHILD_EXPANSION_LIMIT * seeds.length
+          childCandidates.length < TRACE_CHILD_EXPANSION_LIMIT * seeds.length
         ) {
           childCandidates.push(childId);
         }
@@ -3823,14 +4880,16 @@ export class SessionSummaryService {
     );
     const lineageLines = lineageTrail
       .map((trail) =>
-        typeof trail.lineNumber === 'number' && Number.isFinite(trail.lineNumber)
+        typeof trail.lineNumber === 'number' &&
+        Number.isFinite(trail.lineNumber)
           ? Math.floor(trail.lineNumber)
           : null,
       )
       .filter((line): line is number => line !== null);
     const childLines = childSummaries
       .map((child) =>
-        typeof child.lineNumber === 'number' && Number.isFinite(child.lineNumber)
+        typeof child.lineNumber === 'number' &&
+        Number.isFinite(child.lineNumber)
           ? Math.floor(child.lineNumber)
           : null,
       )
@@ -3839,7 +4898,9 @@ export class SessionSummaryService {
       typeof entry.lineNumber === 'number' && Number.isFinite(entry.lineNumber)
         ? Math.floor(entry.lineNumber)
         : null;
-    const searchCorpus = [summaryText, functionName, filePath, fileBase].join(' ');
+    const searchCorpus = [summaryText, functionName, filePath, fileBase].join(
+      ' ',
+    );
 
     const includes = (haystack: string, needle?: string) =>
       needle ? haystack.includes(needle) : false;
@@ -4586,6 +5647,80 @@ export class SessionSummaryService {
   }
 }
 
+type ChatCollection = 'actions' | 'requests' | 'traces' | 'changes';
+
+type ChatPlanAction = {
+  actionId?: string;
+  label?: string;
+  labelContains?: string;
+  hasReq?: boolean;
+  hasDb?: boolean;
+  error?: boolean;
+};
+
+type ChatPlanRequest = {
+  rid?: string;
+  status?: number;
+};
+
+type ChatPlanEndpoint = {
+  method?: string;
+  urlFragment?: string;
+  exactUrl?: string;
+  key?: string;
+};
+
+type ChatPlanEntryPoint = {
+  fn?: string;
+  file?: string;
+  line?: number;
+};
+
+type ChatPlanChange = {
+  collection?: string;
+  op?: string;
+};
+
+type ChatPlanMongoQuery = {
+  collection?: ChatCollection;
+  filter?: Record<string, any>;
+  limit?: number;
+  sort?: Record<string, 1 | -1>;
+};
+
+type ChatQueryPlan = {
+  target: ChatCollection;
+  limit?: number;
+  functionName?: string;
+  action?: ChatPlanAction;
+  request?: ChatPlanRequest;
+  endpoint?: ChatPlanEndpoint;
+  entryPoint?: ChatPlanEntryPoint;
+  change?: ChatPlanChange;
+  include?: ChatCollection[];
+  reason?: string;
+  mongo?: ChatPlanMongoQuery;
+};
+
+type ChatPlanCollections = Partial<Record<ChatCollection, any[]>>;
+
+type ChatForwardSeed = {
+  requests?: Array<{
+    method?: string;
+    url?: string;
+    key?: string;
+    rid?: string;
+  }>;
+  childFunctions?: Array<{ fn: string; file?: string; line?: number }>;
+  changes?: Array<{ collection?: string; op?: string }>;
+};
+
+type ChatPlanExecution = {
+  plan: ChatQueryPlan;
+  collections: ChatPlanCollections;
+  forwardSuggestions: string[];
+};
+
 type TraceEventLike = Record<string, any>;
 
 type HintTokens = {
@@ -4742,6 +5877,11 @@ type RequestIndexEntry = {
   paramsPreview?: string;
   queryPreview?: string;
   headersPreview?: string;
+};
+
+type RequestPayloadContext = {
+  bodyPreview?: string;
+  responsePreview?: string;
 };
 
 type TraceRefIndex = Record<string, { rid: string; codeRefs: CodeRef[] }>;

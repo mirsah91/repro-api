@@ -4,6 +4,14 @@ services:
     image: mongo:7
     container_name: repro-mongo
     restart: unless-stopped
+    logging:
+      driver: "none"
+    command:
+      - mongod
+      - --quiet
+      - --logpath
+      - /dev/null
+      - --bind_ip_all
     ports:
       - "27017:27017"
     volumes:

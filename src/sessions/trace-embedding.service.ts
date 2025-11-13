@@ -523,7 +523,8 @@ export class TraceEmbeddingService {
 
       if (isEnter || descriptor.fn) {
         const resolvedLine =
-          typeof descriptor.line === 'number' && Number.isFinite(descriptor.line)
+          typeof descriptor.line === 'number' &&
+          Number.isFinite(descriptor.line)
             ? descriptor.line
             : this.extractEventLine(event);
 
@@ -850,7 +851,9 @@ export class TraceEmbeddingService {
     };
   }
 
-  private extractEventArgsPreview(event: TraceSegmentEvent): string | undefined {
+  private extractEventArgsPreview(
+    event: TraceSegmentEvent,
+  ): string | undefined {
     if (!event) {
       return undefined;
     }
@@ -880,9 +883,7 @@ export class TraceEmbeddingService {
     return text || undefined;
   }
 
-  private extractEventDurationMs(
-    event: TraceSegmentEvent,
-  ): number | undefined {
+  private extractEventDurationMs(event: TraceSegmentEvent): number | undefined {
     if (!event) {
       return undefined;
     }
@@ -1055,7 +1056,9 @@ export class TraceEmbeddingService {
     if (node.metadata.length >= 12) {
       return;
     }
-    if (node.metadata.some((entry) => entry.key === key && entry.value === value)) {
+    if (
+      node.metadata.some((entry) => entry.key === key && entry.value === value)
+    ) {
       return;
     }
     node.metadata.push({ key, value });

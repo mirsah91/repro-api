@@ -4,10 +4,19 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import * as express from 'express';
 import { readFileSync } from 'fs';
 import { createSecureLogger } from './common/security/secure-logger';
-import { requireEncryptionKey } from './common/security/encryption.util';
+import {
+  isEncryptionDisabled,
+  requireEncryptionKey,
+} from './common/security/encryption.util';
 
 async function bootstrap() {
-  requireEncryptionKey();
+  if (!isEncryptionDisabled()) {
+    requireEncryptionKey();
+  } else {
+    console.warn(
+      '[encryption] Application encryption disabled via APP_ENCRYPTION_DISABLED.',
+    );
+  }
   const httpsOptions = buildHttpsOptions();
 
   const app = await NestFactory.create(AppModule, {
@@ -47,7 +56,7 @@ async function bootstrap() {
   await app.listen(process.env.PORT || 4000);
 }
 
-bootstrap();
+void bootstrap();
 
 function buildHttpsOptions():
   | { key: Buffer; cert: Buffer; ca?: Buffer }

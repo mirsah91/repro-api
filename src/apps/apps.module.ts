@@ -24,7 +24,10 @@ import {
   TraceSummarySchema,
 } from '../sessions/schemas/trace-summary.schema';
 import { SessionSummaryService } from '../sessions/session-summary.service';
-import { TraceNode, TraceNodeSchema } from '../sessions/schemas/trace-node.schema';
+import {
+  TraceNode,
+  TraceNodeSchema,
+} from '../sessions/schemas/trace-node.schema';
 import {
   SessionChatMessage,
   SessionChatMessageSchema,

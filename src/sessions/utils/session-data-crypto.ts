@@ -1,13 +1,28 @@
 import {
   decryptJson,
   encryptJson,
+  isEncryptionDisabled,
 } from '../../common/security/encryption.util';
 
-export function encryptField(value: any): string | undefined {
+export function encryptField(value: any): any {
   if (typeof value === 'undefined') {
     return undefined;
   }
-  return encryptJson(value ?? null);
+  const normalized = value ?? null;
+  if (isEncryptionDisabled()) {
+    if (
+      normalized !== null &&
+      typeof normalized === 'object' &&
+      typeof normalized.toJSON === 'function'
+    ) {
+      return normalized.toJSON();
+    }
+    if (normalized !== null && typeof normalized === 'object') {
+      return JSON.parse(JSON.stringify(normalized));
+    }
+    return normalized as any;
+  }
+  return encryptJson(normalized);
 }
 
 export function decryptField<T = any>(payload: any): T | undefined {

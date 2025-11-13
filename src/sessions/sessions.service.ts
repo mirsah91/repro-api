@@ -276,7 +276,8 @@ export class SessionsService {
           ? entry.resultPreview
           : this.previewCodeRefValue(entry.resultPreview);
       const durationMs =
-        typeof entry.durationMs === 'number' && Number.isFinite(entry.durationMs)
+        typeof entry.durationMs === 'number' &&
+        Number.isFinite(entry.durationMs)
           ? Math.max(0, Math.round(entry.durationMs))
           : undefined;
       const metadata =
@@ -331,6 +332,45 @@ export class SessionsService {
     primary.forEach(upsert);
     secondary.forEach(upsert);
     return merged.slice(0, limit);
+  }
+
+  private normalizeEntryPoint(
+    value: any,
+  ):
+    | {
+        fn?: string | null;
+        file?: string | null;
+        line?: number | null;
+        functionType?: string | null;
+        _id?: any;
+      }
+    | undefined {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+    const fn =
+      typeof value.fn === 'string' && value.fn.trim().length
+        ? value.fn.trim()
+        : undefined;
+    const file =
+      typeof value.file === 'string' && value.file.trim().length
+        ? value.file.trim()
+        : undefined;
+    const line =
+      typeof value.line === 'number' && Number.isFinite(value.line)
+        ? Math.floor(value.line)
+        : undefined;
+    const functionType =
+      typeof value.functionType === 'string' && value.functionType.trim().length
+        ? value.functionType.trim()
+        : undefined;
+    const normalized: Record<string, any> = {};
+    if (fn) normalized.fn = fn;
+    if (file) normalized.file = file;
+    if (line !== undefined) normalized.line = line;
+    if (functionType) normalized.functionType = functionType;
+    if (value._id) normalized._id = value._id;
+    return Object.keys(normalized).length ? normalized : undefined;
   }
 
   async startSession(appId: string, clientTime?: number, appUser?: any) {
@@ -455,6 +495,11 @@ export class SessionsService {
         }
         if (Object.prototype.hasOwnProperty.call(ev, 'query')) {
           set.query = encryptField(ev.query ?? {});
+        }
+
+        const normalizedEntryPoint = this.normalizeEntryPoint(ev.entryPoint);
+        if (normalizedEntryPoint) {
+          set.entryPoint = normalizedEntryPoint;
         }
 
         await this.requests.updateOne(
@@ -630,6 +675,13 @@ export class SessionsService {
           }
           if (Object.prototype.hasOwnProperty.call(req, 'query')) {
             set.query = encryptField(req.query ?? {});
+          }
+
+          const normalizedEntryPoint = this.normalizeEntryPoint(
+            req.entryPoint ?? e.entryPoint,
+          );
+          if (normalizedEntryPoint) {
+            set.entryPoint = normalizedEntryPoint;
           }
 
           const requestDoc = await this.requests.findOneAndUpdate(
