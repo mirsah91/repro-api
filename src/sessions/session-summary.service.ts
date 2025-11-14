@@ -9,6 +9,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { ConfigService } from '@nestjs/config';
 import { Model } from 'mongoose';
 import OpenAI from 'openai';
+import { encode } from '@toon-format/toon';
 import { Session } from './schemas/session.schema';
 import { Action } from './schemas/action.schema';
 import { RequestEvt } from './schemas/request.schema';
@@ -52,6 +53,8 @@ const EMBEDDING_CANDIDATE_LIMIT = 120;
 const EMBEDDING_CHUNK_CHAR_LIMIT = 2000;
 const EMBEDDING_HINT_BOOST = 0.05;
 const CODE_REF_CONTEXT_LIMIT = 20;
+const CHAT_MAX_CONTEXT_TOKENS = 128000;
+const PAST_ANSWER_CHAR_LIMIT = 2000;
 const CHAT_SYSTEM_PROMPT = [
   'You are the on-call engineer answering questions about a single debugging session.',
   'Context will only contain data from the actions, requests, traces, and changes collections—never cite other sources or invent events.',
@@ -65,7 +68,7 @@ const CHAT_SYSTEM_PROMPT = [
   'Never mention that a planning model was used; just answer confidently from the JSON context.',
 ].join('\n');
 const SYSTEM_PROMPT = [
-  'You convert natural-language debugging questions into a single MongoDB query plan targeting exactly one of four collections.',
+  'You convert natural-language debugging questions into multiple MongoDB query plans targeting the actions, requests, traces, and changes collections.',
   '',
   'SCHEMAS (use these exact field names):',
   '- actions: { sessionId, actionId, label, tStart, tEnd, hasReq, hasDb, error, ui }',
@@ -81,21 +84,25 @@ const SYSTEM_PROMPT = [
   '',
   'OUTPUT (JSON only):',
   '{',
-  '  "target": "actions|requests|traces|changes",',
-  '  "limit": <int>,',
-  '  "mongo": {',
-  '    "collection": "actions|requests|traces|changes",',
-  '    "filter": { ... valid Mongo filter using the schema fields ... },',
-  '    "limit"?: <int>,',
-  '    "sort"?: { "<field>": 1|-1 }',
-  '  },',
-  '  "functionName"?: string,',
-  '  "action"?: { "actionId"?: string, "label"?: string, "labelContains"?: string, "hasReq"?: boolean, "hasDb"?: boolean, "error"?: boolean },',
-  '  "request"?: { "rid"?: string, "status"?: number },',
-  '  "endpoint"?: { "method"?: string, "url"?: string, "key"?: string },',
-  '  "entryPoint"?: { "fn"?: string, "file"?: string, "line"?: number },',
-  '  "change"?: { "collection"?: string, "op"?: string },',
-  '  "reason": string',
+  '  "plans": [',
+  '    {',
+  '      "target": "actions|requests|traces|changes",',
+  '      "limit": <int>,',
+  '      "mongo": {',
+  '        "collection": "actions|requests|traces|changes",',
+  '        "filter": { ... valid Mongo filter using the schema fields ... },',
+  '        "limit"?: <int>,',
+  '        "sort"?: { "<field>": 1|-1 }',
+  '      },',
+  '      "functionName"?: string,',
+  '      "action"?: { "actionId"?: string, "label"?: string, "labelContains"?: string, "hasReq"?: boolean, "hasDb"?: boolean, "error"?: boolean },',
+  '      "request"?: { "rid"?: string, "status"?: number },',
+  '      "endpoint"?: { "method"?: string, "url"?: string, "key"?: string },',
+  '      "entryPoint"?: { "fn"?: string, "file"?: string, "line"?: number },',
+  '      "change"?: { "collection"?: string, "op"?: string },',
+  '      "reason": string',
+  '    }',
+  '  ]',
   '}',
   '',
   'RULES:',
@@ -120,16 +127,15 @@ const SYSTEM_PROMPT = [
   '  }',
   '',
   '- Always include concrete filters; never leave mongo.filter empty.',
-  '- Function/file/line/trace questions → target "traces".',
-  '- HTTP endpoint/body/response questions → target "requests".',
-  '- UI/user-action questions → target "actions".',
-  '- Database collection/op/filter/update questions → target "changes".',
-  '  build a multi-collection plan instead of a single collection:',
+  '- Function/file/line/trace questions → include a plan targeting "traces".',
+  '- HTTP endpoint/body/response questions → include a plan targeting "requests".',
+  '- UI/user-action questions → include a plan targeting "actions".',
+  '- Database collection/op/filter/update questions → include a plan targeting "changes".',
+  '- Provide up to three plans per question, each focusing on a different collection when possible.',
   '  • Use "changes" to find dispatched shipment documents (collection + status/keywords).',
   '  • Use "actions" and "requests" linked via actionId to find the request/endpoint that caused the dispatch.',
   '  • Use "traces" linked via requestRid to find the function(s) that send the notification.',
-  '- In such cases, choose as primaryTarget the collection where the final answer lives (for functions, usually "traces"),',
-  '  but still include supporting queries under targets.requests / targets.changes / targets.actions as needed.',
+  '- Choose the collection most likely to contain the direct answer as the first plan, then add supporting plans for related collections.',
   '- Echo any detected function name verbatim in functionName and/or entryPoint.fn.',
   '- Respond with JSON only.',
 ].join('\\n');
@@ -417,20 +423,31 @@ export class SessionSummaryService {
     let usage: UsageTotals | undefined;
 
     try {
-      const plan = await this.buildChatQueryPlan(
+      const plans = await this.buildChatQueryPlan(
         questionText,
         conversation,
         sessionDoc,
       );
-      console.log('plan --->', JSON.stringify(plan, null, 2));
-
-      const execution = await this.executeChatQueryPlan(
+      console.log('plan --->', JSON.stringify(plans, null, 2));
+      const previousAnswersPromise = this.fetchRecentAssistantAnswers(
         sessionId,
-        plan,
+        5,
+      );
+
+      const executions = await this.executeChatQueryPlan(
+        sessionId,
+        plans,
         opts?.messages ?? [],
       );
 
-      datasetContext = this.composeChatExecutionContext(sessionDoc, execution);
+      const previousAnswers = await previousAnswersPromise;
+      datasetContext = this.composeChatExecutionContext(
+        sessionDoc,
+        executions,
+        previousAnswers,
+      );
+      const aggregatedForwardSuggestions =
+        this.collectForwardSuggestions(executions);
 
       const llmMessages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] =
         [
@@ -443,12 +460,16 @@ export class SessionSummaryService {
             ),
           },
         ];
+      const boundedMessages = this.enforceTokenBudget(
+        llmMessages,
+        CHAT_MAX_CONTEXT_TOKENS,
+      );
 
       const completion = await client.chat.completions.create({
         model,
         temperature: 0.2,
         max_tokens: 700,
-        messages: llmMessages,
+        messages: boundedMessages,
       });
 
       reply =
@@ -456,8 +477,8 @@ export class SessionSummaryService {
         'No response generated.';
       usage = this.mapUsage(completion.usage);
 
-      if (execution.forwardSuggestions.length) {
-        const followupLine = `Follow-ups: ${execution.forwardSuggestions.join(
+      if (aggregatedForwardSuggestions.length) {
+        const followupLine = `Follow-ups: ${aggregatedForwardSuggestions.join(
           '; ',
         )}`;
         if (!reply.toLowerCase().includes('follow-ups')) {
@@ -492,7 +513,7 @@ export class SessionSummaryService {
     question: string,
     conversation: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
     sessionDoc: Session,
-  ): Promise<ChatQueryPlan> {
+  ): Promise<ChatQueryPlan[]> {
     const fallback = this.buildFallbackChatQueryPlan(question);
     const trimmedQuestion = question?.trim();
     if (!trimmedQuestion) {
@@ -534,7 +555,7 @@ export class SessionSummaryService {
       if (!parsed) {
         return fallback;
       }
-      return this.normalizeChatQueryPlan(parsed, fallback);
+      return this.normalizeChatQueryPlans(parsed, fallback);
     } catch (err: any) {
       this.logger.warn(
         'LLM query-plan builder failed; using fallback.',
@@ -626,6 +647,33 @@ export class SessionSummaryService {
 
     result.limit = this.resolvePlanLimit(result);
     return result;
+  }
+
+  private normalizeChatQueryPlans(
+    parsed: any,
+    fallback: ChatQueryPlan[],
+  ): ChatQueryPlan[] {
+    const fallbackPlans =
+      fallback && fallback.length ? fallback : this.buildFallbackChatQueryPlan('');
+    const rawPlans = Array.isArray(parsed?.plans)
+      ? parsed.plans
+      : Array.isArray(parsed)
+      ? parsed
+      : parsed
+      ? [parsed]
+      : [];
+    const normalized = rawPlans
+      .map((plan: any, index: number) =>
+        this.normalizeChatQueryPlan(
+          plan,
+          fallbackPlans[Math.min(index, fallbackPlans.length - 1)],
+        ),
+      )
+      .filter(
+        (plan): plan is ChatQueryPlan =>
+          plan !== undefined && plan !== null,
+      );
+    return normalized.length ? normalized : fallbackPlans;
   }
 
   private parseChatCollection(value: any): ChatCollection | undefined {
@@ -766,7 +814,7 @@ export class SessionSummaryService {
     return mongo;
   }
 
-  private buildFallbackChatQueryPlan(question: string): ChatQueryPlan {
+  private buildFallbackChatQueryPlan(question: string): ChatQueryPlan[] {
     const normalized = (question ?? '').toLowerCase();
     let target: ChatCollection = 'requests';
     if (
@@ -781,11 +829,27 @@ export class SessionSummaryService {
       target = 'requests';
     }
     const [fnCandidate] = this.extractFunctionCandidates(question);
-    return {
+    const fallbackTargets: ChatCollection[] = [];
+    const expansionOrder: ChatCollection[] = [
       target,
-      functionName: fnCandidate,
+      'requests',
+      'traces',
+      'actions',
+      'changes',
+    ];
+    for (const candidate of expansionOrder) {
+      if (!fallbackTargets.includes(candidate)) {
+        fallbackTargets.push(candidate);
+      }
+      if (fallbackTargets.length >= 3) {
+        break;
+      }
+    }
+    return fallbackTargets.map((collection, index) => ({
+      target: collection,
+      functionName: index === 0 ? fnCandidate : undefined,
       reason: 'fallback',
-    };
+    }));
   }
 
   private resolvePlanLimit(plan: ChatQueryPlan): number {
@@ -886,7 +950,8 @@ export class SessionSummaryService {
       }
       sanitized[key] = value;
     }
-    return Object.keys(sanitized).length ? sanitized : undefined;
+    const flattened = this.flattenFieldLogicalOperators(sanitized);
+    return Object.keys(flattened).length ? flattened : undefined;
   }
 
   private normalizeFilterAliases(filter: any): any {
@@ -940,6 +1005,65 @@ export class SessionSummaryService {
     return undefined;
   }
 
+  private flattenFieldLogicalOperators(
+    filter: Record<string, any>,
+  ): Record<string, any> {
+    if (!filter || typeof filter !== 'object') {
+      return {};
+    }
+    const normalized: Record<string, any> = {};
+    const andClauses: any[] = Array.isArray(filter.$and)
+      ? [...filter.$and]
+      : [];
+    const orClauses: any[] = Array.isArray(filter.$or) ? [...filter.$or] : [];
+
+    for (const [key, value] of Object.entries(filter)) {
+      if (key === '$and' || key === '$or') {
+        continue;
+      }
+      if (
+        !key.startsWith('$') &&
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value)
+      ) {
+        const entries = Object.entries(value);
+        if (
+          entries.length === 1 &&
+          (entries[0][0] === '$and' || entries[0][0] === '$or') &&
+          Array.isArray(entries[0][1])
+        ) {
+          const [opKey, clauses] = entries[0] as [
+            '$and' | '$or',
+            Array<Record<string, any>>,
+          ];
+          const wrappedClauses = clauses
+            .map((clause) =>
+              clause ? { [key]: clause } : undefined,
+            )
+            .filter(Boolean) as Array<Record<string, any>>;
+          if (wrappedClauses.length) {
+            if (opKey === '$and') {
+              andClauses.push(...wrappedClauses);
+            } else {
+              orClauses.push(...wrappedClauses);
+            }
+          }
+          continue;
+        }
+      }
+      normalized[key] = value;
+    }
+
+    if (andClauses.length) {
+      normalized.$and = andClauses;
+    }
+    if (orClauses.length) {
+      normalized.$or = orClauses;
+    }
+    return normalized;
+  }
+
   private sanitizePlanSort(
     sort: any,
   ): Record<string, 1 | -1> | undefined {
@@ -970,6 +1094,26 @@ export class SessionSummaryService {
   }
 
   private async executeChatQueryPlan(
+    sessionId: string,
+    plans: ChatQueryPlan[],
+    hintMessages: HintMessageParam[],
+  ): Promise<ChatPlanExecution[]> {
+    if (!plans?.length) {
+      return [];
+    }
+    const executions: ChatPlanExecution[] = [];
+    for (const plan of plans) {
+      const execution = await this.executeSingleChatPlan(
+        sessionId,
+        plan,
+        hintMessages,
+      );
+      executions.push(execution);
+    }
+    return executions;
+  }
+
+  private async executeSingleChatPlan(
     sessionId: string,
     plan: ChatQueryPlan,
     hintMessages: HintMessageParam[],
@@ -1160,8 +1304,12 @@ export class SessionSummaryService {
 
   private composeChatExecutionContext(
     sessionDoc: Session,
-    execution: ChatPlanExecution,
+    executions: ChatPlanExecution[],
+    previousAnswers: string[],
   ): string {
+    if (!executions?.length) {
+      return '';
+    }
     const sessionSummary = {
       sessionId: sessionDoc._id,
       appId: sessionDoc.appId,
@@ -1170,20 +1318,164 @@ export class SessionSummaryService {
       startedAt: sessionDoc.startedAt,
       finishedAt: sessionDoc.finishedAt,
     };
+    const selectedExecutions = this.filterExecutionsWithData(executions);
+    const sections = (selectedExecutions.length
+      ? selectedExecutions
+      : executions.slice(0, 1)
+    ).map((execution, index) =>
+      this.buildExecutionContextSection(
+        sessionSummary,
+        execution,
+        index + 1,
+      ),
+    );
+    if (previousAnswers.length) {
+      sections.push(this.buildPastAnswersSection(previousAnswers));
+    }
+    return sections.join('\n\n');
+  }
+
+  private buildExecutionContextSection(
+    sessionSummary: Record<string, any>,
+    execution: ChatPlanExecution,
+    sectionIndex: number,
+  ): string {
     const payload = {
+      section: sectionIndex,
       target: execution.plan.target,
       plan: execution.plan,
       session: sessionSummary,
-      data: execution.collections,
+      resultCounts: this.buildCollectionCounts(execution.collections),
       forwardSuggestions: execution.forwardSuggestions,
+      dataFormat: 'TOON',
     };
-    return [
-      `--- Query context (${execution.plan.target}) ---`,
+    const toonData = this.collectionsToToon(execution.collections);
+    const lines = [
+      `--- Query context #${sectionIndex} (${execution.plan.target}) ---`,
       '```json',
       JSON.stringify(payload, this.promptReplacer, 2),
       '```',
-      '--- End context ---',
+    ];
+    if (toonData) {
+      lines.push('```toon', toonData, '```');
+    } else {
+      lines.push('(No matching documents returned for this plan.)');
+    }
+    lines.push('--- End context ---');
+    return lines.join('\n');
+  }
+
+  private buildPastAnswersSection(answers: string[]): string {
+    if (!answers.length) {
+      return '';
+    }
+    const formatted = answers.map(
+      (answer, index) => `${index + 1}. ${this.truncatePastAnswer(answer)}`,
+    );
+    return [
+      '--- Past 5 assistant answers ---',
+      '```text',
+      formatted.join('\n\n'),
+      '```',
+      '--- End past answers ---',
     ].join('\n');
+  }
+
+  private truncatePastAnswer(answer: string): string {
+    if (!answer) {
+      return '';
+    }
+    const trimmed = answer.trim();
+    if (trimmed.length <= PAST_ANSWER_CHAR_LIMIT) {
+      return trimmed;
+    }
+    return `${trimmed.slice(0, PAST_ANSWER_CHAR_LIMIT)}…`;
+  }
+
+  private collectionsToToon(
+    collections?: ChatPlanCollections,
+  ): string | undefined {
+    if (!collections) {
+      return undefined;
+    }
+    const payload: Record<string, any> = {};
+    (['actions', 'requests', 'traces', 'changes'] as ChatCollection[]).forEach(
+      (collection) => {
+        const docs = collections[collection];
+        if (Array.isArray(docs) && docs.length) {
+          payload[collection] = docs;
+        }
+      },
+    );
+    if (!Object.keys(payload).length) {
+      return undefined;
+    }
+    try {
+      return encode(payload, { keyFolding: 'safe' });
+    } catch (err: any) {
+      this.logger.warn(
+        'Failed to encode query result as TOON',
+        err?.message ?? err,
+      );
+      return JSON.stringify(payload, this.promptReplacer, 2);
+    }
+  }
+
+  private buildCollectionCounts(
+    collections?: ChatPlanCollections,
+  ): Record<string, number> {
+    const counts: Record<string, number> = {};
+    if (!collections) {
+      return counts;
+    }
+    (['actions', 'requests', 'traces', 'changes'] as ChatCollection[]).forEach(
+      (collection) => {
+        const docs = collections[collection];
+        if (Array.isArray(docs)) {
+          counts[collection] = docs.length;
+        }
+      },
+    );
+    return counts;
+  }
+
+  private filterExecutionsWithData(
+    executions: ChatPlanExecution[],
+  ): ChatPlanExecution[] {
+    if (!executions?.length) {
+      return [];
+    }
+    return executions.filter((execution) =>
+      this.hasCollectionsData(execution.collections),
+    );
+  }
+
+  private hasCollectionsData(
+    collections?: ChatPlanCollections,
+  ): boolean {
+    if (!collections) {
+      return false;
+    }
+    return (['actions', 'requests', 'traces', 'changes'] as ChatCollection[]).some(
+      (collection) => {
+        const docs = collections[collection];
+        return Array.isArray(docs) && docs.length > 0;
+      },
+    );
+  }
+
+  private collectForwardSuggestions(
+    executions: ChatPlanExecution[],
+  ): string[] {
+    if (!executions?.length) {
+      return [];
+    }
+    const relevant = this.filterExecutionsWithData(executions);
+    const source = relevant.length ? relevant : executions;
+    return source
+      .flatMap((execution) => execution.forwardSuggestions ?? [])
+      .filter(Boolean)
+      .slice(0, 3);
   }
 
   private buildActionFilter(plan: ChatQueryPlan): Record<string, any> {
@@ -5566,6 +5858,50 @@ export class SessionSummaryService {
     return '';
   }
 
+  private enforceTokenBudget(
+    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+    budgetTokens = CHAT_MAX_CONTEXT_TOKENS,
+    avgCharsPerToken = 4,
+  ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+    if (!messages?.length || budgetTokens <= 0) {
+      return messages ?? [];
+    }
+    const budgetChars = Math.max(1, budgetTokens) * Math.max(1, avgCharsPerToken);
+    const lengths = messages.map((message) =>
+      this.flattenMessageContent(message?.content).length,
+    );
+    let totalChars = lengths.reduce((sum, len) => sum + len, 0);
+    if (totalChars <= budgetChars) {
+      return messages;
+    }
+    this.logger.warn(
+      `Trimming chat history from ${totalChars} chars to fit ~${budgetTokens} tokens.`,
+    );
+    const trimmed = messages.slice();
+    const preserved = new Set<number>([0, messages.length - 1]);
+    const removable: number[] = [];
+    for (let i = 1; i < messages.length - 1; i++) {
+      if (!preserved.has(i)) {
+        removable.push(i);
+      }
+    }
+    for (const index of removable) {
+      if (totalChars <= budgetChars) {
+        break;
+      }
+      totalChars -= lengths[index];
+      trimmed[index] =
+        undefined as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam;
+    }
+    const result = trimmed.filter(
+      (
+        message,
+      ): message is OpenAI.Chat.Completions.ChatCompletionMessageParam =>
+        Boolean(message),
+    );
+    return result.length ? result : messages.slice(-1);
+  }
+
   private resolveRequestId(value: any): string | undefined {
     if (!value || typeof value !== 'object') {
       return undefined;
@@ -5665,6 +6001,32 @@ export class SessionSummaryService {
         err?.message ?? err,
       );
     }
+  }
+
+  private async fetchRecentAssistantAnswers(
+    sessionId: string,
+    limit = 5,
+  ): Promise<string[]> {
+    const tenantId = this.tenant.tryGetTenantId();
+    if (!tenantId) {
+      return [];
+    }
+    const docs = await this.chatMessages
+      .find({
+        tenantId,
+        sessionId,
+        role: 'assistant',
+      })
+      .sort({ createdAt: -1 })
+      .limit(Math.max(1, limit))
+      .lean()
+      .exec();
+    return docs
+      .map((doc) =>
+        typeof doc?.content === 'string' ? doc.content.trim() : '',
+      )
+      .filter(Boolean)
+      .reverse();
   }
 }
 
