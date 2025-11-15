@@ -53,7 +53,12 @@ const EMBEDDING_CANDIDATE_LIMIT = 120;
 const EMBEDDING_CHUNK_CHAR_LIMIT = 2000;
 const EMBEDDING_HINT_BOOST = 0.05;
 const CODE_REF_CONTEXT_LIMIT = 20;
+const GRAPH_TRAVERSAL_MAX_DEPTH = 3;
+const GRAPH_TRAVERSAL_BRANCH_LIMIT = 5;
+const GRAPH_TRAVERSAL_PLAN_LIMIT = 24;
 const CHAT_MAX_CONTEXT_TOKENS = 128000;
+const CHAT_CONTEXT_SECTION_LIMIT = 3;
+const CONTEXT_COLLECTION_ENTRY_LIMIT = 5;
 const PAST_ANSWER_CHAR_LIMIT = 2000;
 const CHAT_SYSTEM_PROMPT = [
   'You are the on-call engineer answering questions about a single debugging session.',
@@ -438,6 +443,7 @@ export class SessionSummaryService {
         sessionId,
         plans,
         opts?.messages ?? [],
+        questionText,
       );
 
       const previousAnswers = await previousAnswersPromise;
@@ -1097,18 +1103,44 @@ export class SessionSummaryService {
     sessionId: string,
     plans: ChatQueryPlan[],
     hintMessages: HintMessageParam[],
+    latestQuestion: string,
   ): Promise<ChatPlanExecution[]> {
     if (!plans?.length) {
       return [];
     }
+    const hintContext: HintMessageParam[] = [
+      ...hintMessages,
+      latestQuestion
+        ? ({ role: 'user', content: latestQuestion } as HintMessageParam)
+        : undefined,
+    ].filter(Boolean) as HintMessageParam[];
+    const traversalTokens = this.extractHintTokens(hintContext);
+    const seeds = this.buildGraphSeedsFromTokens(traversalTokens);
+    plans.forEach((plan) => this.mergeSeedsFromPlan(seeds, plan));
     const executions: ChatPlanExecution[] = [];
     for (const plan of plans) {
-      const execution = await this.executeSingleChatPlan(
+      const planClone = this.clonePlan(plan);
+      const baseExecution = await this.executeSingleChatPlan(
         sessionId,
-        plan,
+        planClone,
         hintMessages,
       );
-      executions.push(execution);
+      executions.push(baseExecution);
+      this.mergeSeedsFromExecution(seeds, baseExecution);
+      if (this.hasCollectionsData(baseExecution.collections)) {
+        continue;
+      }
+      const traversalExecution = await this.runGraphTraversalForPlan(
+        sessionId,
+        planClone,
+        hintMessages,
+        seeds,
+        baseExecution,
+      );
+      this.mergeSeedsFromExecution(seeds, traversalExecution);
+      if (this.hasCollectionsData(traversalExecution.collections)) {
+        executions[executions.length - 1] = traversalExecution;
+      }
     }
     return executions;
   }
@@ -1302,6 +1334,337 @@ export class SessionSummaryService {
     };
   }
 
+  private async runGraphTraversalForPlan(
+    sessionId: string,
+    initialPlan: ChatQueryPlan,
+    hintMessages: HintMessageParam[],
+    seeds: GraphTraversalSeeds,
+    initialExecution?: ChatPlanExecution,
+  ): Promise<ChatPlanExecution> {
+    const queue: Array<{ plan: ChatQueryPlan; depth: number }> =
+      this.buildSeedVariantPlans(initialPlan, seeds).map((plan) => ({
+        plan,
+        depth: 0,
+      }));
+    const baseSignature = initialExecution
+      ? this.planSignature(initialPlan)
+      : undefined;
+    let filteredQueue = queue;
+    if (baseSignature) {
+      filteredQueue = queue.filter(
+        (entry) => this.planSignature(entry.plan) !== baseSignature,
+      );
+    }
+    if (!filteredQueue.length) {
+      if (initialExecution) {
+        return initialExecution;
+      }
+      filteredQueue = [{ plan: this.clonePlan(initialPlan), depth: 0 }];
+    }
+    const visited = new Set<string>(baseSignature ? [baseSignature] : []);
+    let attempts = 0;
+    let lastExecution: ChatPlanExecution | undefined = initialExecution;
+
+    while (filteredQueue.length && attempts < GRAPH_TRAVERSAL_PLAN_LIMIT) {
+      const { plan, depth } = filteredQueue.shift()!;
+      const normalizedPlan = this.clonePlan(plan);
+      const signature = this.planSignature(normalizedPlan);
+      if (visited.has(signature)) {
+        continue;
+      }
+      visited.add(signature);
+      attempts += 1;
+
+      const execution = await this.executeSingleChatPlan(
+        sessionId,
+        normalizedPlan,
+        hintMessages,
+      );
+      this.mergeSeedsFromExecution(seeds, execution);
+      if (this.hasCollectionsData(execution.collections)) {
+        return execution;
+      }
+      lastExecution = execution;
+
+      if (depth >= GRAPH_TRAVERSAL_MAX_DEPTH) {
+        continue;
+      }
+
+      const neighbors = this.graphNeighborTargets(normalizedPlan.target);
+      neighbors.forEach((target) => {
+        const neighborBase = this.clonePlanWithoutMongo(normalizedPlan);
+        neighborBase.target = target;
+        neighborBase.reason = `graph-traversal ${normalizedPlan.target}→${target}`;
+        neighborBase.mongo = undefined;
+        const neighborVariants = this.buildSeedVariantPlans(
+          neighborBase,
+          seeds,
+        );
+        neighborVariants.forEach((variant) =>
+          filteredQueue.push({ plan: variant, depth: depth + 1 }),
+        );
+      });
+    }
+
+    return (
+      lastExecution ??
+      (await this.executeSingleChatPlan(sessionId, initialPlan, hintMessages))
+    );
+  }
+
+  private buildSeedVariantPlans(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    if (!plan) {
+      return [];
+    }
+    let variants: ChatQueryPlan[] = [this.clonePlan(plan)];
+    variants = this.expandPlanVariants(variants, (variant) =>
+      this.applyActionSeeds(variant, seeds),
+    );
+    if (plan.target === 'requests') {
+      variants = this.expandPlanVariants(variants, (variant) =>
+        this.applyRequestSeeds(variant, seeds),
+      );
+    } else if (plan.target === 'traces') {
+      variants = this.expandPlanVariants(variants, (variant) =>
+        this.applyTraceSeeds(variant, seeds),
+      );
+    } else if (plan.target === 'actions') {
+      variants = this.expandPlanVariants(variants, (variant) =>
+        this.applyActionLabelSeeds(variant, seeds),
+      );
+    } else if (plan.target === 'changes') {
+      variants = this.expandPlanVariants(variants, (variant) =>
+        this.applyChangeSeeds(variant, seeds),
+      );
+    }
+    return this.dedupePlans(
+      variants.slice(0, Math.max(1, GRAPH_TRAVERSAL_BRANCH_LIMIT)),
+    );
+  }
+
+  private expandPlanVariants(
+    variants: ChatQueryPlan[],
+    transform: (variant: ChatQueryPlan) => ChatQueryPlan[],
+  ): ChatQueryPlan[] {
+    const expanded: ChatQueryPlan[] = [];
+    for (const variant of variants) {
+      const replacements = transform(variant);
+      if (!replacements || !replacements.length) {
+        expanded.push(variant);
+      } else {
+        expanded.push(...replacements);
+      }
+    }
+    return expanded;
+  }
+
+  private applyActionSeeds(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    const results: ChatQueryPlan[] = [plan];
+    if (plan.action?.actionId || !seeds.actionIds.size) {
+      return results;
+    }
+    Array.from(seeds.actionIds)
+      .slice(0, GRAPH_TRAVERSAL_BRANCH_LIMIT)
+      .forEach((actionId) => {
+        const clone = this.clonePlan(plan);
+        clone.action = { ...(clone.action ?? {}), actionId };
+        results.push(clone);
+      });
+    return results;
+  }
+
+  private applyRequestSeeds(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    const results: ChatQueryPlan[] = [plan];
+    const limit = GRAPH_TRAVERSAL_BRANCH_LIMIT;
+
+    if ((!plan.request || !plan.request.rid) && seeds.requestRids.size) {
+      Array.from(seeds.requestRids)
+        .slice(0, limit)
+        .forEach((rid) => {
+          const clone = this.clonePlan(plan);
+          clone.request = { ...(clone.request ?? {}), rid };
+          results.push(clone);
+        });
+    }
+    if ((!plan.endpoint || !plan.endpoint.urlFragment) && seeds.endpoints.size) {
+      Array.from(seeds.endpoints)
+        .slice(0, limit)
+        .forEach((endpoint) => {
+          const clone = this.clonePlan(plan);
+          clone.endpoint = { ...(clone.endpoint ?? {}), urlFragment: endpoint };
+          results.push(clone);
+        });
+    }
+    if ((!plan.endpoint || !plan.endpoint.method) && seeds.httpMethods.size) {
+      Array.from(seeds.httpMethods)
+        .slice(0, limit)
+        .forEach((method) => {
+          const clone = this.clonePlan(plan);
+          clone.endpoint = { ...(clone.endpoint ?? {}), method };
+          results.push(clone);
+        });
+    }
+    if ((!plan.entryPoint || !plan.entryPoint.fn) && seeds.functions.size) {
+      Array.from(seeds.functions)
+        .slice(0, limit)
+        .forEach((fn) => {
+          const clone = this.clonePlan(plan);
+          clone.entryPoint = { ...(clone.entryPoint ?? {}), fn };
+          results.push(clone);
+        });
+    }
+    return this.limitVariants(results, limit);
+  }
+
+  private applyTraceSeeds(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    const results: ChatQueryPlan[] = [plan];
+    const limit = GRAPH_TRAVERSAL_BRANCH_LIMIT;
+    if (!plan.functionName && seeds.functions.size) {
+      Array.from(seeds.functions)
+        .slice(0, limit)
+        .forEach((fn) => {
+          const clone = this.clonePlan(plan);
+          clone.functionName = fn;
+          results.push(clone);
+        });
+    }
+    if ((!plan.request || !plan.request.rid) && seeds.requestRids.size) {
+      Array.from(seeds.requestRids)
+        .slice(0, limit)
+        .forEach((rid) => {
+          const clone = this.clonePlan(plan);
+          clone.request = { ...(clone.request ?? {}), rid };
+          results.push(clone);
+        });
+    }
+    if ((!plan.entryPoint || !plan.entryPoint.file) && seeds.files.size) {
+      Array.from(seeds.files)
+        .slice(0, limit)
+        .forEach((file) => {
+          const clone = this.clonePlan(plan);
+          clone.entryPoint = { ...(clone.entryPoint ?? {}), file };
+          results.push(clone);
+        });
+    }
+    return this.limitVariants(results, limit);
+  }
+
+  private applyActionLabelSeeds(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    const results: ChatQueryPlan[] = [plan];
+    if (
+      plan.action?.actionId ||
+      plan.action?.label ||
+      plan.action?.labelContains ||
+      !seeds.keywords.size
+    ) {
+      return results;
+    }
+    Array.from(seeds.keywords)
+      .slice(0, GRAPH_TRAVERSAL_BRANCH_LIMIT)
+      .forEach((keyword) => {
+        const clone = this.clonePlan(plan);
+        clone.action = { ...(clone.action ?? {}), labelContains: keyword };
+        results.push(clone);
+      });
+    return results;
+  }
+
+  private applyChangeSeeds(
+    plan: ChatQueryPlan,
+    seeds: GraphTraversalSeeds,
+  ): ChatQueryPlan[] {
+    const results: ChatQueryPlan[] = [plan];
+    if ((!plan.change || !plan.change.collection) && seeds.changeCollections.size) {
+      Array.from(seeds.changeCollections)
+        .slice(0, GRAPH_TRAVERSAL_BRANCH_LIMIT)
+        .forEach((collection) => {
+          const clone = this.clonePlan(plan);
+          clone.change = { ...(clone.change ?? {}), collection };
+          results.push(clone);
+        });
+    }
+    return results;
+  }
+
+  private limitVariants(
+    variants: ChatQueryPlan[],
+    limit: number,
+  ): ChatQueryPlan[] {
+    if (variants.length <= limit) {
+      return this.dedupePlans(variants);
+    }
+    return this.dedupePlans(variants).slice(0, limit);
+  }
+
+  private dedupePlans(plans: ChatQueryPlan[]): ChatQueryPlan[] {
+    const seen = new Set<string>();
+    const result: ChatQueryPlan[] = [];
+    plans.forEach((plan) => {
+      const signature = this.planSignature(plan);
+      if (seen.has(signature)) {
+        return;
+      }
+      seen.add(signature);
+      result.push(plan);
+    });
+    return result;
+  }
+
+  private graphNeighborTargets(target: ChatCollection): ChatCollection[] {
+    if (target === 'actions') {
+      return ['requests', 'traces', 'changes'];
+    }
+    if (target === 'requests') {
+      return ['traces', 'actions', 'changes'];
+    }
+    if (target === 'traces') {
+      return ['requests', 'actions', 'changes'];
+    }
+    if (target === 'changes') {
+      return ['actions', 'requests', 'traces'];
+    }
+    return [];
+  }
+
+  private planSignature(plan: ChatQueryPlan): string {
+    return JSON.stringify({
+      target: plan.target,
+      limit: plan.limit,
+      functionName: plan.functionName,
+      action: plan.action,
+      request: plan.request,
+      endpoint: plan.endpoint,
+      entryPoint: plan.entryPoint,
+      change: plan.change,
+      mongo: plan.mongo,
+    });
+  }
+
+  private clonePlan(plan: ChatQueryPlan): ChatQueryPlan {
+    return plan ? JSON.parse(JSON.stringify(plan)) : ({} as ChatQueryPlan);
+  }
+
+  private clonePlanWithoutMongo(plan: ChatQueryPlan): ChatQueryPlan {
+    const clone = this.clonePlan(plan);
+    clone.mongo = undefined;
+    return clone;
+  }
+
   private composeChatExecutionContext(
     sessionDoc: Session,
     executions: ChatPlanExecution[],
@@ -1319,20 +1682,23 @@ export class SessionSummaryService {
       finishedAt: sessionDoc.finishedAt,
     };
     const selectedExecutions = this.filterExecutionsWithData(executions);
-    const sections = (selectedExecutions.length
+    const baseExecutions = selectedExecutions.length
       ? selectedExecutions
-      : executions.slice(0, 1)
-    ).map((execution, index) =>
-      this.buildExecutionContextSection(
-        sessionSummary,
-        execution,
-        index + 1,
-      ),
-    );
+      : executions.slice(0, 1);
+    const sections = baseExecutions
+      .slice(0, CHAT_CONTEXT_SECTION_LIMIT)
+      .map((execution, index) =>
+        this.buildExecutionContextSection(
+          sessionSummary,
+          execution,
+          index + 1,
+        ),
+      );
     if (previousAnswers.length) {
       sections.push(this.buildPastAnswersSection(previousAnswers));
     }
-    return sections.join('\n\n');
+    const limitedSections = this.limitContextSectionsToBudget(sections);
+    return limitedSections.join('\n\n');
   }
 
   private buildExecutionContextSection(
@@ -1340,16 +1706,19 @@ export class SessionSummaryService {
     execution: ChatPlanExecution,
     sectionIndex: number,
   ): string {
+    const limitedCollections = this.limitCollectionsForContext(
+      execution.collections,
+    );
     const payload = {
       section: sectionIndex,
       target: execution.plan.target,
       plan: execution.plan,
       session: sessionSummary,
-      resultCounts: this.buildCollectionCounts(execution.collections),
+      resultCounts: this.buildCollectionCounts(limitedCollections),
       forwardSuggestions: execution.forwardSuggestions,
       dataFormat: 'TOON',
     };
-    const toonData = this.collectionsToToon(execution.collections);
+    const toonData = this.collectionsToToon(limitedCollections);
     const lines = [
       `--- Query context #${sectionIndex} (${execution.plan.target}) ---`,
       '```json',
@@ -1379,6 +1748,177 @@ export class SessionSummaryService {
       '```',
       '--- End past answers ---',
     ].join('\n');
+  }
+
+  private limitContextSectionsToBudget(
+    sections: string[],
+    tokenBudget = Math.max(1, CHAT_MAX_CONTEXT_TOKENS - 4000),
+    avgCharsPerToken = 3,
+  ): string[] {
+    if (!sections?.length) {
+      return [];
+    }
+    const maxChars = Math.max(1, tokenBudget) * Math.max(1, avgCharsPerToken);
+    const limited: string[] = [];
+    let usedChars = 0;
+    for (const section of sections) {
+      const sectionLength = section.length + (limited.length ? 2 : 0);
+      if (usedChars + sectionLength > maxChars) {
+        const remaining = maxChars - usedChars;
+        const truncationNotice =
+          '...(context truncated to respect the 128000-token budget)...';
+        if (!limited.length) {
+          const sliceLength = Math.max(
+            remaining - truncationNotice.length - 2,
+            0,
+          );
+          const truncated =
+            section.slice(0, sliceLength > 0 ? sliceLength : 0).trimEnd() +
+            '\n' +
+            truncationNotice;
+          limited.push(truncated);
+        } else if (remaining > truncationNotice.length + 2) {
+          const sliceLength = remaining - truncationNotice.length - 2;
+          const truncated =
+            section.slice(0, sliceLength).trimEnd() +
+            '\n' +
+            truncationNotice;
+          limited.push(truncated);
+        }
+        break;
+      }
+      limited.push(section);
+      usedChars += sectionLength;
+    }
+    return limited.length ? limited : sections.slice(0, 1);
+  }
+
+  private buildGraphSeedsFromTokens(tokens: HintTokens): GraphTraversalSeeds {
+    return {
+      actionIds: new Set(Array.from(tokens.actionIds ?? [])),
+      requestRids: new Set(Array.from(tokens.requestIds ?? [])),
+      functions: new Set(Array.from(tokens.functions ?? [])),
+      files: new Set(Array.from(tokens.files ?? [])),
+      endpoints: new Set(Array.from(tokens.endpoints ?? [])),
+      httpMethods: new Set(Array.from(tokens.httpMethods ?? [])),
+      changeCollections: new Set<string>(),
+      keywords: new Set(Array.from(tokens.keywords ?? [])),
+    };
+  }
+
+  private mergeSeedsFromPlan(
+    seeds: GraphTraversalSeeds,
+    plan: ChatQueryPlan,
+  ): void {
+    if (plan.action?.actionId) {
+      seeds.actionIds.add(plan.action.actionId);
+    }
+    if (plan.request?.rid) {
+      seeds.requestRids.add(plan.request.rid);
+    }
+    if (plan.functionName) {
+      seeds.functions.add(plan.functionName);
+    }
+    if (plan.entryPoint?.fn) {
+      seeds.functions.add(plan.entryPoint.fn);
+    }
+    if (plan.entryPoint?.file) {
+      seeds.files.add(plan.entryPoint.file);
+    }
+    if (plan.endpoint?.urlFragment) {
+      seeds.endpoints.add(
+        this.normalizeEndpointPath(plan.endpoint.urlFragment),
+      );
+    }
+    if (plan.endpoint?.method) {
+      seeds.httpMethods.add(plan.endpoint.method.toUpperCase());
+    }
+    if (plan.change?.collection) {
+      seeds.changeCollections.add(plan.change.collection);
+    }
+  }
+
+  private mergeSeedsFromExecution(
+    seeds: GraphTraversalSeeds,
+    execution: ChatPlanExecution,
+  ): void {
+    const collections = execution.collections;
+    if (!collections) {
+      return;
+    }
+    (collections.actions ?? []).forEach((action: any) => {
+      if (action?.actionId) {
+        seeds.actionIds.add(action.actionId);
+      }
+      if (typeof action?.label === 'string') {
+        seeds.keywords.add(action.label.toLowerCase());
+      }
+    });
+    (collections.requests ?? []).forEach((request: any) => {
+      if (request?.rid) {
+        seeds.requestRids.add(request.rid);
+      }
+      if (request?.actionId) {
+        seeds.actionIds.add(request.actionId);
+      }
+      if (request?.entryPoint?.fn) {
+        seeds.functions.add(request.entryPoint.fn);
+      }
+      if (request?.entryPoint?.file) {
+        seeds.files.add(request.entryPoint.file);
+      }
+      if (request?.method) {
+        seeds.httpMethods.add(String(request.method).toUpperCase());
+      }
+      if (request?.url) {
+        seeds.endpoints.add(this.normalizeEndpointPath(request.url));
+      }
+    });
+    (collections.traces ?? []).forEach((trace: any) => {
+      if (trace?.requestRid) {
+        seeds.requestRids.add(trace.requestRid);
+      }
+      if (trace?.actionId) {
+        seeds.actionIds.add(trace.actionId);
+      }
+      const codeRefs: any[] = Array.isArray(trace?.codeRefs)
+        ? trace.codeRefs
+        : [];
+      codeRefs.forEach((ref) => {
+        if (ref?.fn) {
+          seeds.functions.add(ref.fn);
+        }
+        if (ref?.file) {
+          seeds.files.add(ref.file);
+        }
+      });
+    });
+    (collections.changes ?? []).forEach((change: any) => {
+      if (change?.actionId) {
+        seeds.actionIds.add(change.actionId);
+      }
+      if (change?.collection) {
+        seeds.changeCollections.add(change.collection);
+      }
+    });
+  }
+
+  private limitCollectionsForContext(
+    collections?: ChatPlanCollections,
+  ): ChatPlanCollections | undefined {
+    if (!collections) {
+      return undefined;
+    }
+    const limited: ChatPlanCollections = {};
+    (['actions', 'requests', 'traces', 'changes'] as ChatCollection[]).forEach(
+      (collection) => {
+        const docs = collections[collection];
+        if (Array.isArray(docs) && docs.length) {
+          limited[collection] = docs.slice(0, CONTEXT_COLLECTION_ENTRY_LIMIT);
+        }
+      },
+    );
+    return limited;
   }
 
   private truncatePastAnswer(answer: string): string {
@@ -5861,7 +6401,7 @@ export class SessionSummaryService {
   private enforceTokenBudget(
     messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
     budgetTokens = CHAT_MAX_CONTEXT_TOKENS,
-    avgCharsPerToken = 4,
+    avgCharsPerToken = 3,
   ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
     if (!messages?.length || budgetTokens <= 0) {
       return messages ?? [];
@@ -6102,6 +6642,17 @@ type ChatPlanExecution = {
   plan: ChatQueryPlan;
   collections: ChatPlanCollections;
   forwardSuggestions: string[];
+};
+
+type GraphTraversalSeeds = {
+  actionIds: Set<string>;
+  requestRids: Set<string>;
+  functions: Set<string>;
+  files: Set<string>;
+  endpoints: Set<string>;
+  httpMethods: Set<string>;
+  changeCollections: Set<string>;
+  keywords: Set<string>;
 };
 
 type TraceEventLike = Record<string, any>;
