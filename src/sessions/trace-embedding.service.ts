@@ -491,13 +491,53 @@ export class TraceEmbeddingService {
     const stack: FunctionCallNode[] = [];
     const openById = new Map<string, FunctionCallNode>();
     const syntheticIndex = new Map<string, number>();
+    const suspendedRedirects = new Map<string, string | null>();
+
+    const resolveParentId = (id?: string | null) => {
+      let current = id ?? null;
+      const seen = new Set<string>();
+      while (current && suspendedRedirects.has(current) && !seen.has(current)) {
+        seen.add(current);
+        current = suspendedRedirects.get(current) ?? null;
+      }
+      return current;
+    };
 
     for (let idx = 0; idx < events.length; idx += 1) {
       const event = events[idx] ?? {};
       const typeText = this.toText(event.type).toLowerCase();
       const identifier = this.extractEventIdentifier(event);
+      const normalizedDepth = this.normalizeEventDepth(event);
+      const isExit = this.isExitEvent(typeText);
+      const isEnter = this.isEnterEvent(typeText);
+      const isSuspend = this.isSuspendEvent(typeText);
 
-      if (this.isExitEvent(typeText)) {
+      if (isSuspend) {
+        const node =
+          (identifier ? openById.get(identifier) : undefined) ??
+          this.findNodeInStackById(stack, identifier) ??
+          stack[stack.length - 1];
+        if (node) {
+          node.events.push(event);
+          this.enrichNodeFromEvent(node, event);
+          this.detachNodeFromStack(stack, node);
+        }
+        if (identifier) {
+          const parentSpan = event?.parentSpanId;
+          const resolvedParent = resolveParentId(
+            parentSpan !== undefined && parentSpan !== null
+              ? String(parentSpan)
+              : node?.parent?.localId ?? null,
+          );
+          suspendedRedirects.set(identifier, resolvedParent ?? null);
+        }
+        continue;
+      }
+
+      if (isExit) {
+        if (typeof normalizedDepth === 'number') {
+          this.trimStackForExit(stack, openById, normalizedDepth, idx);
+        }
         const node =
           (identifier ? openById.get(identifier) : undefined) ??
           this.findNodeInStackById(stack, identifier) ??
@@ -506,19 +546,29 @@ export class TraceEmbeddingService {
           node.eventEnd = idx;
           node.events.push(event);
           this.enrichNodeFromEvent(node, event);
-          if (identifier) {
-            openById.delete(identifier);
-            this.detachNodeFromStack(stack, node);
-          }
+          openById.delete(node.localId);
+          suspendedRedirects.delete(node.localId);
+          this.detachNodeFromStack(stack, node);
         }
         continue;
       }
 
       const descriptor = this.extractFunctionDescriptor(event);
-      const isEnter = this.isEnterEvent(typeText);
-      const parent = stack[stack.length - 1];
+      const parentSpan = event?.parentSpanId;
+      const resolvedParentId = resolveParentId(
+        parentSpan !== undefined && parentSpan !== null
+          ? String(parentSpan)
+          : null,
+      );
+      const parent = resolvedParentId
+        ? openById.get(resolvedParentId)
+        : stack[stack.length - 1];
       if (!isEnter && !descriptor.fn && !parent) {
         continue;
+      }
+
+      if (isEnter && typeof normalizedDepth === 'number') {
+        this.trimStackForEnter(stack, openById, normalizedDepth, idx);
       }
 
       if (isEnter || descriptor.fn) {
@@ -537,6 +587,12 @@ export class TraceEmbeddingService {
             idx,
             syntheticIndex,
           );
+        const depthForNode =
+          typeof normalizedDepth === 'number'
+            ? normalizedDepth
+            : parent
+              ? parent.depth + 1
+              : 0;
         const node: FunctionCallNode = {
           localId,
           fn:
@@ -546,7 +602,7 @@ export class TraceEmbeddingService {
             'anonymous',
           file: descriptor.file || this.extractEventFile(event) || parent?.file,
           line: resolvedLine ?? parent?.line,
-          depth: parent ? parent.depth + 1 : 0,
+          depth: depthForNode,
           parent: parent ?? null,
           children: [],
           events: [event],
@@ -575,6 +631,7 @@ export class TraceEmbeddingService {
     const lastIndex = events.length ? events.length - 1 : 0;
     while (stack.length) {
       const node = stack.pop()!;
+      openById.delete(node.localId);
       if (node.eventEnd < node.eventStart) {
         node.eventEnd = lastIndex;
       }
@@ -584,6 +641,73 @@ export class TraceEmbeddingService {
       }
     }
     return nodes;
+  }
+
+  private normalizeEventDepth(event: TraceSegmentEvent): number | undefined {
+    if (!event || typeof event.depth === 'undefined') {
+      return undefined;
+    }
+    const raw = Number(event.depth);
+    if (!Number.isFinite(raw)) {
+      return undefined;
+    }
+    return Math.max(0, Math.floor(raw) - 1);
+  }
+
+  private trimStackForEnter(
+    stack: FunctionCallNode[],
+    openById: Map<string, FunctionCallNode>,
+    nodeDepth: number,
+    eventIndex: number,
+  ): void {
+    while (stack.length) {
+      const current = stack[stack.length - 1];
+      if (!current) {
+        break;
+      }
+      if (current.depth >= nodeDepth) {
+        const removed = stack.pop()!;
+        openById.delete(removed.localId);
+        this.finalizeDanglingNode(removed, eventIndex);
+      } else {
+        break;
+      }
+    }
+  }
+
+  private trimStackForExit(
+    stack: FunctionCallNode[],
+    openById: Map<string, FunctionCallNode>,
+    nodeDepth: number,
+    eventIndex: number,
+  ): void {
+    while (stack.length) {
+      const current = stack[stack.length - 1];
+      if (!current) {
+        break;
+      }
+      if (current.depth > nodeDepth) {
+        const removed = stack.pop()!;
+        openById.delete(removed.localId);
+        this.finalizeDanglingNode(removed, eventIndex);
+      } else {
+        break;
+      }
+    }
+  }
+
+  private finalizeDanglingNode(
+    node: FunctionCallNode,
+    eventIndex: number,
+  ): void {
+    if (node.eventEnd < node.eventStart) {
+      const fallback = Math.max(node.eventStart, eventIndex - 1);
+      node.eventEnd = fallback;
+    }
+    const lastEvent = node.events[node.events.length - 1];
+    if (lastEvent) {
+      this.enrichNodeFromEvent(node, lastEvent);
+    }
   }
 
   private buildFunctionChunkSummary(
@@ -816,6 +940,10 @@ export class TraceEmbeddingService {
   private isExitEvent(type: string): boolean {
     const normalized = type.toLowerCase();
     return ['exit', 'end', 'finish', 'return', 'stop'].includes(normalized);
+  }
+
+  private isSuspendEvent(type: string): boolean {
+    return type.toLowerCase() === 'suspend';
   }
 
   private extractEventIdentifier(event: TraceSegmentEvent): string | undefined {

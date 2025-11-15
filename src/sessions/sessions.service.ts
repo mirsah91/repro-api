@@ -334,9 +334,7 @@ export class SessionsService {
     return merged.slice(0, limit);
   }
 
-  private normalizeEntryPoint(
-    value: any,
-  ):
+  private normalizeEntryPoint(value: any):
     | {
         fn?: string | null;
         file?: string | null;
@@ -711,6 +709,38 @@ export class SessionsService {
                 { $set: { request: requestDoc._id } },
               )
               .exec();
+          }
+        }
+
+        if (e.trace) {
+          try {
+            const ridHint =
+              resolvedRid ??
+              e?.traceBatch?.rid ??
+              e?.requestRid ??
+              e?.rid ??
+              null;
+            const serialized =
+              typeof e.trace === 'string'
+                ? e.trace
+                : JSON.stringify(e.trace);
+            const preview =
+              typeof serialized === 'string'
+                ? serialized.slice(0, 2000)
+                : '[unserializable]';
+            console.log('[repro][ingest] trace payload received', {
+              sessionId,
+              rid: ridHint,
+              batchIndex: Number.isFinite(Number(e?.traceBatch?.index))
+                ? Number(e?.traceBatch?.index)
+                : null,
+              previewLength: preview.length,
+              preview,
+            });
+          } catch {
+            console.log(
+              '[repro][ingest] trace payload received (unable to serialize preview)',
+            );
           }
         }
 

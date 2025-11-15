@@ -660,14 +660,16 @@ export class SessionSummaryService {
     fallback: ChatQueryPlan[],
   ): ChatQueryPlan[] {
     const fallbackPlans =
-      fallback && fallback.length ? fallback : this.buildFallbackChatQueryPlan('');
+      fallback && fallback.length
+        ? fallback
+        : this.buildFallbackChatQueryPlan('');
     const rawPlans = Array.isArray(parsed?.plans)
       ? parsed.plans
       : Array.isArray(parsed)
-      ? parsed
-      : parsed
-      ? [parsed]
-      : [];
+        ? parsed
+        : parsed
+          ? [parsed]
+          : [];
     const normalized = rawPlans
       .map((plan: any, index: number) =>
         this.normalizeChatQueryPlan(
@@ -676,8 +678,7 @@ export class SessionSummaryService {
         ),
       )
       .filter(
-        (plan): plan is ChatQueryPlan =>
-          plan !== undefined && plan !== null,
+        (plan): plan is ChatQueryPlan => plan !== undefined && plan !== null,
       );
     return normalized.length ? normalized : fallbackPlans;
   }
@@ -897,9 +898,8 @@ export class SessionSummaryService {
     ...filters: Array<Record<string, any> | undefined>
   ): Record<string, any> {
     const primary = { ...base, tenantId: this.tenant.tenantId };
-    const extras = filters.filter(
-      (filter): filter is Record<string, any> =>
-        this.hasFilterContent(filter),
+    const extras = filters.filter((filter): filter is Record<string, any> =>
+      this.hasFilterContent(filter),
     );
     if (!extras.length) {
       return primary;
@@ -1044,9 +1044,7 @@ export class SessionSummaryService {
             Array<Record<string, any>>,
           ];
           const wrappedClauses = clauses
-            .map((clause) =>
-              clause ? { [key]: clause } : undefined,
-            )
+            .map((clause) => (clause ? { [key]: clause } : undefined))
             .filter(Boolean) as Array<Record<string, any>>;
           if (wrappedClauses.length) {
             if (opKey === '$and') {
@@ -1070,9 +1068,7 @@ export class SessionSummaryService {
     return normalized;
   }
 
-  private sanitizePlanSort(
-    sort: any,
-  ): Record<string, 1 | -1> | undefined {
+  private sanitizePlanSort(sort: any): Record<string, 1 | -1> | undefined {
     if (!sort || typeof sort !== 'object') {
       return undefined;
     }
@@ -1206,7 +1202,7 @@ export class SessionSummaryService {
         filter,
       );
 
-      console.log('query --->', JSON.stringify(query, null, 2))
+      console.log('query --->', JSON.stringify(query, null, 2));
       const requestDocs = await this.requests
         .find(query)
         .sort(branchPlan?.sort ?? { t: 1 })
@@ -1495,7 +1491,10 @@ export class SessionSummaryService {
           results.push(clone);
         });
     }
-    if ((!plan.endpoint || !plan.endpoint.urlFragment) && seeds.endpoints.size) {
+    if (
+      (!plan.endpoint || !plan.endpoint.urlFragment) &&
+      seeds.endpoints.size
+    ) {
       Array.from(seeds.endpoints)
         .slice(0, limit)
         .forEach((endpoint) => {
@@ -1589,7 +1588,10 @@ export class SessionSummaryService {
     seeds: GraphTraversalSeeds,
   ): ChatQueryPlan[] {
     const results: ChatQueryPlan[] = [plan];
-    if ((!plan.change || !plan.change.collection) && seeds.changeCollections.size) {
+    if (
+      (!plan.change || !plan.change.collection) &&
+      seeds.changeCollections.size
+    ) {
       Array.from(seeds.changeCollections)
         .slice(0, GRAPH_TRAVERSAL_BRANCH_LIMIT)
         .forEach((collection) => {
@@ -1688,11 +1690,7 @@ export class SessionSummaryService {
     const sections = baseExecutions
       .slice(0, CHAT_CONTEXT_SECTION_LIMIT)
       .map((execution, index) =>
-        this.buildExecutionContextSection(
-          sessionSummary,
-          execution,
-          index + 1,
-        ),
+        this.buildExecutionContextSection(sessionSummary, execution, index + 1),
       );
     if (previousAnswers.length) {
       sections.push(this.buildPastAnswersSection(previousAnswers));
@@ -1780,9 +1778,7 @@ export class SessionSummaryService {
         } else if (remaining > truncationNotice.length + 2) {
           const sliceLength = remaining - truncationNotice.length - 2;
           const truncated =
-            section.slice(0, sliceLength).trimEnd() +
-            '\n' +
-            truncationNotice;
+            section.slice(0, sliceLength).trimEnd() + '\n' + truncationNotice;
           limited.push(truncated);
         }
         break;
@@ -1990,23 +1986,19 @@ export class SessionSummaryService {
     );
   }
 
-  private hasCollectionsData(
-    collections?: ChatPlanCollections,
-  ): boolean {
+  private hasCollectionsData(collections?: ChatPlanCollections): boolean {
     if (!collections) {
       return false;
     }
-    return (['actions', 'requests', 'traces', 'changes'] as ChatCollection[]).some(
-      (collection) => {
-        const docs = collections[collection];
-        return Array.isArray(docs) && docs.length > 0;
-      },
-    );
+    return (
+      ['actions', 'requests', 'traces', 'changes'] as ChatCollection[]
+    ).some((collection) => {
+      const docs = collections[collection];
+      return Array.isArray(docs) && docs.length > 0;
+    });
   }
 
-  private collectForwardSuggestions(
-    executions: ChatPlanExecution[],
-  ): string[] {
+  private collectForwardSuggestions(executions: ChatPlanExecution[]): string[] {
     if (!executions?.length) {
       return [];
     }
@@ -2137,13 +2129,7 @@ export class SessionSummaryService {
     if (traces.length || planFilter || fnSet.size || requestRidList.length) {
       return traces;
     }
-    return this.fetchTracesForFunctions(
-      sessionId,
-      [],
-      [],
-      limit,
-      hintMessages,
-    );
+    return this.fetchTracesForFunctions(sessionId, [], [], limit, hintMessages);
   }
 
   private async fetchTracesForFunctions(
@@ -2174,11 +2160,7 @@ export class SessionSummaryService {
     } else if (requestRids.length > 1) {
       filter.requestRid = { $in: requestRids };
     }
-    const query = this.buildTenantCriteria(
-      { sessionId },
-      planFilter,
-      filter,
-    );
+    const query = this.buildTenantCriteria({ sessionId }, planFilter, filter);
     const docs = await this.traces
       .find(query)
       .sort(planSort ?? { batchIndex: 1 })
@@ -6406,9 +6388,10 @@ export class SessionSummaryService {
     if (!messages?.length || budgetTokens <= 0) {
       return messages ?? [];
     }
-    const budgetChars = Math.max(1, budgetTokens) * Math.max(1, avgCharsPerToken);
-    const lengths = messages.map((message) =>
-      this.flattenMessageContent(message?.content).length,
+    const budgetChars =
+      Math.max(1, budgetTokens) * Math.max(1, avgCharsPerToken);
+    const lengths = messages.map(
+      (message) => this.flattenMessageContent(message?.content).length,
     );
     let totalChars = lengths.reduce((sum, len) => sum + len, 0);
     if (totalChars <= budgetChars) {

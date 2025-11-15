@@ -20,7 +20,7 @@ export function encryptField(value: any): any {
     if (normalized !== null && typeof normalized === 'object') {
       return JSON.parse(JSON.stringify(normalized));
     }
-    return normalized as any;
+    return normalized;
   }
   return encryptJson(normalized);
 }
