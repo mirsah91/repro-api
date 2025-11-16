@@ -93,7 +93,9 @@ export class AppsService {
   }
 
   async getApp(appId: string) {
-    const app = await this.model.findOne(this.withTenantFilter({ appId })).lean();
+    const app = await this.model
+      .findOne(this.withTenantFilter({ appId }))
+      .lean();
     if (!app) throw new NotFoundException('App not found');
     return this.toAppDetailDto(app);
   }
@@ -143,7 +145,9 @@ export class AppsService {
   private toUserDto(doc: any, passwordOverride?: string) {
     const password =
       passwordOverride ??
-      (typeof doc.tokenEnc === 'string' ? safeDecrypt(doc.tokenEnc) : undefined);
+      (typeof doc.tokenEnc === 'string'
+        ? safeDecrypt(doc.tokenEnc)
+        : undefined);
     return {
       id: String(doc._id),
       tenantId: doc.tenantId,
@@ -162,7 +166,9 @@ export class AppsService {
     base?: T,
   ): T & { tenantId?: string } {
     const tenantId = this.tenant.tryGetTenantId();
-    return tenantId ? { ...(base ?? ({} as T)), tenantId } : base ?? ({} as T);
+    return tenantId
+      ? { ...(base ?? ({} as T)), tenantId }
+      : (base ?? ({} as T));
   }
 }
 

@@ -4,10 +4,19 @@ import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import * as express from 'express';
 import { readFileSync } from 'fs';
 import { createSecureLogger } from './common/security/secure-logger';
-import { requireEncryptionKey } from './common/security/encryption.util';
+import {
+  isEncryptionDisabled,
+  requireEncryptionKey,
+} from './common/security/encryption.util';
 
 async function bootstrap() {
-  requireEncryptionKey();
+  if (!isEncryptionDisabled()) {
+    requireEncryptionKey();
+  } else {
+    console.warn(
+      '[encryption] Application encryption disabled via APP_ENCRYPTION_DISABLED.',
+    );
+  }
   const httpsOptions = buildHttpsOptions();
 
   const app = await NestFactory.create(AppModule, {
@@ -20,7 +29,10 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('Repro API')
     .setVersion('0.1.0')
-    .addApiKey({ type: 'apiKey', name: 'x-sdk-token', in: 'header' }, 'sdkToken')
+    .addApiKey(
+      { type: 'apiKey', name: 'x-sdk-token', in: 'header' },
+      'sdkToken',
+    )
     .addBearerAuth(
       { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
       'appUser',
@@ -44,7 +56,7 @@ async function bootstrap() {
   await app.listen(process.env.PORT || 4000);
 }
 
-bootstrap();
+void bootstrap();
 
 function buildHttpsOptions():
   | { key: Buffer; cert: Buffer; ca?: Buffer }
@@ -55,7 +67,9 @@ function buildHttpsOptions():
 
   if (!keyPath || !certPath) {
     if (!process.env.DISABLE_TLS_WARNING) {
-      console.warn('[tls] TLS disabled - provide TLS_KEY_PATH and TLS_CERT_PATH to enable HTTPS');
+      console.warn(
+        '[tls] TLS disabled - provide TLS_KEY_PATH and TLS_CERT_PATH to enable HTTPS',
+      );
     }
     return undefined;
   }

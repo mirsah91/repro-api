@@ -10,7 +10,7 @@ This service powers multi-tenant session capture and analytics for the Repro pla
 - **TLS everywhere** – the Nest HTTP server can terminate TLS and the MongoDB driver negotiates TLS connections by default. Plain HTTP and non-TLS drivers are supported for local development but not recommended for production.
 ## Encryption Architecture
 
-Repro uses a single symmetric master key to protect tenant credentials, SDK tokens, session payloads, and secure audit logs. The key is supplied via `DATA_ENCRYPTION_KEY`, normalized to 32 bytes, and cached in process memory (`src/common/security/encryption.util.ts`). AES-256-GCM provides confidentiality and integrity, while HMAC-SHA256 enables constant-time secret lookups.
+Repro uses a single symmetric master key to protect tenant credentials, SDK tokens, session payloads, and secure audit logs. The key is supplied via `DATA_ENCRYPTION_KEY`, normalized to 32 bytes, and cached in process memory (`src/common/security/encryption.util.ts`). AES-256-GCM provides confidentiality and integrity, while HMAC-SHA256 enables constant-time secret lookups. When `APP_ENCRYPTION_DISABLED=1`, the API skips AES/HMAC entirely so secrets and payloads are stored in plaintext for easier local debugging (existing encrypted values remain readable if `DATA_ENCRYPTION_KEY` is still provided).
 
 ```mermaid
 flowchart TD
@@ -42,7 +42,7 @@ flowchart TD
 ```
 
 ### Key Derivation
-- `DATA_ENCRYPTION_KEY` accepts raw, hex, or base64 encodings; the service rejects startup if it is missing (`src/common/security/encryption.util.ts:17`).
+- `DATA_ENCRYPTION_KEY` accepts raw, hex, or base64 encodings; the service rejects startup if it is missing unless `APP_ENCRYPTION_DISABLED=1` (`src/common/security/encryption.util.ts:17`).
 - `deriveKey()` squeezes the input to 32 bytes with SHA-256 and caches the result per process.
 
 ### Secret & Token Storage
@@ -66,7 +66,8 @@ flowchart TD
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `DATA_ENCRYPTION_KEY` | ✅ | 32-byte secret (raw, hex, or base64). Used to derive symmetric keys for encrypting app secrets, tokens, and log files. The process will exit if it is not set. |
+| `DATA_ENCRYPTION_KEY` | ✅ (unless `APP_ENCRYPTION_DISABLED=1`) | 32-byte secret (raw, hex, or base64). Used to derive symmetric keys for encrypting app secrets, tokens, and log files. |
+| `APP_ENCRYPTION_DISABLED` | Optional | Set to `1`, `true`, or `yes` to bypass all application-level encryption/HMAC logic. New secrets are saved in plaintext; existing encrypted values still decrypt if `DATA_ENCRYPTION_KEY` is present. |
 | `MONGO_URI` | ✅ | Mongo connection string with database name (e.g. `mongodb+srv://.../repro`). |
 | `MONGO_TLS` | Optional (default `true`) | Set to `false` to disable driver TLS in development. |
 | `MONGO_TLS_CA` | Optional | Path to a CA bundle used when `MONGO_TLS` is enabled. |

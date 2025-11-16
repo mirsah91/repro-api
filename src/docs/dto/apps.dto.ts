@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsOptional, IsString } from 'class-validator';
+import { IsIn, IsOptional, IsString, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { AppUserRole } from '../../apps/schemas/app-user.schema';
 
 export class CreateAppDto {
@@ -145,7 +146,8 @@ export class UpdateAppUserDto {
 
   @ApiPropertyOptional({
     example: true,
-    description: 'Reset the user password and return the new value in the response.',
+    description:
+      'Reset the user password and return the new value in the response.',
   })
   resetPassword?: boolean;
 }
@@ -187,6 +189,19 @@ export class AppUserProfileResponseDto {
   user!: AppUserDto;
 }
 
+export class SummaryMessageDto {
+  @ApiProperty({ enum: ['system', 'user', 'assistant'] })
+  @IsString()
+  @IsIn(['system', 'user', 'assistant'])
+  role!: 'system' | 'user' | 'assistant';
+
+  @ApiProperty({
+    example: 'Why does checkout fail in cart.service.ts line 88?',
+  })
+  @IsString()
+  content!: string;
+}
+
 export class SessionSummaryRequestDto {
   @ApiProperty({ example: 'S_123456789abcdef' })
   @IsString()
@@ -196,6 +211,19 @@ export class SessionSummaryRequestDto {
   @IsOptional()
   @IsString()
   appId?: string;
+
+  @ApiPropertyOptional({ type: [SummaryMessageDto] })
+  @IsOptional()
+  @ValidateNested({ each: true })
+  @Type(() => SummaryMessageDto)
+  messages?: SummaryMessageDto[];
+}
+
+export class SessionChatRequestDto {
+  @ApiProperty({ type: [SummaryMessageDto] })
+  @ValidateNested({ each: true })
+  @Type(() => SummaryMessageDto)
+  messages!: SummaryMessageDto[];
 }
 
 export class SessionSummaryResponseDto {
@@ -228,6 +256,41 @@ export class SessionSummaryResponseDto {
       promptTokens: 1200,
       completionTokens: 450,
       totalTokens: 1650,
+    },
+  })
+  usage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
+}
+
+export class SessionChatResponseDto {
+  @ApiProperty({
+    example: 'Requests to /api/checkout began failing after the DB migration…',
+  })
+  reply!: string;
+
+  @ApiProperty({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      actions: 3,
+      requests: 5,
+      dbChanges: 2,
+      emails: 1,
+      traces: 4,
+    },
+  })
+  counts!: Record<string, number>;
+
+  @ApiPropertyOptional({
+    type: 'object',
+    additionalProperties: { type: 'number' },
+    example: {
+      promptTokens: 800,
+      completionTokens: 220,
+      totalTokens: 1020,
     },
   })
   usage?: {

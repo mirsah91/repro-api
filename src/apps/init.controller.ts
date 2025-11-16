@@ -34,9 +34,7 @@ export class InitController {
 
   @ApiOkResponse({ type: AppUserLoginResponseDto })
   @Post('login')
-  async login(
-    @Body() body: AppUserLoginDto,
-  ): Promise<AppUserLoginResponseDto> {
+  async login(@Body() body: AppUserLoginDto): Promise<AppUserLoginResponseDto> {
     const { user, app } = await this.users.loginWithoutTenant(
       body.email,
       body.password,
@@ -51,6 +49,7 @@ export class InitController {
   ): Promise<SessionSummaryResponseDto> {
     return this.summaries.summarizeSession(body.sessionId, {
       appId: body.appId,
+      hintMessages: body.messages ?? [],
     });
   }
 }

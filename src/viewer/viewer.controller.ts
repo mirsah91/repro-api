@@ -1,4 +1,11 @@
-import { ApiBearerAuth, ApiHeader, ApiOkResponse, ApiParam, ApiSecurity, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiHeader,
+  ApiOkResponse,
+  ApiParam,
+  ApiSecurity,
+  ApiTags,
+} from '@nestjs/swagger';
 import {
   ActionDetailsRespDto,
   SummaryRespDto,

@@ -34,7 +34,11 @@ function writeEncryptedLog(level: string, payload: Record<string, any>) {
   }
 }
 
-function formatConsole(level: string, context: string | undefined, message: string) {
+function formatConsole(
+  level: string,
+  context: string | undefined,
+  message: string,
+) {
   const prefix = context ? `[${context}] ` : '';
   return `${new Date().toISOString()} ${level.toUpperCase()}: ${prefix}${message}`;
 }

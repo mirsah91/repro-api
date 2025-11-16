@@ -16,6 +16,17 @@ import {
   hydrateEmailDoc,
   hydrateRequestDoc,
 } from './utils/session-data-crypto';
+import { TraceEmbeddingService } from './trace-embedding.service';
+
+type CodeRefEntry = {
+  file: string;
+  line?: number;
+  fn?: string;
+  argsPreview?: string;
+  resultPreview?: string;
+  durationMs?: number;
+  metadata?: Record<string, any> | null;
+};
 
 @Injectable()
 export class SessionsService {
@@ -28,6 +39,7 @@ export class SessionsService {
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     private readonly tenant: TenantContext,
+    private readonly traceEmbeddings: TraceEmbeddingService,
   ) {}
 
   private ensureTraceIndexPromise?: Promise<void>;
@@ -70,6 +82,293 @@ export class SessionsService {
     }
 
     return this.ensureTraceIndexPromise;
+  }
+
+  private previewCodeRefValue(value: any, maxLength = 400): string | undefined {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    let text: string;
+    if (typeof value === 'string') {
+      text = value;
+    } else {
+      try {
+        text = JSON.stringify(value);
+      } catch {
+        text = String(value);
+      }
+    }
+    const trimmed = text.trim();
+    if (!trimmed.length) {
+      return undefined;
+    }
+    if (trimmed.length <= maxLength) {
+      return trimmed;
+    }
+    return `${trimmed.slice(0, Math.max(0, maxLength - 3))}...`;
+  }
+
+  private extractCodeRefArgsPreview(event: any): string | undefined {
+    const candidate =
+      event?.args ??
+      event?.body ??
+      event?.input ??
+      event?.payload ??
+      event?.params ??
+      event?.meta?.args;
+    return this.previewCodeRefValue(candidate);
+  }
+
+  private extractCodeRefResultPreview(event: any): string | undefined {
+    const candidate =
+      event?.result ??
+      event?.response ??
+      event?.output ??
+      event?.return ??
+      event?.meta?.result;
+    return this.previewCodeRefValue(candidate);
+  }
+
+  private extractCodeRefDuration(event: any): number | undefined {
+    const duration =
+      event?.durMs ??
+      event?.durationMs ??
+      event?.dur ??
+      event?.duration ??
+      event?.elapsed ??
+      event?.meta?.durMs;
+    const value = Number(duration);
+    if (Number.isFinite(value)) {
+      return Math.max(0, Math.round(value));
+    }
+    return undefined;
+  }
+
+  private extractCodeRefMetadata(event: any): Record<string, any> | undefined {
+    if (!event || typeof event !== 'object') {
+      return undefined;
+    }
+    const metadata: Record<string, any> = {};
+    const message = this.previewCodeRefValue(event.message ?? event.msg, 200);
+    if (message) {
+      metadata.message = message;
+    }
+    const status = event.status ?? event.statusCode ?? event.httpStatus;
+    if (status !== undefined && status !== null) {
+      metadata.status = status;
+    }
+    const collection = event.collection ?? event.table ?? event.model;
+    if (collection) {
+      metadata.collection = collection;
+    }
+    const operation = event.operation ?? event.op ?? event.method;
+    if (operation) {
+      metadata.operation = operation;
+    }
+    const url = event.url ?? event.path ?? event.route;
+    if (url) {
+      metadata.url = url;
+    }
+    return Object.keys(metadata).length ? metadata : undefined;
+  }
+
+  private collectCodeRefsFromTraceEvents(events: any[]): CodeRefEntry[] {
+    if (!Array.isArray(events) || !events.length) {
+      return [];
+    }
+    const seen = new Set<string>();
+    const refs: CodeRefEntry[] = [];
+    for (const event of events) {
+      const file =
+        typeof event?.file === 'string'
+          ? event.file.trim().replace(/\\/g, '/')
+          : null;
+      if (!file?.length) {
+        continue;
+      }
+      const line =
+        typeof event?.line === 'number' && Number.isFinite(event.line)
+          ? Math.floor(event.line)
+          : undefined;
+      const fn =
+        typeof event?.fn === 'string' && event.fn.trim().length
+          ? event.fn.trim()
+          : undefined;
+      const key = `${file}|${line ?? 'na'}|${fn ?? ''}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      refs.push({
+        file,
+        line,
+        fn,
+        argsPreview: this.extractCodeRefArgsPreview(event),
+        resultPreview: this.extractCodeRefResultPreview(event),
+        durationMs: this.extractCodeRefDuration(event),
+        metadata: this.extractCodeRefMetadata(event) ?? null,
+      });
+      if (refs.length >= 50) {
+        break;
+      }
+    }
+    return refs;
+  }
+
+  private async appendRequestCodeRefs(
+    sessionId: string,
+    requestRid: string,
+    refs: CodeRefEntry[],
+  ): Promise<void> {
+    if (!refs.length || !requestRid) {
+      return;
+    }
+    const normalized = refs.map((ref) => ({
+      file: ref.file,
+      line: typeof ref.line === 'number' ? ref.line : null,
+      fn: ref.fn ?? null,
+      argsPreview: ref.argsPreview ?? null,
+      resultPreview: ref.resultPreview ?? null,
+      durationMs:
+        typeof ref.durationMs === 'number' && Number.isFinite(ref.durationMs)
+          ? ref.durationMs
+          : null,
+      metadata: ref.metadata ?? null,
+    }));
+    await this.requests
+      .updateOne(this.tenantFilter({ sessionId, rid: requestRid }), {
+        $addToSet: {
+          codeRefs: {
+            $each: normalized,
+          },
+        },
+      })
+      .exec()
+      .catch(() => undefined);
+  }
+
+  private normalizeIncomingCodeRefs(value: any): CodeRefEntry[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const refs: CodeRefEntry[] = [];
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object') continue;
+      const file =
+        typeof entry.file === 'string' && entry.file.trim().length
+          ? entry.file.trim()
+          : null;
+      if (!file) continue;
+      const line =
+        typeof entry.line === 'number' && Number.isFinite(entry.line)
+          ? Math.floor(entry.line)
+          : undefined;
+      const fn =
+        typeof entry.fn === 'string' && entry.fn.trim().length
+          ? entry.fn.trim()
+          : undefined;
+      const argsPreview =
+        typeof entry.argsPreview === 'string'
+          ? entry.argsPreview
+          : this.previewCodeRefValue(entry.argsPreview);
+      const resultPreview =
+        typeof entry.resultPreview === 'string'
+          ? entry.resultPreview
+          : this.previewCodeRefValue(entry.resultPreview);
+      const durationMs =
+        typeof entry.durationMs === 'number' &&
+        Number.isFinite(entry.durationMs)
+          ? Math.max(0, Math.round(entry.durationMs))
+          : undefined;
+      const metadata =
+        entry.metadata && typeof entry.metadata === 'object'
+          ? entry.metadata
+          : undefined;
+      refs.push({
+        file,
+        line,
+        fn,
+        argsPreview,
+        resultPreview,
+        durationMs,
+        metadata: metadata ?? null,
+      });
+      if (refs.length >= 100) {
+        break;
+      }
+    }
+    return refs;
+  }
+
+  private mergeCodeRefEntries(
+    primary: CodeRefEntry[],
+    secondary: CodeRefEntry[],
+    limit = 100,
+  ): CodeRefEntry[] {
+    const merged: CodeRefEntry[] = [];
+    const map = new Map<string, CodeRefEntry>();
+    const upsert = (ref: CodeRefEntry) => {
+      const key = `${ref.file}|${ref.line ?? 'na'}|${ref.fn ?? ''}`;
+      const existing = map.get(key);
+      if (!existing) {
+        const clone: CodeRefEntry = { ...ref };
+        map.set(key, clone);
+        merged.push(clone);
+        return;
+      }
+      existing.argsPreview = existing.argsPreview ?? ref.argsPreview;
+      existing.resultPreview = existing.resultPreview ?? ref.resultPreview;
+      existing.durationMs = existing.durationMs ?? ref.durationMs;
+      if (!existing.metadata && ref.metadata) {
+        existing.metadata = ref.metadata;
+      }
+      if (!existing.fn && ref.fn) {
+        existing.fn = ref.fn;
+      }
+      if (existing.line === undefined && ref.line !== undefined) {
+        existing.line = ref.line;
+      }
+    };
+    primary.forEach(upsert);
+    secondary.forEach(upsert);
+    return merged.slice(0, limit);
+  }
+
+  private normalizeEntryPoint(value: any):
+    | {
+        fn?: string | null;
+        file?: string | null;
+        line?: number | null;
+        functionType?: string | null;
+        _id?: any;
+      }
+    | undefined {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+    const fn =
+      typeof value.fn === 'string' && value.fn.trim().length
+        ? value.fn.trim()
+        : undefined;
+    const file =
+      typeof value.file === 'string' && value.file.trim().length
+        ? value.file.trim()
+        : undefined;
+    const line =
+      typeof value.line === 'number' && Number.isFinite(value.line)
+        ? Math.floor(value.line)
+        : undefined;
+    const functionType =
+      typeof value.functionType === 'string' && value.functionType.trim().length
+        ? value.functionType.trim()
+        : undefined;
+    const normalized: Record<string, any> = {};
+    if (fn) normalized.fn = fn;
+    if (file) normalized.file = file;
+    if (line !== undefined) normalized.line = line;
+    if (functionType) normalized.functionType = functionType;
+    if (value._id) normalized._id = value._id;
+    return Object.keys(normalized).length ? normalized : undefined;
   }
 
   async startSession(appId: string, clientTime?: number, appUser?: any) {
@@ -196,6 +495,11 @@ export class SessionsService {
           set.query = encryptField(ev.query ?? {});
         }
 
+        const normalizedEntryPoint = this.normalizeEntryPoint(ev.entryPoint);
+        if (normalizedEntryPoint) {
+          set.entryPoint = normalizedEntryPoint;
+        }
+
         await this.requests.updateOne(
           this.tenantFilter({ sessionId, rid: ev.rid }),
           { $set: set },
@@ -204,10 +508,9 @@ export class SessionsService {
 
         if (ev.aid) {
           await this.actions
-            .updateOne(
-              this.tenantFilter({ sessionId, actionId: ev.aid }),
-              { $set: { hasReq: true } },
-            )
+            .updateOne(this.tenantFilter({ sessionId, actionId: ev.aid }), {
+              $set: { hasReq: true },
+            })
             .exec();
         }
       }
@@ -228,7 +531,9 @@ export class SessionsService {
       return str.length ? str : null;
     };
 
-    const getActionBaseTime = async (actionId: string): Promise<number | null> => {
+    const getActionBaseTime = async (
+      actionId: string,
+    ): Promise<number | null> => {
       if (actionTimeCache.has(actionId)) {
         return actionTimeCache.get(actionId)!;
       }
@@ -246,7 +551,10 @@ export class SessionsService {
         .filter((v): v is number => Number.isFinite(v));
 
       const base = candidates.length
-        ? candidates.reduce((max, cur) => (cur > max ? cur : max), candidates[0])
+        ? candidates.reduce(
+            (max, cur) => (cur > max ? cur : max),
+            candidates[0],
+          )
         : null;
 
       actionTimeCache.set(actionId, base);
@@ -367,6 +675,13 @@ export class SessionsService {
             set.query = encryptField(req.query ?? {});
           }
 
+          const normalizedEntryPoint = this.normalizeEntryPoint(
+            req.entryPoint ?? e.entryPoint,
+          );
+          if (normalizedEntryPoint) {
+            set.entryPoint = normalizedEntryPoint;
+          }
+
           const requestDoc = await this.requests.findOneAndUpdate(
             this.tenantFilter({ sessionId, rid: resolvedRid }),
             { $set: set },
@@ -397,10 +712,45 @@ export class SessionsService {
           }
         }
 
+        if (e.trace) {
+          try {
+            const ridHint =
+              resolvedRid ??
+              e?.traceBatch?.rid ??
+              e?.requestRid ??
+              e?.rid ??
+              null;
+            const serialized =
+              typeof e.trace === 'string'
+                ? e.trace
+                : JSON.stringify(e.trace);
+            const preview =
+              typeof serialized === 'string'
+                ? serialized.slice(0, 2000)
+                : '[unserializable]';
+            console.log('[repro][ingest] trace payload received', {
+              sessionId,
+              rid: ridHint,
+              batchIndex: Number.isFinite(Number(e?.traceBatch?.index))
+                ? Number(e?.traceBatch?.index)
+                : null,
+              previewLength: preview.length,
+              preview,
+            });
+          } catch {
+            console.log(
+              '[repro][ingest] trace payload received (unable to serialize preview)',
+            );
+          }
+        }
+
         // ---- TRACE BATCH ----
         if (e.trace && e.traceBatch) {
           const batchRid = e.traceBatch?.rid ?? resolvedRid;
           if (batchRid) {
+            const eventsForSummaries = this.normalizeTraceEventsForSummary(
+              e.trace,
+            );
             let tracePayload: any = e.trace;
             if (typeof tracePayload !== 'string') {
               try {
@@ -416,12 +766,21 @@ export class SessionsService {
             const hasTotal = Number.isFinite(totalValue);
 
             const existingRequest = await this.requests
-              .findOne(
-                this.tenantFilter({ sessionId, rid: batchRid }),
-                { _id: 1 },
-              )
+              .findOne(this.tenantFilter({ sessionId, rid: batchRid }), {
+                _id: 1,
+              })
               .lean()
               .exec();
+
+            const eventCodeRefs =
+              this.collectCodeRefsFromTraceEvents(eventsForSummaries);
+            const suppliedCodeRefs = this.normalizeIncomingCodeRefs(
+              e.traceBatch.codeRefs,
+            );
+            const combinedRefs = this.mergeCodeRefEntries(
+              eventCodeRefs,
+              suppliedCodeRefs,
+            );
 
             const setPayload: Record<string, any> = {
               tenantId: this.tenant.tenantId,
@@ -432,6 +791,9 @@ export class SessionsService {
                 ? { events: tracePayload, total: totalValue }
                 : tracePayload,
             };
+            if (combinedRefs.length) {
+              setPayload.codeRefs = combinedRefs;
+            }
 
             if (existingRequest?._id) {
               setPayload.request = existingRequest._id;
@@ -467,6 +829,34 @@ export class SessionsService {
               } else {
                 throw err;
               }
+            }
+
+            if (eventsForSummaries.length) {
+              try {
+                await this.traceEmbeddings.processTraceBatch({
+                  tenantId: this.tenant.tenantId,
+                  sessionId,
+                  requestRid: batchRid,
+                  actionId: normalizedActionId ?? null,
+                  traceId: null,
+                  batchIndex,
+                  totalBatches: hasTotal ? totalValue : null,
+                  events: eventsForSummaries,
+                });
+              } catch (traceErr) {
+                console.warn(
+                  'trace summary pipeline failed',
+                  (traceErr as Error)?.message ?? traceErr,
+                );
+              }
+            }
+
+            if (combinedRefs.length) {
+              await this.appendRequestCodeRefs(
+                sessionId,
+                batchRid,
+                combinedRefs,
+              );
             }
           }
         }
@@ -754,13 +1144,38 @@ export class SessionsService {
     if (!exists) throw new NotFoundException('Session not found');
   }
 
-  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+  private normalizeTraceEventsForSummary(raw: any): any[] {
+    if (!raw) {
+      return [];
+    }
+    if (Array.isArray(raw)) {
+      return raw;
+    }
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    if (typeof raw === 'object' && Array.isArray(raw.events)) {
+      return raw.events;
+    }
+    return [];
+  }
+
+  private tenantFilter<T extends Record<string, any>>(
+    criteria: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
   }
 
-  private tenantDoc<T extends Record<string, any>>(doc: T): T & {
+  private tenantDoc<T extends Record<string, any>>(
+    doc: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...doc, tenantId: this.tenant.tenantId };

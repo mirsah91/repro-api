@@ -1,13 +1,28 @@
 import {
   decryptJson,
   encryptJson,
+  isEncryptionDisabled,
 } from '../../common/security/encryption.util';
 
-export function encryptField(value: any): string | undefined {
+export function encryptField(value: any): any {
   if (typeof value === 'undefined') {
     return undefined;
   }
-  return encryptJson(value ?? null);
+  const normalized = value ?? null;
+  if (isEncryptionDisabled()) {
+    if (
+      normalized !== null &&
+      typeof normalized === 'object' &&
+      typeof normalized.toJSON === 'function'
+    ) {
+      return normalized.toJSON();
+    }
+    if (normalized !== null && typeof normalized === 'object') {
+      return JSON.parse(JSON.stringify(normalized));
+    }
+    return normalized;
+  }
+  return encryptJson(normalized);
 }
 
 export function decryptField<T = any>(payload: any): T | undefined {
@@ -43,11 +58,8 @@ export function hydrateRequestDoc(doc: any) {
       typeof doc.headers === 'undefined'
         ? undefined
         : (() => {
-            const decoded =
-              decryptField<Record<string, any>>(doc.headers);
-            return typeof decoded === 'undefined'
-              ? doc.headers
-              : decoded;
+            const decoded = decryptField<Record<string, any>>(doc.headers);
+            return typeof decoded === 'undefined' ? doc.headers : decoded;
           })(),
     body:
       typeof doc.body === 'undefined'
@@ -60,30 +72,22 @@ export function hydrateRequestDoc(doc: any) {
       typeof doc.params === 'undefined'
         ? undefined
         : (() => {
-            const decoded =
-              decryptField<Record<string, any>>(doc.params);
-            return typeof decoded === 'undefined'
-              ? doc.params
-              : decoded;
+            const decoded = decryptField<Record<string, any>>(doc.params);
+            return typeof decoded === 'undefined' ? doc.params : decoded;
           })(),
     query:
       typeof doc.query === 'undefined'
         ? undefined
         : (() => {
-            const decoded =
-              decryptField<Record<string, any>>(doc.query);
-            return typeof decoded === 'undefined'
-              ? doc.query
-              : decoded;
+            const decoded = decryptField<Record<string, any>>(doc.query);
+            return typeof decoded === 'undefined' ? doc.query : decoded;
           })(),
     respBody:
       typeof doc.respBody === 'undefined'
         ? undefined
         : (() => {
             const decoded = decryptField<any>(doc.respBody);
-            return typeof decoded === 'undefined'
-              ? doc.respBody
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.respBody : decoded;
           })(),
   };
 }
@@ -104,9 +108,7 @@ export function hydrateChangeDoc(doc: any) {
         ? undefined
         : (() => {
             const decoded = decryptField<any>(doc.before);
-            return typeof decoded === 'undefined'
-              ? doc.before
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.before : decoded;
           })(),
     after:
       typeof doc.after === 'undefined'
@@ -127,9 +129,7 @@ export function hydrateChangeDoc(doc: any) {
         ? undefined
         : (() => {
             const decoded = decryptField<any>(doc.resultMeta);
-            return typeof decoded === 'undefined'
-              ? doc.resultMeta
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.resultMeta : decoded;
           })(),
     error:
       typeof doc.error === 'undefined'
@@ -178,9 +178,7 @@ export function hydrateEmailDoc(doc: any) {
         ? undefined
         : (() => {
             const decoded = decryptField<string>(doc.subject);
-            return typeof decoded === 'undefined'
-              ? doc.subject
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.subject : decoded;
           })(),
     text:
       typeof doc.text === 'undefined'
@@ -201,9 +199,7 @@ export function hydrateEmailDoc(doc: any) {
         ? undefined
         : (() => {
             const decoded = decryptField<string | null>(doc.templateId);
-            return typeof decoded === 'undefined'
-              ? doc.templateId
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.templateId : decoded;
           })(),
     dynamicTemplateData:
       typeof doc.dynamicTemplateData === 'undefined'
@@ -221,9 +217,7 @@ export function hydrateEmailDoc(doc: any) {
         ? undefined
         : (() => {
             const decoded = decryptField<string[]>(doc.categories);
-            return typeof decoded === 'undefined'
-              ? doc.categories
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.categories : decoded;
           })(),
     customArgs:
       typeof doc.customArgs === 'undefined'
@@ -232,9 +226,7 @@ export function hydrateEmailDoc(doc: any) {
             const decoded = decryptField<Record<string, any> | null>(
               doc.customArgs,
             );
-            return typeof decoded === 'undefined'
-              ? doc.customArgs
-              : decoded;
+            return typeof decoded === 'undefined' ? doc.customArgs : decoded;
           })(),
     attachmentsMeta:
       typeof doc.attachmentsMeta === 'undefined'
@@ -249,11 +241,8 @@ export function hydrateEmailDoc(doc: any) {
       typeof doc.headers === 'undefined'
         ? undefined
         : (() => {
-            const decoded =
-              decryptField<Record<string, any>>(doc.headers);
-            return typeof decoded === 'undefined'
-              ? doc.headers
-              : decoded;
+            const decoded = decryptField<Record<string, any>>(doc.headers);
+            return typeof decoded === 'undefined' ? doc.headers : decoded;
           })(),
   };
 }

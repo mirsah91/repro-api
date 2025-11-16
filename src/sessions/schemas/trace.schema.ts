@@ -21,6 +21,29 @@ export class TraceEvt {
 
   @Prop({ type: SchemaTypes.Mixed })
   data?: any;
+
+  @Prop({
+    type: [
+      {
+        file: { type: String },
+        line: { type: Number },
+        fn: { type: String },
+        argsPreview: { type: String },
+        resultPreview: { type: String },
+        durationMs: { type: Number },
+        metadata: { type: SchemaTypes.Mixed },
+      },
+    ],
+  })
+  codeRefs?: Array<{
+    file?: string | null;
+    line?: number | null;
+    fn?: string | null;
+    argsPreview?: string | null;
+    resultPreview?: string | null;
+    durationMs?: number | null;
+    metadata?: Record<string, any> | null;
+  }>;
 }
 
 export type TraceEvtDocument = HydratedDocument<TraceEvt>;

@@ -6,6 +6,7 @@ import { AppsModule } from './apps/apps.module';
 import { SdkModule } from './sdk/sdk.module';
 import { SessionsModule } from './sessions/sessions.module';
 import { ViewerModule } from './viewer/viewer.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -56,6 +57,7 @@ import { ViewerModule } from './viewer/viewer.module';
     SdkModule,
     SessionsModule,
     ViewerModule,
+    ChatModule,
   ],
 })
 export class AppModule {}

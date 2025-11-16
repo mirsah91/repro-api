@@ -200,14 +200,8 @@ export class ViewerService {
         .find(this.tenantFilter({ sessionId }))
         .sort({ t: 1 })
         .lean(),
-      this.changes
-        .find(this.tenantFilter({ sessionId }))
-        .sort({ t: 1 })
-        .lean(),
-      this.emails
-        .find(this.tenantFilter({ sessionId }))
-        .sort({ t: 1 })
-        .lean(), // <-- new
+      this.changes.find(this.tenantFilter({ sessionId })).sort({ t: 1 }).lean(),
+      this.emails.find(this.tenantFilter({ sessionId })).sort({ t: 1 }).lean(), // <-- new
     ]);
     const reqs = reqDocs.map((doc) => hydrateRequestDoc(doc));
     const dbs = dbDocs.map((doc) => hydrateChangeDoc(doc));
@@ -367,7 +361,9 @@ export class ViewerService {
     if (!exists) throw new NotFoundException('Session not found');
   }
 
-  private tenantFilter<T extends Record<string, any>>(criteria: T): T & {
+  private tenantFilter<T extends Record<string, any>>(
+    criteria: T,
+  ): T & {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };

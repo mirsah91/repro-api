@@ -4,10 +4,7 @@ import { Model } from 'mongoose';
 import { App } from '../apps/schemas/app.schema';
 import { SdkToken } from './schemas/sdk-token.schema';
 import { randomUUID } from 'crypto';
-import {
-  encryptString,
-  hashSecret,
-} from '../common/security/encryption.util';
+import { encryptString, hashSecret } from '../common/security/encryption.util';
 import { TenantContext } from '../common/tenant/tenant-context';
 
 @Injectable()
@@ -18,7 +15,11 @@ export class SdkService {
     private readonly tenant: TenantContext,
   ) {}
   async bootstrap(appId: string) {
-    console.log('data --->', { tenantId: this.tenant.tenantId, appId, enabled: true })
+    console.log('data --->', {
+      tenantId: this.tenant.tenantId,
+      appId,
+      enabled: true,
+    });
     const app = await this.appModel
       .findOne({ tenantId: this.tenant.tenantId, appId, enabled: true })
       .lean();

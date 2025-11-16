@@ -89,7 +89,7 @@ export class AppUserTokenGuard implements CanActivate {
     if (
       requiredRoles &&
       requiredRoles.length &&
-      !requiredRoles.includes(user.role as AppUserRole)
+      !requiredRoles.includes(user.role)
     ) {
       return false;
     }
@@ -108,7 +108,6 @@ export class AppUserTokenGuard implements CanActivate {
     }
     return secret;
   }
-
 }
 
 type AppUserJwtPayload = {
