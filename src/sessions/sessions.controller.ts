@@ -27,6 +27,7 @@ import {
 import {
   Body,
   Controller,
+  ForbiddenException,
   Get,
   Param,
   Post,
@@ -41,6 +42,7 @@ import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from '../apps/schemas/app-user.schema';
+import { computeChatQuota } from '../apps/app-user.constants';
 
 @ApiTags('sessions')
 @ApiHeader({
@@ -158,15 +160,37 @@ export class SessionsController {
     @Body() body: SessionChatRequestDto,
     @Req() req: any,
   ): Promise<SessionChatResponseDto> {
-    const result = await this.summaries.chatSession(sessionId, {
-      appId: req.appId,
-      messages: body?.messages ?? [],
-    });
-    return {
-      reply: result.reply,
-      counts: result.counts,
-      usage: result.usage,
-    };
+    if (!req?.appUser?.chatEnabled) {
+      throw new ForbiddenException(
+        'Chat assistant is disabled for this user. Contact an administrator to request access.',
+      );
+    }
+    const tenantId = req?.tenantId;
+    const userId = this.extractAppUserId(req?.appUser);
+    let reservedUser: any | null = null;
+    try {
+      reservedUser = await this.svc.reserveChatQuota(userId, tenantId);
+      if (!reservedUser) {
+        throw new ForbiddenException(
+          'You have reached the maximum number of chat prompts allowed for this workspace.',
+        );
+      }
+      const result = await this.summaries.chatSession(sessionId, {
+        appId: req.appId,
+        messages: body?.messages ?? [],
+      });
+      return {
+        reply: result.reply,
+        counts: result.counts,
+        usage: result.usage,
+        quota: computeChatQuota(reservedUser.chatUsageCount),
+      };
+    } catch (err) {
+      if (reservedUser) {
+        await this.svc.releaseChatQuota(userId, tenantId);
+      }
+      throw err;
+    }
   }
 
   @ApiBearerAuth('appUser')
@@ -198,5 +222,14 @@ export class SessionsController {
     @Req() req: any,
   ) {
     return this.svc.getChunk(sessionId, req.appId, seqStr);
+  }
+
+  private extractAppUserId(appUser: any): string | undefined {
+    if (!appUser) return undefined;
+    if (typeof appUser.id === 'string') return appUser.id;
+    if (typeof appUser._id === 'string') return appUser._id;
+    if (appUser._id?.toHexString) return appUser._id.toHexString();
+    if (appUser._id?.toString) return appUser._id.toString();
+    return undefined;
   }
 }

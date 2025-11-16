@@ -21,6 +21,7 @@ import {
   hashSecret,
 } from '../common/security/encryption.util';
 import { TenantContext } from '../common/tenant/tenant-context';
+import { computeChatQuota } from './app-user.constants';
 
 type StoredAppUser = {
   _id: AppUserDocument['_id'];
@@ -34,6 +35,8 @@ type StoredAppUser = {
   name?: string;
   createdAt?: Date;
   updatedAt?: Date;
+  chatEnabled: boolean;
+  chatUsageCount?: number;
 };
 
 export interface AppUserDtoShape {
@@ -48,6 +51,10 @@ export interface AppUserDtoShape {
   createdAt?: Date;
   updatedAt?: Date;
   accessToken?: string;
+  chatEnabled: boolean;
+  chatUsageCount?: number;
+  chatQuotaRemaining?: number;
+  chatQuotaLimit?: number;
 }
 
 export interface AppSummaryShape {
@@ -59,6 +66,10 @@ export interface AppSummaryShape {
   createdAt?: Date;
   updatedAt?: Date;
   appSecret?: string;
+  chatEnabled: boolean;
+  chatUsageCount: number;
+  chatQuotaRemaining: number;
+  chatQuotaLimit: number;
 }
 
 @Injectable()
@@ -87,6 +98,7 @@ export class AppUsersService {
       role?: AppUserRole;
       name?: string;
       enabled?: boolean;
+      chatEnabled?: boolean;
     },
   ): Promise<AppUserDtoShape> {
     const email = this.normalizeEmail(dto.email);
@@ -94,6 +106,7 @@ export class AppUsersService {
     const role = dto.role ?? AppUserRole.Viewer;
     const enabled = dto.enabled ?? true;
     const name = typeof dto.name === 'string' ? dto.name.trim() : undefined;
+    const chatEnabled = role === AppUserRole.Admin ? true : dto.chatEnabled ?? false;
 
     try {
       const created = await this.users.create({
@@ -105,6 +118,8 @@ export class AppUsersService {
         tokenEnc: encryptString(password),
         name,
         enabled,
+        chatEnabled,
+        chatUsageCount: 0,
       });
       return this.toDto(
         created.toObject() as unknown as StoredAppUser,
@@ -220,6 +235,8 @@ export class AppUsersService {
         createdAt?: Date;
         updatedAt?: Date;
         appSecretEnc?: string;
+        chatEnabled?: boolean;
+        chatUsageCount?: number;
       } | null>();
 
     const app = appDoc
@@ -231,7 +248,12 @@ export class AppUsersService {
   async updateProfile(
     appId: string,
     userId: string,
-    dto: { email?: string; name?: string | null },
+    dto: {
+      email?: string;
+      name?: string | null;
+      chatEnabled?: boolean;
+      resetChatUsage?: boolean;
+    },
   ): Promise<AppUserDtoShape> {
     const doc = await this.users.findOne(
       this.withTenantFilter({ appId, _id: userId }),
@@ -246,6 +268,21 @@ export class AppUsersService {
       const trimmed =
         typeof dto.name === 'string' ? dto.name.trim() : undefined;
       doc.name = trimmed ?? undefined;
+    }
+    const isAdmin = doc.role === AppUserRole.Admin;
+    if (isAdmin) {
+      doc.chatEnabled = true;
+      doc.chatUsageCount = 0;
+    } else {
+      if (typeof dto.chatEnabled !== 'undefined') {
+        if (dto.chatEnabled && !doc.chatEnabled) {
+          doc.chatUsageCount = 0;
+        }
+        doc.chatEnabled = dto.chatEnabled;
+      }
+      if (dto.resetChatUsage) {
+        doc.chatUsageCount = 0;
+      }
     }
 
     try {
@@ -269,6 +306,8 @@ export class AppUsersService {
       name?: string | null;
       enabled?: boolean;
       resetPassword?: boolean;
+      chatEnabled?: boolean;
+      resetChatUsage?: boolean;
     },
   ): Promise<AppUserDtoShape> {
     const doc = await this.users.findOne(
@@ -277,11 +316,27 @@ export class AppUsersService {
     if (!doc) throw new NotFoundException('User not found');
 
     if (typeof dto.role !== 'undefined') doc.role = dto.role;
+    const isAdmin = doc.role === AppUserRole.Admin;
     if (typeof dto.enabled !== 'undefined') doc.enabled = dto.enabled;
     if (typeof dto.name !== 'undefined') {
       const trimmed =
         typeof dto.name === 'string' ? dto.name.trim() : undefined;
       doc.name = trimmed ?? undefined;
+    }
+
+    if (isAdmin) {
+      doc.chatEnabled = true;
+      doc.chatUsageCount = 0;
+    } else {
+      if (typeof dto.chatEnabled !== 'undefined') {
+        if (dto.chatEnabled && !doc.chatEnabled) {
+          doc.chatUsageCount = 0;
+        }
+        doc.chatEnabled = dto.chatEnabled;
+      }
+      if (dto.resetChatUsage) {
+        doc.chatUsageCount = 0;
+      }
     }
 
     if (dto.resetPassword) {
@@ -303,11 +358,25 @@ export class AppUsersService {
     return this.toDto(doc.toObject() as unknown as StoredAppUser);
   }
 
-  async remove(appId: string, userId: string): Promise<{ deleted: boolean }> {
-    const res = await this.users.deleteOne(
+  async remove(
+    appId: string,
+    userId: string,
+    actorUserId?: string,
+  ): Promise<{ deleted: boolean }> {
+    const doc = await this.users.findOne(
       this.withTenantFilter({ appId, _id: userId }),
     );
-    if (!res.deletedCount) throw new NotFoundException('User not found');
+    if (!doc) {
+      throw new NotFoundException('User not found');
+    }
+    if (
+      actorUserId &&
+      String(doc._id) === actorUserId &&
+      doc.role === AppUserRole.Admin
+    ) {
+      throw new ConflictException('Admins cannot delete themselves.');
+    }
+    await doc.deleteOne();
     return { deleted: true };
   }
 
@@ -316,10 +385,8 @@ export class AppUsersService {
     passwordOverride?: string,
   ): AppUserDtoShape {
     const password =
-      passwordOverride ??
-      (typeof doc.tokenEnc === 'string'
-        ? safeDecrypt(doc.tokenEnc)
-        : undefined);
+      typeof passwordOverride === 'string' ? passwordOverride : undefined;
+    const quota = computeChatQuota(doc.chatUsageCount);
     return {
       id: String(doc._id),
       tenantId: doc.tenantId,
@@ -331,6 +398,10 @@ export class AppUsersService {
       name: doc.name ?? undefined,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
+      chatEnabled: !!doc.chatEnabled,
+      chatUsageCount: quota.used,
+      chatQuotaRemaining: quota.remaining,
+      chatQuotaLimit: quota.limit,
     };
   }
 
@@ -405,9 +476,16 @@ export class AppUsersService {
       createdAt?: Date;
       updatedAt?: Date;
       appSecretEnc?: string;
+      chatEnabled?: boolean;
+      chatUsageCount?: number;
     },
     includeSecret: boolean,
   ): AppSummaryShape {
+    const usage =
+      typeof doc.chatUsageCount === 'number' && Number.isFinite(doc.chatUsageCount)
+        ? Math.max(0, Math.floor(doc.chatUsageCount))
+        : 0;
+    const chat = computeChatQuota(usage);
     const base: AppSummaryShape = {
       tenantId: doc.tenantId,
       appId: doc.appId,
@@ -416,6 +494,10 @@ export class AppUsersService {
       adminEmail: doc.adminEmail,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
+      chatEnabled: doc.chatEnabled ?? false,
+      chatUsageCount: usage,
+      chatQuotaRemaining: chat.remaining,
+      chatQuotaLimit: chat.limit,
     };
     if (includeSecret) {
       return {
@@ -427,11 +509,16 @@ export class AppUsersService {
   }
 
   private toFallbackApp(appId: string): AppSummaryShape {
+    const chat = computeChatQuota(0);
     return {
       tenantId: this.tenant.tenantId,
       appId,
       name: appId,
       enabled: true,
+      chatEnabled: false,
+      chatUsageCount: 0,
+      chatQuotaRemaining: chat.remaining,
+      chatQuotaLimit: chat.limit,
     };
   }
 

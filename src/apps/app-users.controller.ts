@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Req,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -86,8 +87,17 @@ export class AppUsersController {
   @AppUserRoles(AppUserRole.Admin)
   @ApiOkResponse({ schema: { example: { deleted: true } } })
   @Delete(':userId')
-  remove(@Param('appId') appId: string, @Param('userId') userId: string) {
-    return this.users.remove(appId, userId);
+  remove(
+    @Param('appId') appId: string,
+    @Param('userId') userId: string,
+    @Req() req: any,
+  ) {
+    const actorId =
+      req?.appUser?._id?.toString?.() ??
+      req?.appUser?.id ??
+      req?.appUser?._id ??
+      undefined;
+    return this.users.remove(appId, userId, actorId);
   }
 
   @ApiParam({ name: 'appId' })

@@ -63,6 +63,18 @@ export class AppDto {
 
   @ApiPropertyOptional({ example: '2024-03-16T15:30:00.000Z' })
   updatedAt?: Date;
+
+  @ApiProperty({ example: false })
+  chatEnabled!: boolean;
+
+  @ApiPropertyOptional({ example: 3 })
+  chatUsageCount?: number;
+
+  @ApiPropertyOptional({ example: 7 })
+  chatQuotaRemaining?: number;
+
+  @ApiPropertyOptional({ example: 10 })
+  chatQuotaLimit?: number;
 }
 
 export class AppDetailDto extends AppDto {
@@ -132,6 +144,12 @@ export class CreateAppUserDto {
 
   @ApiPropertyOptional({ example: true })
   enabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: false,
+    description: 'Grant access to the AI chat assistant (default disabled).',
+  })
+  chatEnabled?: boolean;
 }
 
 export class UpdateAppUserDto {
@@ -150,6 +168,18 @@ export class UpdateAppUserDto {
       'Reset the user password and return the new value in the response.',
   })
   resetPassword?: boolean;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Enable or disable access to the AI chat assistant.',
+  })
+  chatEnabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Set to true to reset the chat usage counter for the user.',
+  })
+  resetChatUsage?: boolean;
 }
 
 export class AppKeysDto extends AppDetailDto {
@@ -297,5 +327,19 @@ export class SessionChatResponseDto {
     promptTokens?: number;
     completionTokens?: number;
     totalTokens?: number;
+  };
+
+  @ApiPropertyOptional({
+    description: 'Quota metadata describing the remaining chat prompts for the user.',
+    example: {
+      limit: 10,
+      used: 3,
+      remaining: 7,
+    },
+  })
+  quota?: {
+    limit: number;
+    used: number;
+    remaining: number;
   };
 }

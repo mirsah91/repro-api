@@ -128,3 +128,105 @@ export class FinishSessionDto {
 export class FinishSessionRespDto {
   @ApiProperty({ example: 'https://repro.app/s/S_...' }) viewerUrl!: string;
 }
+
+export class AppSessionDto {
+  @ApiProperty({ example: 'S_8b6e...' })
+  sessionId!: string;
+
+  @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  appId!: string;
+
+  @ApiPropertyOptional({ example: '2024-03-20T15:30:00.000Z' })
+  startedAt?: Date;
+
+  @ApiPropertyOptional({ example: '2024-03-20T15:42:00.000Z' })
+  finishedAt?: Date;
+
+  @ApiPropertyOptional({ example: 'Login form froze on submit' })
+  notes?: string;
+
+  @ApiPropertyOptional({ example: 'qa@example.com' })
+  userEmail?: string;
+
+  @ApiPropertyOptional({ example: '65f8e63c8a7a2c1d9c5e4f12' })
+  userId?: string;
+
+  @ApiPropertyOptional({
+    type: Object,
+    additionalProperties: true,
+    example: { browser: 'Chrome 123', os: 'macOS' },
+  })
+  env?: Record<string, any>;
+
+  @ApiPropertyOptional({ example: '2024-03-20T15:30:05.000Z' })
+  createdAt?: Date;
+
+  @ApiPropertyOptional({ example: '2024-03-20T15:45:00.000Z' })
+  updatedAt?: Date;
+}
+
+export class SessionListResponseDto {
+  @ApiProperty({ type: [AppSessionDto] })
+  items!: AppSessionDto[];
+
+  @ApiPropertyOptional({
+    description:
+      'Opaque cursor to request the next page (ISO timestamp of the last session).',
+    example: '2024-03-19T10:02:00.000Z',
+  })
+  nextCursor?: string;
+}
+
+export class CreateAppSessionDto {
+  @ApiPropertyOptional({ example: 'Sign up form stuck on loader' })
+  notes?: string;
+
+  @ApiPropertyOptional({ example: 'qa@example.com' })
+  userEmail?: string;
+
+  @ApiPropertyOptional({
+    example: '2024-03-20T15:30:00.000Z',
+    description: 'Override the start timestamp (defaults to now).',
+  })
+  startedAt?: string;
+
+  @ApiPropertyOptional({
+    example: '2024-03-20T15:42:00.000Z',
+    description: 'Optional end timestamp for the session.',
+  })
+  finishedAt?: string;
+
+  @ApiPropertyOptional({
+    type: Object,
+    additionalProperties: true,
+    example: { browser: 'Chrome 123', viewport: '1440x900' },
+  })
+  env?: Record<string, any>;
+}
+
+export class UpdateAppSessionDto {
+  @ApiPropertyOptional({ example: 'Updated notes about the bug' })
+  notes?: string | null;
+
+  @ApiPropertyOptional({ example: 'qa@example.com' })
+  userEmail?: string | null;
+
+  @ApiPropertyOptional({
+    example: '2024-03-20T15:30:00.000Z',
+    description: 'Override the start timestamp.',
+  })
+  startedAt?: string | null;
+
+  @ApiPropertyOptional({
+    example: '2024-03-20T15:42:00.000Z',
+    description: 'Mark the session as finished at this time.',
+  })
+  finishedAt?: string | null;
+
+  @ApiPropertyOptional({
+    type: Object,
+    additionalProperties: true,
+    example: { browser: 'Firefox 124' },
+  })
+  env?: Record<string, any> | null;
+}

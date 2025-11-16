@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { SessionsController } from './sessions.controller';
+import { AppSessionsController } from './app-sessions.controller';
 import { SessionsService } from './sessions.service';
 import { Session, SessionSchema } from './schemas/session.schema';
 import { Action, ActionSchema } from './schemas/action.schema';
@@ -47,7 +48,7 @@ import { SessionSummaryService } from './session-summary.service';
     ]),
     TenantModule,
   ],
-  controllers: [SessionsController],
+  controllers: [SessionsController, AppSessionsController],
   providers: [
     SessionsService,
     SdkTokenGuard,

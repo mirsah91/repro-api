@@ -18,6 +18,7 @@ import {
   hashSecret,
 } from '../common/security/encryption.util';
 import { TenantContext } from '../common/tenant/tenant-context';
+import { computeChatQuota } from './app-user.constants';
 
 @Injectable()
 export class AppsService {
@@ -48,6 +49,8 @@ export class AppsService {
       name: normalizedName ?? appId,
       enabled: true,
       adminEmail: normalizedEmail,
+      chatEnabled: true,
+      chatUsageCount: 0,
     });
 
     const candidatePassword =
@@ -70,6 +73,8 @@ export class AppsService {
       tokenHash: hashSecret(adminSecret),
       tokenEnc: encryptString(adminSecret),
       enabled: true,
+      chatEnabled: true,
+      chatUsageCount: 0,
     });
 
     return {
@@ -79,6 +84,7 @@ export class AppsService {
       name: createdApp.name,
       enabled: createdApp.enabled,
       adminEmail: normalizedEmail,
+      ...this.buildChatFields(createdApp.toObject()),
       admin: this.toUserDto(adminUser.toObject(), adminSecret),
       encryptionKey: dataEncryptionKey,
     };
@@ -125,6 +131,7 @@ export class AppsService {
       adminEmail: doc.adminEmail,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
+      ...this.buildChatFields(doc),
     };
   }
 
@@ -139,6 +146,19 @@ export class AppsService {
         typeof doc.encryptionKeyEnc === 'string'
           ? safeDecrypt(doc.encryptionKeyEnc)
           : undefined,
+    };
+  }
+
+  private buildChatFields(source: { chatEnabled?: boolean; chatUsageCount?: number }) {
+    const usage = typeof source.chatUsageCount === 'number' && Number.isFinite(source.chatUsageCount)
+      ? Math.max(0, Math.floor(source.chatUsageCount))
+      : 0;
+    const quota = computeChatQuota(usage);
+    return {
+      chatEnabled: source.chatEnabled ?? false,
+      chatUsageCount: usage,
+      chatQuotaRemaining: quota.remaining,
+      chatQuotaLimit: quota.limit,
     };
   }
 
