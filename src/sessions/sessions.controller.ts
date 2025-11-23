@@ -25,6 +25,13 @@ import {
   SessionChatResponseDto,
 } from '../docs/dto/apps.dto';
 import {
+  ReindexSessionGraphResponseDto,
+  ReproAiGraphDto,
+  ReproAiHitDto,
+  ReproAiQueryDto,
+  ReproAiQueryResponseDto,
+} from '../docs/dto/repro-ai.dto';
+import {
   Body,
   Controller,
   ForbiddenException,
@@ -37,6 +44,7 @@ import {
 } from '@nestjs/common';
 import { SessionsService } from './sessions.service';
 import { SessionSummaryService } from './session-summary.service';
+import { SessionGraphService } from './session-graph.service';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
@@ -56,6 +64,7 @@ export class SessionsController {
   constructor(
     private svc: SessionsService,
     private summaries: SessionSummaryService,
+    private graphAi: SessionGraphService,
   ) {}
 
   @ApiSecurity('sdkToken')
@@ -191,6 +200,92 @@ export class SessionsController {
       }
       throw err;
     }
+  }
+
+  @ApiBearerAuth('appUser')
+  @ApiSecurity('appId')
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
+  @ApiOkResponse({ type: ReindexSessionGraphResponseDto })
+  @Post('sessions/:sessionId/ai/reindex')
+  async reindexSessionGraph(
+    @Param('sessionId') sessionId: string,
+    @Req() req: any,
+  ): Promise<ReindexSessionGraphResponseDto> {
+    if (!req?.appUser?.chatEnabled) {
+      throw new ForbiddenException(
+        'Chat assistant is disabled for this user. Contact an administrator to request access.',
+      );
+    }
+    const result = await this.graphAi.rebuildSessionGraph(sessionId, {
+      appId: req.appId,
+    });
+    return {
+      sessionId: result.sessionId,
+      nodes: result.counts.nodes,
+      edges: result.counts.edges,
+      facts: result.counts.facts,
+    };
+  }
+
+  @ApiBearerAuth('appUser')
+  @ApiSecurity('appId')
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
+  @ApiBody({ type: ReproAiQueryDto })
+  @ApiOkResponse({ type: ReproAiQueryResponseDto })
+  @Post('sessions/:sessionId/ai/query')
+  async querySessionGraph(
+    @Param('sessionId') sessionId: string,
+    @Body() body: ReproAiQueryDto,
+    @Req() req: any,
+  ): Promise<ReproAiQueryResponseDto> {
+    if (!req?.appUser?.chatEnabled) {
+      throw new ForbiddenException(
+        'Chat assistant is disabled for this user. Contact an administrator to request access.',
+      );
+    }
+    const result = await this.graphAi.answerQuestion({
+      sessionId,
+      appId: req.appId,
+      question: body?.question ?? '',
+      nodeTypes: body?.nodeTypes,
+      capabilityTags: body?.capabilityTags,
+      limit: body?.limit,
+      rebuildIndex: body?.rebuildIndex,
+    });
+
+    const hits: ReproAiHitDto[] = result.hits.map((hit) => ({
+      nodeId: hit.fact.nodeId,
+      nodeType: hit.fact.nodeType,
+      title:
+        hit.node?.title ??
+        hit.fact.structured?.['functionName'] ??
+        hit.fact.structured?.['url'],
+      capabilityTags: hit.fact.capabilityTags ?? [],
+      score: Number(hit.score ?? 0),
+    }));
+    const graph: ReproAiGraphDto = {
+      nodes: result.graph.nodes.map((node) => ({
+        nodeId: node._id,
+        nodeType: node.type,
+        title: node.title,
+        capabilityTags: node.capabilityTags ?? [],
+      })),
+      edges: result.graph.edges.map((edge) => ({
+        fromNodeId: edge.fromNodeId,
+        toNodeId: edge.toNodeId,
+        relation: edge.relation,
+      })),
+    };
+
+    return {
+      sessionId: result.sessionId,
+      question: result.question,
+      answer: result.answer,
+      hits,
+      graph,
+    };
   }
 
   @ApiBearerAuth('appUser')

@@ -22,12 +22,22 @@ import {
   SessionChatMessage,
   SessionChatMessageSchema,
 } from './schemas/session-chat.schema';
+import {
+  SessionGraphNode,
+  SessionGraphNodeSchema,
+} from './schemas/session-graph-node.schema';
+import {
+  SessionGraphEdge,
+  SessionGraphEdgeSchema,
+} from './schemas/session-graph-edge.schema';
+import { SessionFact, SessionFactSchema } from './schemas/session-fact.schema';
 import { SdkTokenGuard } from '../common/guards/sdk-token.guard';
 import { AppSecretGuard } from '../common/guards/app-secret.guard';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 import { TenantModule } from '../common/tenant/tenant.module';
 import { TraceEmbeddingService } from './trace-embedding.service';
 import { SessionSummaryService } from './session-summary.service';
+import { SessionGraphService } from './session-graph.service';
 
 @Module({
   imports: [
@@ -45,6 +55,9 @@ import { SessionSummaryService } from './session-summary.service';
       { name: TraceNode.name, schema: TraceNodeSchema },
       { name: AppUser.name, schema: AppUserSchema },
       { name: SessionChatMessage.name, schema: SessionChatMessageSchema },
+      { name: SessionGraphNode.name, schema: SessionGraphNodeSchema },
+      { name: SessionGraphEdge.name, schema: SessionGraphEdgeSchema },
+      { name: SessionFact.name, schema: SessionFactSchema },
     ]),
     TenantModule,
   ],
@@ -56,6 +69,7 @@ import { SessionSummaryService } from './session-summary.service';
     AppUserTokenGuard,
     TraceEmbeddingService,
     SessionSummaryService,
+    SessionGraphService,
   ],
   exports: [MongooseModule],
 })
