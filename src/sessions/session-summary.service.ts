@@ -60,6 +60,7 @@ const CHAT_MAX_CONTEXT_TOKENS = 128000;
 const CHAT_CONTEXT_SECTION_LIMIT = 3;
 const CONTEXT_COLLECTION_ENTRY_LIMIT = 5;
 const PAST_ANSWER_CHAR_LIMIT = 2000;
+const CHAT_PERSISTED_HISTORY_LIMIT = 30;
 const CHAT_SYSTEM_PROMPT = [
   'You are the on-call engineer answering questions about a single debugging session.',
   'Context will only contain data from the actions, requests, traces, and changes collections—never cite other sources or invent events.',
@@ -415,7 +416,20 @@ export class SessionSummaryService {
     const model =
       this.config.get<string>('OPENAI_MODEL')?.trim() || 'gpt-4o-mini';
 
-    const conversation = this.normalizeHintMessages(opts?.messages);
+    let conversation = this.normalizeHintMessages(opts?.messages);
+    if (
+      !conversation.length ||
+      !conversation.some((msg) => msg.role === 'assistant')
+    ) {
+      const storedHistory = await this.loadPersistedChatHistory(
+        sessionId,
+        opts?.appId,
+        CHAT_PERSISTED_HISTORY_LIMIT,
+      );
+      if (storedHistory.length) {
+        conversation = [...storedHistory, ...conversation];
+      }
+    }
     const { history, latestUser } =
       this.splitConversationForPrompt(conversation);
     const questionText =
@@ -1242,7 +1256,8 @@ export class SessionSummaryService {
           undefined,
         );
         collections.traces = traceDocs;
-        forwardSeed.childFunctions = this.collectTraceChildFunctions(
+        forwardSeed.childFunctions = await this.collectTraceChildFunctions(
+          sessionId,
           traceDocs,
           fnSet,
         );
@@ -2180,17 +2195,214 @@ export class SessionSummaryService {
     return trimmed.map((doc) => this.sanitize(doc));
   }
 
-  private collectTraceChildFunctions(
+  private async collectTraceChildFunctions(
+    sessionId: string,
     traces: any[],
     entryFnSet: Set<string>,
-  ): Array<{ fn: string; file?: string; line?: number }> {
+  ): Promise<Array<{ fn: string; file?: string; line?: number }>> {
+    const limit = 5;
     if (!traces?.length) {
       return [];
     }
+    if (!entryFnSet?.size) {
+      return this.collectChildFunctionsFromEventsFallback(
+        traces,
+        new Set<string>(),
+        new Set<string>(),
+        limit,
+      );
+    }
+    const parentFns = Array.from(entryFnSet)
+      .map((fn) => fn?.trim())
+      .filter(Boolean);
+    if (!parentFns.length) {
+      return [];
+    }
     const normalizedEntryFns = new Set(
-      Array.from(entryFnSet).map((fn) => this.normalizeFunctionName(fn)),
+      parentFns.map((fn) => this.normalizeFunctionName(fn)),
+    );
+    const fnRegexes = parentFns.map(
+      (fn) => new RegExp(`^${this.escapeRegex(fn)}$`, 'i'),
+    );
+    const requestRids = Array.from(
+      new Set(
+        traces
+          .map((trace) =>
+            typeof trace?.requestRid === 'string' ? trace.requestRid : null,
+          )
+          .filter((rid): rid is string => Boolean(rid)),
+      ),
     );
     const suggestions: Array<{ fn: string; file?: string; line?: number }> = [];
+    const suggestionKeys = new Set<string>();
+    if (!requestRids.length) {
+      return this.collectChildFunctionsFromEventsFallback(
+        traces,
+        normalizedEntryFns,
+        suggestionKeys,
+        limit,
+      );
+    }
+
+    const fnFilter =
+      fnRegexes.length === 1 ? fnRegexes[0] : { $in: fnRegexes };
+    const ridFilter =
+      requestRids.length === 1 ? requestRids[0] : { $in: requestRids };
+    const parentNodes = await this.traceNodes
+      .find(
+        this.tenantFilter({
+          sessionId,
+          requestRid: ridFilter,
+          functionName: fnFilter,
+        }),
+      )
+      .lean()
+      .exec();
+
+    if (parentNodes?.length) {
+      const childIds = Array.from(
+        new Set(
+          parentNodes
+            .flatMap((node) => node.childChunkIds ?? [])
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
+      const childMap = childIds.length
+        ? await this.loadTraceNodeMap(sessionId, childIds)
+        : new Map<string, TraceNodeDetail>();
+
+      for (const parent of parentNodes) {
+        const sortedChildren = (parent.childChunkIds ?? [])
+          .map((chunkId, index) => ({
+            chunkId: chunkId ?? '',
+            index,
+            child: chunkId ? childMap.get(chunkId) : undefined,
+          }))
+          .filter(
+            (
+              entry,
+            ): entry is {
+              chunkId: string;
+              index: number;
+              child: TraceNodeDetail;
+            } => Boolean(entry.chunkId && entry.child),
+          )
+          .sort((a, b) => {
+            const fileA = (a.child.filePath ?? '').toLowerCase();
+            const fileB = (b.child.filePath ?? '').toLowerCase();
+            if (fileA && fileA === fileB) {
+              const lineA =
+                typeof a.child.lineNumber === 'number'
+                  ? a.child.lineNumber
+                  : Number.MAX_SAFE_INTEGER;
+              const lineB =
+                typeof b.child.lineNumber === 'number'
+                  ? b.child.lineNumber
+                  : Number.MAX_SAFE_INTEGER;
+              if (lineA !== lineB) {
+                return lineA - lineB;
+              }
+            }
+            return a.index - b.index;
+          });
+
+        for (const entry of sortedChildren) {
+          if (
+            this.tryPushChildSuggestion(
+              suggestions,
+              suggestionKeys,
+              normalizedEntryFns,
+              entry.child,
+            )
+          ) {
+            if (suggestions.length >= limit) {
+              return suggestions;
+            }
+          }
+        }
+        if (suggestions.length >= limit) {
+          break;
+        }
+      }
+      if (suggestions.length >= limit) {
+        return suggestions.slice(0, limit);
+      }
+    }
+
+    const fallback = this.collectChildFunctionsFromEventsFallback(
+      traces,
+      normalizedEntryFns,
+      suggestionKeys,
+      limit - suggestions.length,
+    );
+    return suggestions.concat(fallback).slice(0, limit);
+  }
+
+  private async loadTraceNodeMap(
+    sessionId: string,
+    chunkIds: string[],
+  ): Promise<Map<string, TraceNodeDetail>> {
+    if (!chunkIds.length) {
+      return new Map();
+    }
+    const docs = await this.traceNodes
+      .find(
+        this.tenantFilter({
+          sessionId,
+          chunkId: { $in: chunkIds },
+        }),
+      )
+      .lean()
+      .exec();
+    const map = new Map<string, TraceNodeDetail>();
+    for (const doc of docs ?? []) {
+      if (doc?.chunkId) {
+        map.set(doc.chunkId, doc as TraceNodeDetail);
+      }
+    }
+    return map;
+  }
+
+  private tryPushChildSuggestion(
+    bucket: Array<{ fn: string; file?: string; line?: number }>,
+    usedKeys: Set<string>,
+    normalizedEntryFns: Set<string>,
+    node: TraceNodeDetail,
+  ): boolean {
+    const fn = node?.functionName?.trim();
+    if (!fn) {
+      return false;
+    }
+    const normalized = this.normalizeFunctionName(fn);
+    if (normalized && normalizedEntryFns.has(normalized)) {
+      return false;
+    }
+    const file = node.filePath ?? undefined;
+    const line =
+      typeof node.lineNumber === 'number' ? node.lineNumber : undefined;
+    const key = [
+      normalized || fn.toLowerCase(),
+      file?.toLowerCase() ?? '',
+      typeof line === 'number' ? line : 'na',
+    ].join('|');
+    if (usedKeys.has(key)) {
+      return false;
+    }
+    usedKeys.add(key);
+    bucket.push({ fn, file, line });
+    return true;
+  }
+
+  private collectChildFunctionsFromEventsFallback(
+    traces: any[],
+    normalizedEntryFns: Set<string>,
+    usedKeys: Set<string>,
+    remaining: number,
+  ): Array<{ fn: string; file?: string; line?: number }> {
+    if (!traces?.length || remaining <= 0) {
+      return [];
+    }
+    const fallback: Array<{ fn: string; file?: string; line?: number }> = [];
     for (const trace of traces) {
       const events: Array<Record<string, any>> = Array.isArray(
         trace?.data?.events,
@@ -2206,27 +2418,30 @@ export class SessionSummaryService {
           continue;
         }
         const normalized = this.normalizeFunctionName(fn);
-        if (!normalized || normalizedEntryFns.has(normalized)) {
+        if (normalized && normalizedEntryFns.has(normalized)) {
           continue;
         }
-        if (
-          suggestions.some(
-            (item) => this.normalizeFunctionName(item.fn) === normalized,
-          )
-        ) {
+        const file = event?.file ?? undefined;
+        const line =
+          typeof event?.line === 'number' && Number.isFinite(event.line)
+            ? Math.round(event.line)
+            : undefined;
+        const key = [
+          normalized || fn.toLowerCase(),
+          file?.toLowerCase() ?? '',
+          typeof line === 'number' ? line : 'na',
+        ].join('|');
+        if (usedKeys.has(key)) {
           continue;
         }
-        suggestions.push({
-          fn,
-          file: event?.file,
-          line:
-            typeof event?.line === 'number' && Number.isFinite(event.line)
-              ? Math.round(event.line)
-              : undefined,
-        });
+        usedKeys.add(key);
+        fallback.push({ fn, file, line });
+        if (fallback.length >= remaining) {
+          return fallback;
+        }
       }
     }
-    return suggestions.slice(0, 5);
+    return fallback;
   }
 
   private buildForwardSuggestions(
@@ -6475,6 +6690,40 @@ export class SessionSummaryService {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
+  }
+
+  private async loadPersistedChatHistory(
+    sessionId: string,
+    appId: string | undefined,
+    limit = CHAT_PERSISTED_HISTORY_LIMIT,
+  ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
+    const tenantId = this.tenant.tryGetTenantId();
+    if (!tenantId) {
+      return [];
+    }
+    const docs = await this.chatMessages
+      .find({
+        tenantId,
+        sessionId,
+        ...(appId ? { appId } : {}),
+      })
+      .sort({ createdAt: -1 })
+      .limit(Math.max(1, limit))
+      .lean()
+      .exec();
+    const normalized: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+    for (let idx = docs.length - 1; idx >= 0; idx--) {
+      const doc = docs[idx];
+      const content =
+        typeof doc?.content === 'string' ? doc.content.trim() : '';
+      if (!content.length) {
+        continue;
+      }
+      const role: OpenAI.Chat.Completions.ChatCompletionMessageParam['role'] =
+        doc.role === 'assistant' || doc.role === 'system' ? doc.role : 'user';
+      normalized.push({ role, content });
+    }
+    return normalized;
   }
 
   private async persistChatMessages(

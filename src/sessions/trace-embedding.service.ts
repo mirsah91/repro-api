@@ -2,8 +2,6 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { ConfigService } from '@nestjs/config';
 import { Model } from 'mongoose';
-import { Pinecone, Index } from '@pinecone-database/pinecone';
-import OpenAI from 'openai';
 import { createHash } from 'crypto';
 import { TraceSummary } from './schemas/trace-summary.schema';
 import { TraceNode } from './schemas/trace-node.schema';
@@ -24,12 +22,6 @@ type TraceBatchPayload = {
   batchIndex: number;
   totalBatches?: number | null;
   events: TraceSegmentEvent[];
-};
-
-type PineconeVectorRecord = {
-  id: string;
-  values: number[];
-  metadata: Record<string, string | number | boolean>;
 };
 
 type LineageEntry = {
@@ -107,15 +99,6 @@ type SegmentBuildContext = {
 @Injectable()
 export class TraceEmbeddingService {
   private readonly logger = new Logger(TraceEmbeddingService.name);
-  private openai?: OpenAI;
-  private pinecone?: Pinecone;
-  private pineconeIndex?: Index<Record<string, string | number | boolean>>;
-  private pineconeNamespaceClient?: Index<
-    Record<string, string | number | boolean>
-  >;
-  private openAiWarned = false;
-  private pineconeWarned = false;
-  private vectorSizeWarned = false;
 
   constructor(
     @InjectModel(TraceSummary.name)
@@ -124,15 +107,6 @@ export class TraceEmbeddingService {
     private readonly traceNodes: Model<TraceNode>,
     private readonly config: ConfigService,
   ) {}
-
-  private get useIntegratedIngest(): boolean {
-    return (
-      this.config
-        .get<string>('PINECONE_INTEGRATED_MODE')
-        ?.trim()
-        .toLowerCase() === 'true'
-    );
-  }
 
   async processTraceBatch(payload: TraceBatchPayload): Promise<void> {
     if (!Array.isArray(payload.events) || !payload.events.length) {
@@ -216,30 +190,6 @@ export class TraceEmbeddingService {
 
       if (segment.chunkKind === 'function') {
         await this.upsertTraceNodeDocument(payload, groupId, segment);
-      }
-
-      const baseRecord = {
-        id: this.buildRecordId(
-          payload,
-          groupId,
-          segment.segmentIndex,
-          segmentHash,
-        ),
-        summary: segment.summary,
-        metadata: this.buildRecordMetadata(payload, groupId, segment),
-      };
-
-      if (this.useIntegratedIngest) {
-        await this.upsertIntegratedRecord(baseRecord);
-      } else {
-        const embedding = await this.createEmbedding(segment.summary);
-        if (embedding) {
-          await this.upsertVectorRecord({
-            id: baseRecord.id,
-            values: embedding,
-            metadata: baseRecord.metadata,
-          });
-        }
       }
     }
   }
@@ -1304,307 +1254,4 @@ export class TraceEmbeddingService {
       .digest('hex');
   }
 
-  private async upsertIntegratedRecord(record: {
-    id: string;
-    summary: string;
-    metadata: Record<string, string | number | boolean>;
-  }): Promise<void> {
-    const namespaceClient = await this.ensurePineconeNamespaceClient();
-    if (!namespaceClient) {
-      return;
-    }
-    try {
-      await namespaceClient.upsertRecords([
-        {
-          _id: record.id,
-          chunk_text: record.summary,
-          ...record.metadata,
-        },
-      ]);
-    } catch (err: any) {
-      this.logger.warn(
-        `Pinecone upsert failed: ${err?.message ?? 'unknown error'}`,
-      );
-    }
-  }
-
-  private buildRecordId(
-    payload: TraceBatchPayload,
-    groupId: string,
-    segmentIndex: number,
-    segmentHash: string,
-  ): string {
-    return [
-      payload.tenantId,
-      payload.sessionId,
-      groupId,
-      segmentIndex,
-      segmentHash.slice(0, 8),
-    ]
-      .filter(Boolean)
-      .join(':');
-  }
-
-  private buildRecordMetadata(
-    payload: TraceBatchPayload,
-    groupId: string,
-    segment: TraceSegmentDescriptor,
-  ): Record<string, string | number | boolean> {
-    const metadata: Record<string, string | number | boolean> = {
-      tenantId: payload.tenantId,
-      sessionId: payload.sessionId,
-      groupId,
-      segmentIndex: segment.segmentIndex,
-      batchIndex: payload.batchIndex,
-      eventStart: segment.eventStart,
-      eventEnd: segment.eventEnd,
-      eventCount: segment.eventCount,
-    };
-    if (payload.requestRid) metadata.requestRid = payload.requestRid;
-    if (payload.actionId) metadata.actionId = payload.actionId;
-    if (payload.totalBatches != null) {
-      metadata.totalBatches = payload.totalBatches;
-    }
-    if (segment.chunkId) {
-      metadata.chunkId = segment.chunkId;
-    }
-    if (segment.parentChunkId) {
-      metadata.parentChunkId = segment.parentChunkId;
-    }
-    if (segment.chunkKind) {
-      metadata.chunkKind = segment.chunkKind;
-    }
-    if (typeof segment.depth === 'number' && Number.isFinite(segment.depth)) {
-      metadata.depth = segment.depth;
-    }
-    if (segment.functionName) {
-      metadata.functionName = segment.functionName;
-    }
-    if (segment.filePath) {
-      metadata.filePath = segment.filePath;
-    }
-    if (
-      typeof segment.lineNumber === 'number' &&
-      Number.isFinite(segment.lineNumber)
-    ) {
-      metadata.lineNumber = segment.lineNumber;
-    }
-    return metadata;
-  }
-
-  private async upsertVectorRecord(
-    record: PineconeVectorRecord,
-  ): Promise<void> {
-    const namespaceClient = await this.ensurePineconeNamespaceClient();
-    if (!namespaceClient) {
-      return;
-    }
-    try {
-      const values = this.normalizeVector(record.values);
-      await namespaceClient.upsert([
-        {
-          id: record.id,
-          values,
-          metadata: record.metadata,
-        },
-      ]);
-    } catch (err: any) {
-      this.logger.warn(
-        `Pinecone upsert failed: ${err?.message ?? 'unknown error'}`,
-      );
-    }
-  }
-
-  private async ensurePineconeNamespaceClient(): Promise<Index<
-    Record<string, string | number | boolean>
-  > | null> {
-    if (this.pineconeNamespaceClient) {
-      return this.pineconeNamespaceClient;
-    }
-
-    const indexClient = await this.ensurePineconeIndex();
-    if (!indexClient) {
-      return null;
-    }
-
-    const namespaceEnv = this.config.get<string>('PINECONE_NAMESPACE')?.trim();
-    this.pineconeNamespaceClient = namespaceEnv?.length
-      ? indexClient.namespace(namespaceEnv)
-      : indexClient;
-    return this.pineconeNamespaceClient;
-  }
-
-  private async createEmbedding(text: string): Promise<number[] | null> {
-    if (!text) {
-      return null;
-    }
-    const client = this.ensureOpenAI();
-    if (!client) {
-      return null;
-    }
-    try {
-      const result = await client.embeddings.create({
-        model: this.getEmbeddingModel(),
-        input: text,
-      });
-      return result.data?.[0]?.embedding ?? null;
-    } catch (err: any) {
-      this.logger.warn(
-        `Failed to create embedding: ${err?.message ?? 'unknown error'}`,
-      );
-      return null;
-    }
-  }
-
-  private ensureOpenAI(): OpenAI | null {
-    if (this.openai) {
-      return this.openai;
-    }
-    const apiKey = this.config.get<string>('OPENAI_API_KEY')?.trim();
-    if (!apiKey) {
-      if (!this.openAiWarned) {
-        this.logger.warn(
-          'Trace embeddings disabled: OPENAI_API_KEY is not configured (set PINECONE_INTEGRATED_MODE=true to skip embeddings).',
-        );
-        this.openAiWarned = true;
-      }
-      return null;
-    }
-    this.openai = new OpenAI({ apiKey });
-    return this.openai;
-  }
-
-  private normalizeVector(values: number[]): number[] {
-    const target = Number(this.config.get<string>('PINECONE_INDEX_DIMENSION'));
-    if (!Number.isFinite(target) || target <= 0) {
-      return values;
-    }
-    if (values.length === target) {
-      return values;
-    }
-    if (!this.vectorSizeWarned) {
-      this.logger.warn(
-        `Adjusting embedding vector length from ${values.length} to ${target} to satisfy Pinecone index dimension. Consider setting PINECONE_INDEX_DIMENSION to match your index or recreating the index.`,
-      );
-      this.vectorSizeWarned = true;
-    }
-    if (values.length > target) {
-      return values.slice(0, target);
-    }
-    const padded = values.slice();
-    while (padded.length < target) {
-      padded.push(0);
-    }
-    return padded;
-  }
-
-  private async ensurePineconeIndex(): Promise<Index<
-    Record<string, string | number | boolean>
-  > | null> {
-    if (this.pineconeIndex) {
-      return this.pineconeIndex;
-    }
-
-    const apiKey = this.config.get<string>('PINECONE_API_KEY')?.trim();
-    const providedIndexName =
-      this.config.get<string>('PINECONE_INDEX')?.trim() ?? undefined;
-    const dataHost = this.resolvePineconeDataHost();
-    const indexName =
-      providedIndexName ?? this.deriveIndexNameFromHost(dataHost ?? '');
-
-    if (!apiKey) {
-      if (!this.pineconeWarned) {
-        this.logger.warn(
-          'Trace embeddings disabled: PINECONE_API_KEY is not configured.',
-        );
-        this.pineconeWarned = true;
-      }
-      return null;
-    }
-
-    if (!indexName) {
-      if (!this.pineconeWarned) {
-        this.logger.warn(
-          'Trace embeddings disabled: configure PINECONE_INDEX (or provide PINECONE_HOST so the index can be inferred).',
-        );
-        this.pineconeWarned = true;
-      }
-      return null;
-    }
-
-    if (!dataHost) {
-      if (!this.pineconeWarned) {
-        this.logger.warn(
-          'Trace embeddings disabled: set PINECONE_HOST (index data plane URL).',
-        );
-        this.pineconeWarned = true;
-      }
-      return null;
-    }
-
-    if (!this.pinecone) {
-      const controllerHostRaw =
-        this.config.get<string>('PINECONE_CONTROLLER_HOST')?.trim() ?? '';
-      const controllerHost =
-        controllerHostRaw && controllerHostRaw.length
-          ? controllerHostRaw
-          : undefined;
-
-      if (
-        controllerHost &&
-        controllerHost.includes('.svc.') &&
-        !this.pineconeWarned
-      ) {
-        this.logger.warn(
-          [
-            'PINECONE_CONTROLLER_HOST looks like a data-plane host.',
-            'Set that value via PINECONE_HOST (for vector traffic) and leave PINECONE_CONTROLLER_HOST empty or https://api.pinecone.io so index metadata can be resolved automatically.',
-          ].join(' '),
-        );
-        this.pineconeWarned = true;
-      }
-
-      this.pinecone = new Pinecone(
-        controllerHost
-          ? { apiKey, controllerHostUrl: controllerHost }
-          : { apiKey },
-      );
-    }
-
-    this.pineconeIndex = this.pinecone.index(indexName, dataHost);
-    this.pineconeWarned = false;
-    return this.pineconeIndex;
-  }
-
-  private resolvePineconeDataHost(): string | undefined {
-    const explicit = this.config.get<string>('PINECONE_HOST')?.trim();
-    if (explicit) {
-      return explicit.endsWith('/') ? explicit.slice(0, -1) : explicit;
-    }
-    const index = this.config.get<string>('PINECONE_INDEX')?.trim();
-    const project = this.config.get<string>('PINECONE_PROJECT_ID')?.trim();
-    const environment = this.config.get<string>('PINECONE_ENVIRONMENT')?.trim();
-    if (index && project && environment) {
-      return `https://${index}-${project}.svc.${environment}.pinecone.io`;
-    }
-    return undefined;
-  }
-
-  private deriveIndexNameFromHost(host?: string): string | undefined {
-    if (!host) {
-      return undefined;
-    }
-    const sanitized = host.replace(/^https?:\/\//, '').trim();
-    if (!sanitized.length) {
-      return undefined;
-    }
-    const match = sanitized.match(
-      /^([a-z0-9-]+?)-[a-z0-9]{6,}\.svc\.[a-z0-9-]+\.[a-z]+$/i,
-    );
-    if (match?.[1]) {
-      return match[1];
-    }
-    const firstSegment = sanitized.split('.')[0];
-    return firstSegment || undefined;
-  }
 }
