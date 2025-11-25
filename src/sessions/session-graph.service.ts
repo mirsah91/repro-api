@@ -9,15 +9,21 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { VoyageAIClient } from 'voyageai';
 import OpenAI from 'openai';
+import { encode } from '@toon-format/toon';
 import { Session } from './schemas/session.schema';
 import { Action } from './schemas/action.schema';
 import { RequestEvt } from './schemas/request.schema';
 import { DbChange } from './schemas/db-change.schema';
 import { TraceSummary } from './schemas/trace-summary.schema';
+import { TraceEvt } from './schemas/trace.schema';
 import { SessionGraphNode } from './schemas/session-graph-node.schema';
 import { SessionGraphEdge } from './schemas/session-graph-edge.schema';
 import { SessionFact } from './schemas/session-fact.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
+import {
+  hydrateChangeDoc,
+  hydrateRequestDoc,
+} from './utils/session-data-crypto';
 
 const CAPABILITY_LABELS = [
   'messaging',
@@ -44,6 +50,19 @@ const EMBEDDING_INPUT_LIMIT = 1200;
 const EMBEDDING_BATCH_SIZE = 60;
 const EMBEDDING_MAX_FACTS = 1200;
 const EMBEDDING_TIMEOUT_MS = 20000;
+const ANSWER_PRIMARY_HIT_LIMIT = 6;
+const ANSWER_NEIGHBOR_LIMIT = 0;
+const ANSWER_NODE_LIMIT = 10;
+const ANSWER_COLLECTION_LIMIT = 6;
+
+type CoreCollectionName = 'actions' | 'requests' | 'traces' | 'changes';
+type CoreCollections = Partial<Record<CoreCollectionName, any[]>>;
+type NodeSelection = {
+  nodeId: string;
+  nodeType: string;
+  collection?: CoreCollectionName;
+  sourceId?: string;
+};
 
 export type ReproAiAnswer = {
   summary: string;
@@ -83,6 +102,7 @@ export class SessionGraphService {
     @InjectModel(DbChange.name) private readonly changes: Model<DbChange>,
     @InjectModel(TraceSummary.name)
     private readonly traceSummaries: Model<TraceSummary>,
+    @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     @InjectModel(SessionGraphNode.name)
     private readonly graphNodes: Model<SessionGraphNode>,
     @InjectModel(SessionGraphEdge.name)
@@ -927,10 +947,65 @@ export class SessionGraphService {
     questionCapabilities: string[];
   }): Promise<ReproAiAnswer> {
     const systemPrompt = [
-      'You are Repro AI, an expert answering questions about a single debugging session.',
-      'Use only the provided facts and graph neighbors.',
-      'Never respond with a bare "no context"—offer best-effort hypotheses, label uncertainty, and ask for one precise follow-up.',
-      'Output JSON with keys: summary (string), details (array of strings), evidence (array of {nodeId,nodeType,why}), uncertainties (array), suggestedFollowUps (array).',
+      'You are Repro AI, an expert assistant for a SINGLE debugging session.',
+      '',
+      'CONTEXT',
+      '- You receive TOON-encoded documents from the core collections only: actions, requests, traces, and changes.',
+      '- Each document may include a nodeId that maps back to the internal session graph—use that nodeId in evidence when present.',
+      '- Do not assume any other nodes or relationships beyond what appears in the provided documents.',
+      '- When helpful, link related documents via shared identifiers (actionId ↔ requests/changes, requestRid ↔ traces, entryPoint.fn/file/line ↔ traces).',
+      '',
+      'GENERAL BEHAVIOR',
+      '- Use only the provided documents to answer.',
+      '- Prefer precise, concrete answers rooted in request payloads, trace arguments/returns, DB changes, and action metadata.',
+      '- If the question refers to a “value”, “payload”, “body”, “argument”, “JSON”, “config”, “key”, or “secret”, treat this as a DATA LOOKUP task and quote the exact value(s) from the documents.',
+      '- NEVER invent JSON payloads or specific scalar values (IDs, keys, amounts) that are not present in the documents.',
+      '- You may truncate large JSON with "…" in non-critical parts, but any keys/values you show must exactly match the source.',
+      '',
+      'HANDLING UNCERTAINTY',
+      '- Never respond with a bare “no context” or “I don’t know”.',
+      '- If you cannot find an exact match, explain what you checked in the provided documents and propose exactly one clarifying follow-up question.',
+      '',
+      'OUTPUT FORMAT (STRICT)',
+      '- You MUST respond with a SINGLE top-level JSON object.',
+      '- Do NOT wrap the JSON in code fences.',
+      '- Do NOT include any text before or after the JSON.',
+      '- The JSON MUST have EXACTLY these keys at the top level:',
+      '  - summary            (string)',
+      '  - details            (array of strings)',
+      '  - evidence           (array of objects with keys: nodeId (string), nodeType (string), why (string))',
+      '  - uncertainties      (array of strings)',
+      '  - suggestedFollowUps (array of strings)',
+      '- Do NOT add extra top-level keys.',
+      '- If a field has nothing to say, use an empty array [] or an empty string "" as appropriate.',
+      '- The JSON MUST be valid and parseable:',
+      '  - Use double quotes for all keys and string values.',
+      '  - No trailing commas.',
+      '  - No comments.',
+      '',
+      'FIELD SEMANTICS',
+      '- "summary":',
+      '  - A 1–3 sentence high-level answer to the user’s question.',
+      '  - If you are uncertain, state that explicitly here.',
+      '- "details":',
+      '  - A list of more granular explanations, steps, or observations.',
+      '  - Include any relevant JSON snippets here as strings (you may pretty-print or indent them).',
+      '  - When including JSON, ensure it matches exactly what was in the provided documents.',
+      '- "evidence":',
+      '  - Each element describes one concrete piece of supporting data from the provided documents.',
+      '  - "nodeId": use the document nodeId when available; otherwise use a stable identifier from the document (rid, actionId, trace id, change id).',
+      '  - "nodeType": a short type label (e.g. "trace_span", "request", "change", "action").',
+      '  - "why": a short explanation of how this item supports your answer.',
+      '- "uncertainties":',
+      '  - Explicitly list what you are unsure about (e.g. “Not sure if this API key is for production or staging.”).',
+      '- "suggestedFollowUps":',
+      '  - 0–3 concrete follow-up questions the user could answer to help you refine or validate your answer.',
+      '  - If you already gave a precise answer and have no meaningful follow-up, you may return an empty array.',
+      '',
+      'CONSISTENCY REQUIREMENTS',
+      '- ALWAYS follow the JSON schema above, for EVERY answer, regardless of the question.',
+      '- Even if the user asks for “just the JSON” or “just the node id”, still respond with the full JSON object in the required format.',
+      '- Never change the key names, their types, or the top-level structure.',
     ].join('\n');
 
     const factPayload = payload.hits.slice(0, FACT_RESULT_LIMIT).map((hit) => ({
@@ -942,33 +1017,32 @@ export class SessionGraphService {
       text: this.truncate(hit.fact.text, 500),
       structured: hit.fact.structured,
     }));
-    const neighborPayload = payload.graph.nodes
-      .filter((node) => !factPayload.find((fact) => fact.nodeId === node._id))
-      .slice(0, 30)
-      .map((node) => ({
-        nodeId: node._id,
-        nodeType: node.type,
-        title: node.title,
-        capabilityTags: node.capabilityTags,
-        text: this.truncate(node.rawText ?? '', 300),
-      }));
+
+    const context = await this.buildAnswerCollections({
+      sessionId: payload.session._id,
+      hits: payload.hits,
+      graph: payload.graph,
+    });
+    const toonData = this.collectionsToToon(context.collections);
+    const header = {
+      sessionId: payload.session._id,
+      question: payload.question,
+      targetCapabilities: payload.questionCapabilities,
+      dataFormat: 'TOON',
+      resultCounts: this.countCollections(context.collections),
+    };
+    const userContent = [
+      JSON.stringify(header, null, 2),
+      toonData
+        ? `TOON:\n${toonData}`
+        : 'No matching actions, requests, traces, or changes were retrieved for this query.',
+    ].join('\n\n');
+
+    console.log('userContent ===>', userContent)
 
     const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
       { role: 'system', content: systemPrompt },
-      {
-        role: 'user',
-        content: JSON.stringify(
-          {
-            sessionId: payload.session._id,
-            question: payload.question,
-            targetCapabilities: payload.questionCapabilities,
-            facts: factPayload,
-            neighbors: neighborPayload,
-          },
-          null,
-          2,
-        ),
-      },
+      { role: 'user', content: userContent },
     ];
 
     try {
@@ -982,6 +1056,7 @@ export class SessionGraphService {
         messages,
         max_tokens: 700,
       });
+      // const completion = {} as any
       const raw = completion.choices?.[0]?.message?.content?.trim();
       const parsed = this.tryParseJson<ReproAiAnswer>(raw);
       if (parsed) {
@@ -995,6 +1070,495 @@ export class SessionGraphService {
     }
 
     return this.buildFallbackAnswer(payload.question, factPayload);
+  }
+
+  private async buildAnswerCollections(payload: {
+    sessionId: string;
+    hits: GraphSearchHit[];
+    graph: { nodes: SessionGraphNode[]; edges: SessionGraphEdge[] };
+  }): Promise<{ collections: CoreCollections; selection: NodeSelection[] }> {
+    const nodeMap = new Map<string, SessionGraphNode>(
+      payload.graph.nodes.map((node) => [node._id, node] as const),
+    );
+    const selection: NodeSelection[] = [];
+    if (!nodeMap.size) {
+      return { collections: {}, selection };
+    }
+
+    const candidateIds: string[] = [];
+    const seen = new Set<string>();
+    const addCandidate = (nodeId?: string | null): boolean => {
+      if (!nodeId || !nodeMap.has(nodeId) || seen.has(nodeId)) {
+        return false;
+      }
+      if (seen.size >= ANSWER_NODE_LIMIT) {
+        return false;
+      }
+      seen.add(nodeId);
+      candidateIds.push(nodeId);
+      return true;
+    };
+
+    const seedHits = payload.hits.slice(0, ANSWER_PRIMARY_HIT_LIMIT);
+    seedHits.forEach((hit) => addCandidate(hit.fact.nodeId));
+
+    let neighborBudget = ANSWER_NEIGHBOR_LIMIT;
+    if (neighborBudget > 0 && payload.graph.edges?.length) {
+      for (const edge of payload.graph.edges) {
+        if (!neighborBudget) {
+          break;
+        }
+        if (seen.has(edge.fromNodeId) && edge.toNodeId && addCandidate(edge.toNodeId)) {
+          neighborBudget -= 1;
+          continue;
+        }
+        if (
+          edge.toNodeId &&
+          seen.has(edge.toNodeId) &&
+          addCandidate(edge.fromNodeId)
+        ) {
+          neighborBudget -= 1;
+        }
+      }
+    }
+
+    const nodeIds = candidateIds.slice(0, ANSWER_NODE_LIMIT);
+    const selectedNodes = nodeIds
+      .map((id) => nodeMap.get(id))
+      .filter((node): node is SessionGraphNode => Boolean(node));
+
+    const actionRefs = new Map<string, string>();
+    const requestRefs = new Map<string, string>();
+    const changeRefs = new Map<string, string>();
+    const traceRequestRefs = new Map<string, string>();
+
+    selectedNodes.forEach((node) => {
+      const ref = this.extractCoreRef(node);
+      if (!ref) {
+        return;
+      }
+      selection.push({
+        nodeId: node._id,
+        nodeType: node.type,
+        collection: ref.collection,
+        sourceId: ref.sourceId,
+      });
+      if (ref.collection === 'actions' && ref.key) {
+        actionRefs.set(ref.key, node._id);
+      } else if (ref.collection === 'requests' && ref.key) {
+        requestRefs.set(ref.key, node._id);
+      } else if (ref.collection === 'changes' && ref.key) {
+        changeRefs.set(ref.key, node._id);
+      } else if (ref.collection === 'traces' && ref.requestRid) {
+        traceRequestRefs.set(ref.requestRid, node._id);
+      }
+    });
+
+    const collections: CoreCollections = {};
+    collections.actions = await this.loadActionsForIds(
+      payload.sessionId,
+      Array.from(actionRefs.keys()),
+      actionRefs,
+    );
+    collections.requests = await this.loadRequestsForIds(
+      payload.sessionId,
+      Array.from(requestRefs.keys()),
+      requestRefs,
+    );
+    collections.changes = await this.loadChangesForIds(
+      payload.sessionId,
+      Array.from(changeRefs.keys()),
+      changeRefs,
+    );
+    collections.traces = await this.loadTracesForIds(
+      payload.sessionId,
+      Array.from(traceRequestRefs.keys()),
+      traceRequestRefs,
+    );
+
+    return { collections, selection };
+  }
+
+  private async loadActionsForIds(
+    sessionId: string,
+    actionIds: string[],
+    nodeLookup: Map<string, string>,
+  ): Promise<any[]> {
+    const limited = actionIds.slice(0, ANSWER_COLLECTION_LIMIT);
+    if (!limited.length) {
+      return [];
+    }
+    const docs = await this.actions
+      .find(
+        this.tenantFilter({
+          sessionId,
+          actionId: { $in: limited },
+        }),
+      )
+      .limit(ANSWER_COLLECTION_LIMIT)
+      .lean()
+      .exec();
+
+    const sanitized = docs.map((doc) => {
+      const cleaned = this.sanitizeForAnswer(doc);
+      const nodeId =
+        typeof doc?.actionId === 'string'
+          ? nodeLookup.get(doc.actionId)
+          : undefined;
+      if (nodeId) {
+        (cleaned as Record<string, any>).nodeId = nodeId;
+      }
+      return cleaned;
+    });
+
+    return this.orderDocs(
+      sanitized,
+      limited,
+      (doc) => (doc as any)?.actionId ?? undefined,
+    );
+  }
+
+  private async loadRequestsForIds(
+    sessionId: string,
+    rids: string[],
+    nodeLookup: Map<string, string>,
+  ): Promise<any[]> {
+    const limited = rids.slice(0, ANSWER_COLLECTION_LIMIT);
+    if (!limited.length) {
+      return [];
+    }
+    const docs = await this.requests
+      .find(
+        this.tenantFilter({
+          sessionId,
+          rid: { $in: limited },
+        }),
+      )
+      .limit(ANSWER_COLLECTION_LIMIT)
+      .lean()
+      .exec();
+
+    const sanitized = docs.map((doc) => {
+      const hydrated = hydrateRequestDoc(doc);
+      const cleaned = this.sanitizeForAnswer(hydrated);
+      const nodeId =
+        typeof doc?.rid === 'string' ? nodeLookup.get(doc.rid) : undefined;
+      if (nodeId) {
+        (cleaned as Record<string, any>).nodeId = nodeId;
+      }
+      return cleaned;
+    });
+
+    return this.orderDocs(
+      sanitized,
+      limited,
+      (doc) => (doc as any)?.rid ?? undefined,
+    );
+  }
+
+  private async loadChangesForIds(
+    sessionId: string,
+    changeIds: string[],
+    nodeLookup: Map<string, string>,
+  ): Promise<any[]> {
+    const limited = changeIds.slice(0, ANSWER_COLLECTION_LIMIT);
+    if (!limited.length) {
+      return [];
+    }
+    const docs = await this.changes
+      .find(
+        this.tenantFilter({
+          sessionId,
+          _id: { $in: limited },
+        }),
+      )
+      .limit(ANSWER_COLLECTION_LIMIT)
+      .lean()
+      .exec();
+
+    const sanitized = docs.map((doc) => {
+      const hydrated = hydrateChangeDoc(doc);
+      const cleaned = this.sanitizeForAnswer(hydrated);
+      const changeId = this.normalizeId(doc?._id);
+      const nodeId = changeId ? nodeLookup.get(changeId) : undefined;
+      if (nodeId) {
+        (cleaned as Record<string, any>).nodeId = nodeId;
+      }
+      return cleaned;
+    });
+
+    return this.orderDocs(
+      sanitized,
+      limited,
+      (doc) => (doc as any)?.id ?? this.normalizeId((doc as any)?._id),
+    );
+  }
+
+  private async loadTracesForIds(
+    sessionId: string,
+    requestRids: string[],
+    traceRequestRefs: Map<string, string>,
+  ): Promise<any[]> {
+    const limitedRids = requestRids.slice(0, ANSWER_COLLECTION_LIMIT);
+    if (!limitedRids.length) {
+      return [];
+    }
+
+    const docs = await this.traces
+      .find(
+        this.tenantFilter({
+          sessionId,
+          requestRid: { $in: limitedRids },
+        }),
+      )
+      .limit(ANSWER_COLLECTION_LIMIT)
+      .lean()
+      .exec();
+
+    const sanitized = docs.map((doc) => {
+      const cleaned = this.sanitizeForAnswer(doc);
+      if ('data' in cleaned) {
+        delete (cleaned as Record<string, any>).data;
+      }
+      const nodeId =
+        doc.requestRid && traceRequestRefs.get(String(doc.requestRid));
+      if (nodeId) {
+        (cleaned as Record<string, any>).nodeId = nodeId;
+      }
+      return cleaned;
+    });
+
+    return this.orderDocs(
+      sanitized,
+      limitedRids,
+      (doc) => (doc as any)?.requestRid ?? undefined,
+    );
+  }
+
+  private extractCoreRef(
+    node: SessionGraphNode,
+  ):
+    | { collection: 'actions'; key: string; sourceId?: string }
+    | { collection: 'requests'; key: string; sourceId?: string }
+    | { collection: 'changes'; key: string; sourceId?: string }
+    | {
+        collection: 'traces';
+        key?: string;
+        sourceId?: string;
+        chunkId?: string;
+        segmentHash?: string;
+        traceId?: string;
+        requestRid?: string;
+      }
+    | undefined {
+    const structured = node.structured ?? {};
+    if (node.type === 'action') {
+      const actionId =
+        (structured as any)?.actionId ??
+        node.sourceId ??
+        this.stripPrefix(node._id, 'action:');
+      if (actionId) {
+        return {
+          collection: 'actions',
+          key: String(actionId),
+          sourceId: node.sourceId,
+        };
+      }
+    }
+    if (node.type === 'request') {
+      const rid =
+        (structured as any)?.rid ??
+        node.sourceId ??
+        this.stripPrefix(node._id, 'request:');
+      if (rid) {
+        return {
+          collection: 'requests',
+          key: String(rid),
+          sourceId: node.sourceId,
+        };
+      }
+    }
+    if (node.type === 'change') {
+      const changeId =
+        node.sourceId ??
+        this.normalizeId((structured as any)?._id) ??
+        this.stripPrefix(node._id, 'change:');
+      if (changeId) {
+        return {
+          collection: 'changes',
+          key: String(changeId),
+          sourceId: node.sourceId,
+        };
+      }
+    }
+    if (node.type === 'trace_span') {
+      const chunkId =
+        typeof (structured as any)?.chunkId === 'string'
+          ? (structured as any).chunkId
+          : undefined;
+      const segmentHash =
+        typeof node.sourceId === 'string'
+          ? node.sourceId
+          : typeof (structured as any)?.segmentHash === 'string'
+            ? (structured as any).segmentHash
+            : undefined;
+      const traceId =
+        typeof (structured as any)?.traceId === 'string'
+          ? (structured as any).traceId
+          : typeof (structured as any)?.groupId === 'string'
+            ? (structured as any).groupId
+            : undefined;
+      const requestRid =
+        typeof (structured as any)?.requestRid === 'string'
+          ? (structured as any).requestRid
+          : undefined;
+      const key = chunkId ?? segmentHash ?? traceId ?? requestRid;
+      if (key) {
+        return {
+          collection: 'traces',
+          key: String(key),
+          sourceId: node.sourceId,
+          chunkId: chunkId ?? undefined,
+          segmentHash,
+          traceId,
+          requestRid,
+        };
+      }
+    }
+    return undefined;
+  }
+
+  private sanitizeForAnswer<T>(doc: T): T {
+    if (Array.isArray(doc)) {
+      return doc.map((item) => this.sanitizeForAnswer(item)) as unknown as T;
+    }
+    if (!doc || typeof doc !== 'object') {
+      return doc;
+    }
+    if (Buffer.isBuffer(doc)) {
+      return doc.toString('utf8') as unknown as T;
+    }
+    if (doc instanceof Date) {
+      return doc.toISOString() as unknown as T;
+    }
+    const cloned: Record<string, any> = {};
+    Object.entries(doc as Record<string, any>).forEach(([key, value]) => {
+      if (key === 'tenantId' || key === '__v') {
+        return;
+      }
+      if (key === '_id') {
+        cloned.id = this.normalizeId(value);
+        return;
+      }
+      const sanitized = this.sanitizeForAnswer(value);
+      cloned[key] = sanitized;
+    });
+    return cloned as T;
+  }
+
+  private countCollections(
+    collections: CoreCollections,
+  ): Record<string, number> {
+    const counts: Record<string, number> = {};
+    (
+      ['actions', 'requests', 'traces', 'changes'] as CoreCollectionName[]
+    ).forEach((collection) => {
+      const docs = collections[collection];
+      if (Array.isArray(docs)) {
+        counts[collection] = docs.length;
+      }
+    });
+    return counts;
+  }
+
+  private orderDocs<T>(
+    docs: T[],
+    order: string[],
+    keySelector: (doc: T) => string | undefined,
+  ): T[] {
+    if (!docs.length) {
+      return docs;
+    }
+    if (!order.length) {
+      return docs;
+    }
+    const rank = new Map<string, number>();
+    order.forEach((key, idx) => {
+      rank.set(key, idx);
+    });
+    return [...docs].sort((a, b) => {
+      const aKey = keySelector(a);
+      const bKey = keySelector(b);
+      const aRank =
+        typeof aKey === 'string' && rank.has(aKey)
+          ? (rank.get(aKey) as number)
+          : Number.MAX_SAFE_INTEGER;
+      const bRank =
+        typeof bKey === 'string' && rank.has(bKey)
+          ? (rank.get(bKey) as number)
+          : Number.MAX_SAFE_INTEGER;
+      if (aRank === bRank) {
+        return 0;
+      }
+      return aRank - bRank;
+    });
+  }
+
+  private collectionsToToon(collections: CoreCollections): string | undefined {
+    const payload: Record<string, any> = {};
+    (
+      ['actions', 'requests', 'traces', 'changes'] as CoreCollectionName[]
+    ).forEach((collection) => {
+      const docs = collections[collection];
+      if (Array.isArray(docs) && docs.length) {
+        payload[collection] = docs;
+      }
+    });
+    if (!Object.keys(payload).length) {
+      return undefined;
+    }
+    try {
+      return encode(payload, { keyFolding: 'safe' });
+    } catch (err: any) {
+      this.logger.warn(
+        'Failed to encode OpenAI context as TOON',
+        err?.message ?? err,
+      );
+      return JSON.stringify(payload, this.promptReplacer, 2);
+    }
+  }
+
+  private promptReplacer(_key: string, value: any): any {
+    if (Buffer.isBuffer(value)) {
+      return value.toString('utf8');
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    return value;
+  }
+
+  private normalizeId(value: any): string | undefined {
+    if (typeof value === 'undefined' || value === null) {
+      return undefined;
+    }
+    if (typeof value === 'string') {
+      return value;
+    }
+    if (typeof value === 'object' && typeof value.toString === 'function') {
+      return value.toString();
+    }
+    return String(value);
+  }
+
+  private stripPrefix(
+    value: string | undefined,
+    prefix: string,
+  ): string | undefined {
+    if (!value?.startsWith(prefix)) {
+      return undefined;
+    }
+    return value.slice(prefix.length);
   }
 
   private normalizeAnswer(
