@@ -54,6 +54,8 @@ const ANSWER_PRIMARY_HIT_LIMIT = 6;
 const ANSWER_NEIGHBOR_LIMIT = 6;
 const ANSWER_NODE_LIMIT = 10;
 const ANSWER_COLLECTION_LIMIT = 6;
+const ANSWER_STRING_LIMIT = 600;
+const ANSWER_LIST_LIMIT = 8;
 
 type CoreCollectionName = 'actions' | 'requests' | 'traces' | 'changes';
 type CoreCollections = Partial<Record<CoreCollectionName, any[]>>;
@@ -988,9 +990,9 @@ export class SessionGraphService {
       '  - A 1–3 sentence high-level answer to the user’s question.',
       '  - If you are uncertain, state that explicitly here.',
       '- "details":',
-      '  - A list of more granular explanations, steps, or observations.',
-      '  - Include any relevant JSON snippets here as strings (you may pretty-print or indent them).',
-      '  - When including JSON, ensure it matches exactly what was in the provided documents.',
+      '  - A concise list of more granular explanations, steps, or observations (max ~8 items).',
+      '  - Include JSON snippets only when necessary; keep them short (≤ 400 chars) and inline if possible.',
+      '  - Do NOT use code fences or triple backticks anywhere in the response.',
       '- "evidence":',
       '  - Each element describes one concrete piece of supporting data from the provided documents.',
       '  - "nodeId": use the document nodeId when available; otherwise use a stable identifier from the document (rid, actionId, trace id, change id).',
@@ -1036,7 +1038,7 @@ export class SessionGraphService {
       toonData
         ? `TOON:\n${toonData}`
         : 'No matching actions, requests, traces, or changes were retrieved for this query.',
-    ].join('\n\n');
+    ].join('\n');
 
     console.log('userContent ===>', userContent)
 
@@ -1054,11 +1056,18 @@ export class SessionGraphService {
         temperature: 0.2,
         response_format: { type: 'json_object' },
         messages,
-        max_tokens: 700,
+        max_tokens: 1100,
       });
       // const completion = {} as any
       const raw = completion.choices?.[0]?.message?.content?.trim();
-      const parsed = this.tryParseJson<ReproAiAnswer>(raw);
+
+      console.log('raw ---->', raw)
+      const parsedFromSdk =
+        (completion as any)?.choices?.[0]?.message?.parsed ??
+        (completion as any)?.choices?.[0]?.message?.content?.parsed;
+      const parsed =
+        (parsedFromSdk as ReproAiAnswer | undefined) ??
+        this.parseAnswerContent(raw);
       if (parsed) {
         return this.normalizeAnswer(parsed, factPayload);
       }
@@ -1602,39 +1611,79 @@ export class SessionGraphService {
     answer: ReproAiAnswer,
     facts: Array<{ nodeId: string; nodeType: string }>,
   ): ReproAiAnswer {
+    const clampStrings = (list: string[]) =>
+      list
+        .slice(0, ANSWER_LIST_LIMIT)
+        .map((line) => this.truncate(line, ANSWER_STRING_LIMIT));
+
+    const clampFollowUps = (list: string[]) =>
+      list
+        .slice(0, 3)
+        .map((line) => this.truncate(line, ANSWER_STRING_LIMIT));
+
+    const clampEvidence = (
+      items: Array<{
+        nodeId: string;
+        nodeType: string;
+        why?: string;
+        title?: string;
+        score?: number;
+        capabilityTags?: string[];
+      }>,
+    ) =>
+      items
+        .slice(0, ANSWER_LIST_LIMIT)
+        .map((ev) => ({
+          nodeId: ev.nodeId,
+          nodeType: ev.nodeType,
+          why: ev.why ? this.truncate(ev.why, ANSWER_STRING_LIMIT) : undefined,
+          title: ev.title ? this.truncate(ev.title, ANSWER_STRING_LIMIT) : undefined,
+          score: ev.score,
+          capabilityTags: ev.capabilityTags ?? [],
+        }));
+
     return {
-      summary: answer.summary?.trim() || 'No summary available.',
+      summary:
+        this.truncate(answer.summary?.trim() || 'No summary available.', ANSWER_STRING_LIMIT),
       details: Array.isArray(answer.details)
-        ? answer.details.filter((line) => typeof line === 'string' && line.trim())
+        ? clampStrings(
+            answer.details.filter((line) => typeof line === 'string' && line.trim()),
+          )
         : [],
       evidence: Array.isArray(answer.evidence)
-        ? answer.evidence
-            .map((ev) => ({
-              nodeId: ev.nodeId,
-              nodeType: ev.nodeType,
-              why: ev.why,
-              title: ev.title,
-              score: ev.score,
-              capabilityTags: ev.capabilityTags ?? [],
-            }))
+        ? clampEvidence(
+            answer.evidence
+              .map((ev) => ({
+                nodeId: ev.nodeId,
+                nodeType: ev.nodeType,
+                why: ev.why,
+                title: ev.title,
+                score: ev.score,
+                capabilityTags: ev.capabilityTags ?? [],
+              }))
             .filter(
               (ev) =>
                 typeof ev.nodeId === 'string' &&
                 typeof ev.nodeType === 'string',
-            )
+            ),
+          )
         : facts.map((fact) => ({
             nodeId: fact.nodeId,
             nodeType: fact.nodeType,
             why: 'Included as retrieved context.',
           })),
       uncertainties: Array.isArray(answer.uncertainties)
-        ? answer.uncertainties.filter(
-            (item) => typeof item === 'string' && item.trim(),
+        ? clampStrings(
+            answer.uncertainties.filter(
+              (item) => typeof item === 'string' && item.trim(),
+            ),
           )
         : [],
       suggestedFollowUps: Array.isArray(answer.suggestedFollowUps)
-        ? answer.suggestedFollowUps.filter(
-            (item) => typeof item === 'string' && item.trim(),
+        ? clampFollowUps(
+            answer.suggestedFollowUps.filter(
+              (item) => typeof item === 'string' && item.trim(),
+            ),
           )
         : [],
     };
@@ -1897,5 +1946,41 @@ export class SessionGraphService {
     } catch {
       return undefined;
     }
+  }
+
+  private parseAnswerContent(raw?: string | null): ReproAiAnswer | undefined {
+    if (!raw) return undefined;
+    const tryParse = (text: string) => {
+      try {
+        return JSON.parse(text) as ReproAiAnswer;
+      } catch {
+        return undefined;
+      }
+    };
+
+    const trimmed = raw.trim();
+    const direct = tryParse(trimmed);
+    if (direct) {
+      return direct;
+    }
+
+    const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fencedMatch?.[1]) {
+      const fenced = tryParse(fencedMatch[1]);
+      if (fenced) {
+        return fenced;
+      }
+    }
+
+    const cleanedFences = trimmed
+      .replace(/^```(?:json)?/i, '')
+      .replace(/```$/i, '')
+      .trim();
+    const cleaned = tryParse(cleanedFences);
+    if (cleaned) {
+      return cleaned;
+    }
+
+    return this.tryParseJson<ReproAiAnswer>(trimmed);
   }
 }
