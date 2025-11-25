@@ -51,7 +51,7 @@ const EMBEDDING_BATCH_SIZE = 60;
 const EMBEDDING_MAX_FACTS = 1200;
 const EMBEDDING_TIMEOUT_MS = 20000;
 const ANSWER_PRIMARY_HIT_LIMIT = 6;
-const ANSWER_NEIGHBOR_LIMIT = 0;
+const ANSWER_NEIGHBOR_LIMIT = 6;
 const ANSWER_NODE_LIMIT = 10;
 const ANSWER_COLLECTION_LIMIT = 6;
 
@@ -661,7 +661,7 @@ export class SessionGraphService {
     const searchResult = await this.searchFacts(params);
     const hits = searchResult.hits;
     const nodeIds = hits.map((hit) => hit.fact.nodeId);
-    const graph = await this.expandGraph(params.sessionId, nodeIds, 1);
+    const graph = await this.expandGraph(params.sessionId, nodeIds, 2);
     const nodeMap = new Map(
       graph.nodes.map((node) => [node._id, node] as const),
     );
@@ -1104,19 +1104,50 @@ export class SessionGraphService {
 
     let neighborBudget = ANSWER_NEIGHBOR_LIMIT;
     if (neighborBudget > 0 && payload.graph.edges?.length) {
-      for (const edge of payload.graph.edges) {
+      const neighborSeen = new Set<string>();
+      const neighborPriority = (nodeId: string): number => {
+        const nodeType = nodeMap.get(nodeId)?.type;
+        switch (nodeType) {
+          case 'request':
+            return 0;
+          case 'change':
+            return 1;
+          case 'action':
+            return 2;
+          case 'trace_span':
+            return 3;
+          default:
+            return 4;
+        }
+      };
+      const candidates: Array<{ nodeId: string; priority: number }> = [];
+      const pushNeighbor = (nodeId?: string | null) => {
+        if (!nodeId || seen.has(nodeId) || neighborSeen.has(nodeId)) {
+          return;
+        }
+        const node = nodeMap.get(nodeId);
+        if (!node) {
+          return;
+        }
+        neighborSeen.add(nodeId);
+        candidates.push({ nodeId, priority: neighborPriority(nodeId) });
+      };
+
+      payload.graph.edges.forEach((edge) => {
+        if (seen.has(edge.fromNodeId)) {
+          pushNeighbor(edge.toNodeId);
+        }
+        if (edge.toNodeId && seen.has(edge.toNodeId)) {
+          pushNeighbor(edge.fromNodeId);
+        }
+      });
+
+      candidates.sort((a, b) => a.priority - b.priority);
+      for (const candidate of candidates) {
         if (!neighborBudget) {
           break;
         }
-        if (seen.has(edge.fromNodeId) && edge.toNodeId && addCandidate(edge.toNodeId)) {
-          neighborBudget -= 1;
-          continue;
-        }
-        if (
-          edge.toNodeId &&
-          seen.has(edge.toNodeId) &&
-          addCandidate(edge.fromNodeId)
-        ) {
+        if (addCandidate(candidate.nodeId)) {
           neighborBudget -= 1;
         }
       }
@@ -1160,9 +1191,15 @@ export class SessionGraphService {
       Array.from(actionRefs.keys()),
       actionRefs,
     );
+    const requestIds = new Set<string>(requestRefs.keys());
+    traceRequestRefs.forEach((_nodeId, rid) => {
+      if (typeof rid === 'string') {
+        requestIds.add(rid);
+      }
+    });
     collections.requests = await this.loadRequestsForIds(
       payload.sessionId,
-      Array.from(requestRefs.keys()),
+      Array.from(requestIds),
       requestRefs,
     );
     collections.changes = await this.loadChangesForIds(
