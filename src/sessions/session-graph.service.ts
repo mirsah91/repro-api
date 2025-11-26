@@ -43,8 +43,9 @@ const CAPABILITY_LABELS = [
 ];
 
 const FACT_TEXT_LIMIT = 1600;
-const FACT_CANDIDATE_LIMIT = 400;
+const FACT_CANDIDATE_LIMIT = 1200;
 const FACT_RESULT_LIMIT = 40;
+const FACT_LISTING_LIMIT = 300;
 const GRAPH_NEIGHBOR_LIMIT = 120;
 const EMBEDDING_INPUT_LIMIT = 1200;
 const EMBEDDING_BATCH_SIZE = 60;
@@ -588,6 +589,27 @@ export class SessionGraphService {
       params.capabilityTags ?? [],
       this.deriveCapabilityTags([params.question]),
     );
+    const listingTypes = this.inferListingTypes(
+      params.question,
+      params.nodeTypes,
+    );
+    if (listingTypes.size) {
+      const filtered = facts.filter((fact) => listingTypes.has(fact.nodeType));
+      if (filtered.length) {
+        const maxHits = Math.max(
+          5,
+          Math.min(params.limit ?? FACT_LISTING_LIMIT, FACT_LISTING_LIMIT),
+        );
+        const limited = filtered.slice(0, maxHits);
+        return {
+          hits: limited.map((fact, idx) => ({
+            fact,
+            score: 1 - idx * 0.001,
+          })),
+          questionCapabilities,
+        };
+      }
+    }
     const questionEmbedding = await this.embedQuestion(params.question);
     const hits = facts
       .map((fact) => {
@@ -1982,5 +2004,46 @@ export class SessionGraphService {
     }
 
     return this.tryParseJson<ReproAiAnswer>(trimmed);
+  }
+
+  private inferListingTypes(
+    question: string,
+    nodeTypes?: string[],
+  ): Set<string> {
+    const normalized = question.toLowerCase();
+    const listingHint = /\b(list|show|display|enumerate|all|every|full|complete)\b/.test(
+      normalized,
+    );
+    if (!listingHint) {
+      return new Set();
+    }
+
+    const requested = new Set<string>();
+    const add = (type: string) => requested.add(type);
+    const hasToken = (pattern: RegExp) => pattern.test(normalized);
+
+    nodeTypes?.forEach((type) => add(type));
+
+    if (hasToken(/\b(request|endpoint|endpoints|api|call|route)s?\b/)) {
+      add('request');
+    }
+    if (hasToken(/\b(change|db|database|write|insert|update|delete|query)\b/)) {
+      add('change');
+    }
+    if (hasToken(/\b(trace|span|function|stack|code)\b/)) {
+      add('trace_span');
+    }
+    if (hasToken(/\b(action|step|event|ui)\b/)) {
+      add('action');
+    }
+
+    if (!requested.size && hasToken(/\ball\b/)) {
+      add('request');
+      add('change');
+      add('trace_span');
+      add('action');
+    }
+
+    return requested;
   }
 }
