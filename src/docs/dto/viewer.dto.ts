@@ -30,6 +30,11 @@ export class UiInfoDto {
 }
 
 export class ActionBaseDto {
+  @ApiProperty({ required: false, description: 'Mongo _id as string' })
+  @IsOptional()
+  @IsString()
+  id?: string;
+
   @ApiProperty()
   @IsString()
   actionId!: string | null;
@@ -66,6 +71,11 @@ export class ActionBaseDto {
 }
 
 export class RequestEvtDto {
+  @ApiProperty({ required: false, description: 'Mongo _id as string' })
+  @IsOptional()
+  @IsString()
+  id?: string;
+
   @ApiProperty()
   @IsString()
   sessionId!: string;
@@ -167,6 +177,11 @@ export enum DbOp {
 }
 
 export class DbChangeDto {
+  @ApiProperty({ required: false, description: 'Mongo _id as string' })
+  @IsOptional()
+  @IsString()
+  id?: string;
+
   @ApiProperty()
   @IsString()
   sessionId!: string;
@@ -351,6 +366,73 @@ export class RespDiffGroupDto {
   diffs!: RespDiffEdgeDto[];
 }
 
+export class TimelineTraceDto {
+  @ApiProperty({ description: 'Mongo _id as string' })
+  @IsString()
+  id!: string;
+
+  @ApiProperty()
+  @IsString()
+  requestRid!: string;
+
+  @ApiProperty()
+  @IsNumber()
+  batchIndex!: number;
+
+  @ApiProperty({
+    required: false,
+    type: [Object],
+    description: 'Captured code references and previews',
+  })
+  @IsOptional()
+  @IsArray()
+  codeRefs?: any[];
+
+  @ApiProperty({ required: false, description: 'Raw trace payload (if stored)' })
+  @IsOptional()
+  data?: any;
+}
+
+export class TimelineRequestDto extends RequestEvtDto {
+  @ApiProperty({ type: [TimelineTraceDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TimelineTraceDto)
+  traces!: TimelineTraceDto[];
+
+  @ApiProperty({ type: [DbChangeDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => DbChangeDto)
+  dbChanges!: DbChangeDto[];
+}
+
+export class TimelineActionDto extends ActionBaseDto {
+  @ApiProperty({ type: [TimelineRequestDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TimelineRequestDto)
+  requests!: TimelineRequestDto[];
+
+  @ApiProperty({ type: [DbChangeDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => DbChangeDto)
+  dbChanges!: DbChangeDto[];
+}
+
+export class TimelineActionsResponseDto {
+  @ApiProperty()
+  @IsString()
+  sessionId!: string;
+
+  @ApiProperty({ type: [TimelineActionDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TimelineActionDto)
+  actions!: TimelineActionDto[];
+}
+
 /** Responses */
 export class SummaryResponseDto {
   @ApiProperty()
@@ -391,7 +473,14 @@ export class ActionDetailsResponseDto {
   db!: DbChangeDto[];
 }
 
-@ApiExtraModels(ActionWithDetailsDto, RrwebMetaDto, RespDiffGroupDto)
+@ApiExtraModels(
+  ActionWithDetailsDto,
+  RrwebMetaDto,
+  RespDiffGroupDto,
+  TimelineActionDto,
+  TimelineRequestDto,
+  TimelineTraceDto,
+)
 export class FullResponseDto {
   @ApiProperty()
   @IsString()

@@ -9,6 +9,15 @@ import { DbChange } from './schemas/db-change.schema';
 import { RrwebChunk } from './schemas/rrweb-chunk.schema';
 import { EmailEvt } from './schemas/emails.schema';
 import { TraceEvt } from './schemas/trace.schema';
+import { TraceSummary } from './schemas/trace-summary.schema';
+import { TraceNode } from './schemas/trace-node.schema';
+import {
+  SessionChatMessage,
+} from './schemas/session-chat.schema';
+import {
+  AppUser,
+  AppUserDocument,
+} from '../apps/schemas/app-user.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
 import {
   encryptField,
@@ -17,6 +26,7 @@ import {
   hydrateRequestDoc,
 } from './utils/session-data-crypto';
 import { TraceEmbeddingService } from './trace-embedding.service';
+import { APP_USER_CHAT_LIMIT } from '../apps/app-user.constants';
 
 type CodeRefEntry = {
   file: string;
@@ -26,6 +36,24 @@ type CodeRefEntry = {
   resultPreview?: string;
   durationMs?: number;
   metadata?: Record<string, any> | null;
+};
+
+export type AppSessionShape = {
+  sessionId: string;
+  appId: string;
+  startedAt?: Date;
+  finishedAt?: Date;
+  notes?: string;
+  userEmail?: string;
+  userId?: string;
+  env?: Record<string, any> | undefined;
+  createdAt?: Date;
+  updatedAt?: Date;
+};
+
+export type SessionListResultShape = {
+  items: AppSessionShape[];
+  nextCursor?: string;
 };
 
 @Injectable()
@@ -38,6 +66,13 @@ export class SessionsService {
     @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
     @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
+    @InjectModel(TraceSummary.name)
+    private readonly traceSummaries: Model<TraceSummary>,
+    @InjectModel(TraceNode.name) private readonly traceNodes: Model<TraceNode>,
+    @InjectModel(SessionChatMessage.name)
+    private readonly chatMessages: Model<SessionChatMessage>,
+    @InjectModel(AppUser.name)
+    private readonly appUsers: Model<AppUserDocument>,
     private readonly tenant: TenantContext,
     private readonly traceEmbeddings: TraceEmbeddingService,
   ) {}
@@ -1171,6 +1206,247 @@ export class SessionsService {
     tenantId: string;
   } {
     return { ...criteria, tenantId: this.tenant.tenantId };
+  }
+
+  async listSessionsForApp(
+    appId: string,
+    opts?: {
+      limit?: number;
+      cursor?: string;
+      search?: string;
+      status?: 'active' | 'finished';
+    },
+  ): Promise<SessionListResultShape> {
+    const limit = Math.max(1, Math.min(100, Number(opts?.limit) || 20));
+    const clauses: Record<string, any>[] = [this.tenantFilter({ appId })];
+
+    if (opts?.status === 'active') {
+      clauses.push({
+        $or: [{ finishedAt: { $exists: false } }, { finishedAt: null }],
+      });
+    } else if (opts?.status === 'finished') {
+      clauses.push({ finishedAt: { $ne: null } });
+    }
+
+    const cursorDate = this.coerceDate(opts?.cursor);
+    if (cursorDate) {
+      clauses.push({ startedAt: { $lt: cursorDate } });
+    }
+
+    const searchClauses = this.buildSessionSearchClauses(opts?.search);
+    if (searchClauses.length) {
+      clauses.push({ $or: searchClauses });
+    }
+
+    const filter =
+      clauses.length > 1 ? { $and: clauses } : clauses[0];
+
+    const docs = await this.sessions
+      .find(filter)
+      .sort({ startedAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .lean();
+
+    let nextCursor: string | undefined;
+    if (docs.length > limit) {
+      const tail = docs.pop();
+      nextCursor = tail?.startedAt
+        ? new Date(tail.startedAt).toISOString()
+        : undefined;
+    }
+
+    const items = docs.map((doc) => this.formatSessionDoc(doc));
+    return { items, nextCursor };
+  }
+
+  async getSessionForApp(appId: string, sessionId: string): Promise<AppSessionShape> {
+    const doc = await this.sessions
+      .findOne(this.tenantFilter({ _id: sessionId, appId }))
+      .lean();
+    if (!doc) {
+      throw new NotFoundException('Session not found');
+    }
+    return this.formatSessionDoc(doc);
+  }
+
+  async createSessionForApp(
+    appId: string,
+    input: {
+      notes?: string | null;
+      userEmail?: string | null;
+      startedAt?: Date | string | number | null;
+      finishedAt?: Date | string | number | null;
+      env?: Record<string, any> | null;
+      userId?: string | null;
+    },
+  ): Promise<AppSessionShape> {
+    const sessionId = 'S_' + randomUUID();
+    const startedAt = this.coerceDate(input.startedAt) ?? new Date();
+    const finishedAt = this.coerceDate(input.finishedAt);
+    const doc = await this.sessions.create(
+      this.tenantDoc({
+        _id: sessionId,
+        appId,
+        startedAt,
+        finishedAt: finishedAt ?? undefined,
+        notes: input.notes?.trim() || undefined,
+        userEmail: input.userEmail?.trim() || undefined,
+        env: input.env ?? undefined,
+        userId: input.userId ?? undefined,
+      }),
+    );
+    return this.formatSessionDoc(doc.toObject());
+  }
+
+  async updateSessionForApp(
+    appId: string,
+    sessionId: string,
+    update: {
+      notes?: string | null;
+      userEmail?: string | null;
+      startedAt?: Date | string | number | null;
+      finishedAt?: Date | string | number | null;
+      env?: Record<string, any> | null;
+    },
+  ): Promise<AppSessionShape> {
+    const doc = await this.sessions.findOne(
+      this.tenantFilter({ _id: sessionId, appId }),
+    );
+    if (!doc) {
+      throw new NotFoundException('Session not found');
+    }
+    if (typeof update.notes !== 'undefined') {
+      const trimmed =
+        typeof update.notes === 'string' ? update.notes.trim() : undefined;
+      doc.notes = trimmed || undefined;
+    }
+    if (typeof update.userEmail !== 'undefined') {
+      const trimmed =
+        typeof update.userEmail === 'string'
+          ? update.userEmail.trim()
+          : undefined;
+      doc.userEmail = trimmed || undefined;
+    }
+    if (typeof update.startedAt !== 'undefined') {
+      const coerced = this.coerceDate(update.startedAt);
+      if (coerced) {
+        doc.startedAt = coerced;
+      }
+    }
+    if (typeof update.finishedAt !== 'undefined') {
+      const coerced = this.coerceDate(update.finishedAt);
+      doc.finishedAt = coerced ?? undefined;
+    }
+    if (typeof update.env !== 'undefined') {
+      doc.env = update.env ?? undefined;
+    }
+    await doc.save();
+    return this.formatSessionDoc(doc.toObject());
+  }
+
+  async deleteSessionForApp(appId: string, sessionId: string) {
+    const res = await this.sessions.deleteOne(
+      this.tenantFilter({ _id: sessionId, appId }),
+    );
+    if (!res.deletedCount) {
+      throw new NotFoundException('Session not found');
+    }
+
+    const filter = this.tenantFilter({ sessionId, appId });
+    await Promise.all([
+      this.actions.deleteMany(filter),
+      this.requests.deleteMany(filter),
+      this.changes.deleteMany(filter),
+      this.chunks.deleteMany(filter),
+      this.emails.deleteMany(filter),
+      this.traces.deleteMany(filter),
+      this.traceSummaries.deleteMany(filter),
+      this.traceNodes.deleteMany(filter),
+      this.chatMessages.deleteMany(filter),
+    ]);
+    return { deleted: true };
+  }
+
+  async reserveChatQuota(
+    userId: string | undefined,
+    tenantId: string | undefined,
+  ) {
+    if (!userId || !tenantId) {
+      return null;
+    }
+    return this.appUsers
+      .findOneAndUpdate(
+        {
+          _id: userId,
+          tenantId,
+          chatEnabled: true,
+          chatUsageCount: { $lt: APP_USER_CHAT_LIMIT },
+        },
+        { $inc: { chatUsageCount: 1 } },
+        { new: true },
+      )
+      .lean();
+  }
+
+  async releaseChatQuota(
+    userId: string | undefined,
+    tenantId: string | undefined,
+  ) {
+    if (!userId || !tenantId) {
+      return;
+    }
+    await this.appUsers.updateOne(
+      {
+        _id: userId,
+        tenantId,
+        chatUsageCount: { $gt: 0 },
+      },
+      { $inc: { chatUsageCount: -1 } },
+    );
+  }
+
+  private buildSessionSearchClauses(query?: string | null) {
+    if (!query || !query.trim()) {
+      return [];
+    }
+    const pattern = this.escapeRegex(query.trim());
+    const regex = new RegExp(pattern, 'i');
+    return [{ _id: regex }, { notes: regex }, { userEmail: regex }];
+  }
+
+  private formatSessionDoc(doc: any): AppSessionShape {
+    if (!doc) {
+      throw new Error('Cannot format empty session document');
+    }
+    return {
+      sessionId: doc._id,
+      appId: doc.appId,
+      startedAt: doc.startedAt,
+      finishedAt: doc.finishedAt,
+      notes: doc.notes,
+      userEmail: doc.userEmail,
+      userId: doc.userId,
+      env: doc.env,
+      createdAt: doc.createdAt,
+      updatedAt: doc.updatedAt,
+    };
+  }
+
+  private coerceDate(
+    value?: Date | string | number | null,
+  ): Date | undefined {
+    if (value === null || typeof value === 'undefined') {
+      return undefined;
+    }
+    if (value instanceof Date) {
+      return Number.isNaN(value.getTime()) ? undefined : value;
+    }
+    const coerced = new Date(value);
+    return Number.isNaN(coerced.getTime()) ? undefined : coerced;
+  }
+
+  private escapeRegex(value: string) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   private tenantDoc<T extends Record<string, any>>(

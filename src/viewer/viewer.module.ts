@@ -14,6 +14,7 @@ import { EmailEvt, EmailEvtSchema } from '../sessions/schemas/emails.schema';
 import { AppUser, AppUserSchema } from '../apps/schemas/app-user.schema';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
 import { TenantModule } from '../common/tenant/tenant.module';
+import { TraceEvt, TraceEvtSchema } from '../sessions/schemas/trace.schema';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { TenantModule } from '../common/tenant/tenant.module';
       { name: RrwebChunk.name, schema: RrwebChunk },
       { name: EmailEvt.name, schema: EmailEvtSchema },
       { name: AppUser.name, schema: AppUserSchema },
+      { name: TraceEvt.name, schema: TraceEvtSchema },
     ]),
     TenantModule,
   ],

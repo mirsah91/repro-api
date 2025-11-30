@@ -10,6 +10,7 @@ import {
   ActionDetailsRespDto,
   SummaryRespDto,
   FullResponseDto,
+  TimelineActionsResponseDto,
 } from '../docs/dto/viewer.dto';
 import { Controller, Get, Param, Query, Req, UseGuards } from '@nestjs/common';
 import { ViewerService } from './viewer.service';
@@ -78,5 +79,15 @@ export class ViewerController {
         inc.includes('resp-diffs') ||
         inc.includes('responses'),
     });
+  }
+
+  @ApiBearerAuth('appUser')
+  @ApiSecurity('appId')
+  @UseGuards(AppUserTokenGuard)
+  @AppUserRoles(AppUserRole.Admin, AppUserRole.Viewer)
+  @Get('sessions/:sid/timeline-actions')
+  @ApiOkResponse({ type: TimelineActionsResponseDto })
+  timelineActions(@Param('sid') sid: string, @Req() req: any) {
+    return this.svc.timelineActions(sid, req.appId);
   }
 }

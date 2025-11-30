@@ -11,6 +11,8 @@ export class App {
   @Prop({ required: true }) encryptionKeyEnc: string;
   @Prop({ default: true }) enabled: boolean;
   @Prop() adminEmail?: string;
+  @Prop({ default: true }) chatEnabled?: boolean;
+  @Prop({ default: 0 }) chatUsageCount?: number;
 }
 export type AppDocument = HydratedDocument<App>;
 export const AppSchema = SchemaFactory.createForClass(App);

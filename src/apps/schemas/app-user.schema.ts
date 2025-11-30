@@ -26,6 +26,12 @@ export class AppUser {
 
   @Prop()
   name?: string;
+
+  @Prop({ default: false })
+  chatEnabled!: boolean;
+
+  @Prop({ type: Number, default: 0 })
+  chatUsageCount!: number;
 }
 
 export type AppUserDocument = HydratedDocument<AppUser>;

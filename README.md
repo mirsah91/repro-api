@@ -75,6 +75,10 @@ flowchart TD
 | `TLS_KEY_PATH` / `TLS_CERT_PATH` | Optional | When both are supplied, Nest will boot in HTTPS mode using the provided PEM files. |
 | `TLS_CA_PATH` | Optional | Additional CA bundle for HTTPS clients. |
 | `SECURE_LOG_DIR` / `SECURE_LOG_FILE` | Optional | Override the default location (`logs/secure.log.enc`) for AES-encrypted audit logs. |
+| `OPENAI_API_KEY` | Optional (required for chat/summaries) | API key used for LLM-backed summaries and Repro AI answers. |
+| `OPENAI_EMBEDDING_MODEL` | Optional | Override OpenAI embedding model when Voyage is unavailable (defaults to `text-embedding-3-small`). |
+| `VOYAGE_API_KEY` | Optional (recommended) | API key for Voyage embeddings that power the session graph index; falls back to OpenAI embeddings when unset. |
+| `VOYAGE_EMBEDDING_MODEL` | Optional | Override Voyage embedding model (defaults to `voyage-large-2`). |
 
 ## Request Headers
 
@@ -144,3 +148,9 @@ npm run start:dev
 ```
 
 Ensure your SDKs (React, Nest, Node) attach the tenant header – refer to their READMEs for configuration details.
+
+## Repro AI Graph
+
+- `POST /v1/sessions/:sessionId/ai/reindex` rebuilds `session_graph_nodes`, edges, and `session_facts_index` for the session using Voyage (or OpenAI) embeddings.
+- `POST /v1/sessions/:sessionId/ai/query` retrieves graph-aware context across actions → requests → traces → changes and returns a structured JSON answer with evidence, uncertainties, and follow-up suggestions.
+- Both endpoints require `chatEnabled` workspace users. Configure `VOYAGE_API_KEY` for best retrieval quality; the API will fall back to `OPENAI_API_KEY` embeddings when Voyage is unavailable.

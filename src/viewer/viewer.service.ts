@@ -6,8 +6,12 @@ import { Action } from '../sessions/schemas/action.schema';
 import { RequestEvt } from '../sessions/schemas/request.schema';
 import { DbChange } from '../sessions/schemas/db-change.schema';
 import { RrwebChunk } from '../sessions/schemas/rrweb-chunk.schema';
-import { FullResponseDto } from './viewer.dto';
+import {
+  FullResponseDto,
+  TimelineActionsResponseDto,
+} from './viewer.dto';
 import { EmailEvt } from '../sessions/schemas/emails.schema';
+import { TraceEvt } from '../sessions/schemas/trace.schema';
 import { TenantContext } from '../common/tenant/tenant-context';
 import {
   hydrateChangeDoc,
@@ -24,6 +28,7 @@ export class ViewerService {
     @InjectModel(DbChange.name) private changes: Model<DbChange>,
     @InjectModel(RrwebChunk.name) private chunks: Model<RrwebChunk>,
     @InjectModel(EmailEvt.name) private readonly emails: Model<EmailEvt>,
+    @InjectModel(TraceEvt.name) private readonly traces: Model<TraceEvt>,
     private readonly tenant: TenantContext,
   ) {}
 
@@ -174,6 +179,121 @@ export class ViewerService {
     const requests = reqDocs.map((doc) => hydrateRequestDoc(doc));
     const db = dbDocs.map((doc) => hydrateChangeDoc(doc));
     return { ui: a?.ui ?? {}, requests, db };
+  }
+
+  async timelineActions(
+    sessionId: string,
+    appId: string,
+  ): Promise<TimelineActionsResponseDto> {
+    await this.ensureSession(sessionId, appId);
+
+    const [actions, requestsRaw, changesRaw, tracesRaw] = await Promise.all([
+      this.actions
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ tStart: 1 })
+        .lean()
+        .exec(),
+      this.requests
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ t: 1 })
+        .lean()
+        .exec(),
+      this.changes
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ t: 1 })
+        .lean()
+        .exec(),
+      this.traces
+        .find(this.tenantFilter({ sessionId }))
+        .sort({ batchIndex: 1 })
+        .lean()
+        .exec(),
+    ]);
+
+    const changeByAction = new Map<string, any[]>();
+    changesRaw.forEach((change) => {
+      const hydrated = this.sanitizeDoc(hydrateChangeDoc(change));
+      const key = change.actionId ?? '';
+      const list = changeByAction.get(key) ?? [];
+      list.push(hydrated);
+      changeByAction.set(key, list);
+    });
+
+    const traceByRequest = new Map<string, any[]>();
+    tracesRaw.forEach((trace) => {
+      const cleaned = this.sanitizeDoc(trace);
+      const rid = trace.requestRid ?? '';
+      const list = traceByRequest.get(rid) ?? [];
+      list.push(cleaned);
+      traceByRequest.set(rid, list);
+    });
+    traceByRequest.forEach((list) =>
+      list.sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0)),
+    );
+
+    const actionPayloads = actions.map((action) => {
+      const cleaned = this.sanitizeDoc(action);
+      return {
+        ...cleaned,
+        actionId: cleaned.actionId ?? null,
+        label: cleaned.label ?? null,
+        tStart: typeof cleaned.tStart === 'number' ? cleaned.tStart : null,
+        tEnd: typeof cleaned.tEnd === 'number' ? cleaned.tEnd : null,
+        hasReq: typeof cleaned.hasReq === 'boolean' ? cleaned.hasReq : false,
+        hasDb: typeof cleaned.hasDb === 'boolean' ? cleaned.hasDb : false,
+        error: typeof cleaned.error === 'boolean' ? cleaned.error : false,
+        requests: [] as any[],
+        dbChanges: changeByAction.get(action.actionId ?? '') ?? [],
+      };
+    });
+
+    const actionByKey = new Map<string, any>();
+    actionPayloads.forEach((a) =>
+      actionByKey.set(a.actionId ?? '', a),
+    );
+
+    const fallbackActions = new Map<string, any>();
+    const ensureAction = (actionId?: string | null) => {
+      const key = actionId ?? '';
+      const existing = actionByKey.get(key);
+      if (existing) return existing;
+      const fallback = fallbackActions.get(key);
+      if (fallback) return fallback;
+      const placeholder = {
+        id: `missing:${key || 'unknown'}`,
+        actionId: actionId ?? null,
+        label: actionId ?? 'Unassigned action',
+        tStart: null,
+        tEnd: null,
+        hasReq: null,
+        hasDb: null,
+        error: null,
+        ui: {},
+        requests: [] as any[],
+        dbChanges: changeByAction.get(key) ?? [],
+      };
+      fallbackActions.set(key, placeholder);
+      return placeholder;
+    };
+
+    requestsRaw.forEach((req) => {
+      const hydrated = hydrateRequestDoc(req);
+      const cleaned = this.sanitizeDoc(hydrated);
+      cleaned.actionId = cleaned.actionId ?? null;
+      cleaned.url = cleaned.url ?? cleaned.path ?? null;
+      cleaned.path = typeof cleaned.path === 'string' ? cleaned.path : undefined;
+      cleaned.traces = traceByRequest.get(req.rid) ?? [];
+      cleaned.dbChanges = changeByAction.get(req.actionId ?? '') ?? [];
+      const action = ensureAction(req.actionId ?? '');
+      action.requests.push(cleaned);
+    });
+
+    fallbackActions.forEach((a) => actionPayloads.push(a));
+    actionPayloads.sort(
+      (a, b) => (a.tStart ?? Number.MAX_SAFE_INTEGER) - (b.tStart ?? Number.MAX_SAFE_INTEGER),
+    );
+
+    return { sessionId, actions: actionPayloads };
   }
 
   async full(
@@ -352,6 +472,46 @@ export class ViewerService {
       .replace(/[\n\r\t]/gm, '')
       .replace(/<\!--.*?-->/g, '')
       .replace(/\\"/g, '"');
+  }
+
+  private sanitizeDoc<T>(doc: T): T {
+    if (Array.isArray(doc)) {
+      return doc.map((item) => this.sanitizeDoc(item)) as unknown as T;
+    }
+    if (!doc || typeof doc !== 'object') {
+      return doc;
+    }
+    if (Buffer.isBuffer(doc)) {
+      return doc.toString('utf8') as unknown as T;
+    }
+    if (doc instanceof Date) {
+      return doc.toISOString() as unknown as T;
+    }
+    const cleaned: Record<string, any> = {};
+    Object.entries(doc as Record<string, any>).forEach(([key, value]) => {
+      if (key === '__v' || key === 'tenantId') {
+        return;
+      }
+      if (key === '_id') {
+        cleaned.id = this.normalizeId(value);
+        return;
+      }
+      cleaned[key] = this.sanitizeDoc(value);
+    });
+    return cleaned as T;
+  }
+
+  private normalizeId(val: any): string | undefined {
+    if (val === null || typeof val === 'undefined') {
+      return undefined;
+    }
+    if (typeof val === 'string') {
+      return val;
+    }
+    if (typeof val === 'object' && typeof val.toString === 'function') {
+      return val.toString();
+    }
+    return String(val);
   }
 
   private async ensureSession(sessionId: string, appId: string) {
