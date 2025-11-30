@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { VoyageAIClient } from 'voyageai';
 import OpenAI from 'openai';
 import { encode } from '@toon-format/toon';
@@ -57,6 +57,13 @@ const ANSWER_NODE_LIMIT = 10;
 const ANSWER_COLLECTION_LIMIT = 6;
 const ANSWER_STRING_LIMIT = 600;
 const ANSWER_LIST_LIMIT = 8;
+const ANSWER_VALUE_CHAR_LIMIT = 1200;
+const ANSWER_ARRAY_LIMIT = 20;
+const ANSWER_OBJECT_DEPTH_LIMIT = 6;
+const LISTING_COLLECTION_LIMIT = 120;
+const LISTING_CODE_REF_LIMIT = 3;
+const LISTING_CODE_PREVIEW_LIMIT = 160;
+const LISTING_PREVIEW_STRING_LIMIT = 300;
 
 type CoreCollectionName = 'actions' | 'requests' | 'traces' | 'changes';
 type CoreCollections = Partial<Record<CoreCollectionName, any[]>>;
@@ -86,6 +93,15 @@ type GraphSearchHit = {
   fact: SessionFact;
   score: number;
   node?: SessionGraphNode;
+};
+
+type AnswerHints = {
+  requestHint: boolean;
+  traceHint: boolean;
+  actionHint: boolean;
+  changeHint: boolean;
+  codeHint: boolean;
+  dbHint: boolean;
 };
 
 @Injectable()
@@ -565,7 +581,11 @@ export class SessionGraphService {
     nodeTypes?: string[];
     capabilityTags?: string[];
     limit?: number;
-  }): Promise<{ hits: GraphSearchHit[]; questionCapabilities: string[] }> {
+  }): Promise<{
+    hits: GraphSearchHit[];
+    questionCapabilities: string[];
+    listingTypes: string[];
+  }> {
     const { sessionId } = params;
     const filters: Record<string, any> = this.tenantFilter({ sessionId });
     if (params.nodeTypes?.length) {
@@ -582,7 +602,7 @@ export class SessionGraphService {
       .exec();
 
     if (!facts.length) {
-      return { hits: [], questionCapabilities: [] };
+      return { hits: [], questionCapabilities: [], listingTypes: [] };
     }
 
     const questionCapabilities = this.mergeTags(
@@ -593,8 +613,23 @@ export class SessionGraphService {
       params.question,
       params.nodeTypes,
     );
-    if (listingTypes.size) {
-      const filtered = facts.filter((fact) => listingTypes.has(fact.nodeType));
+    const questionHints = this.inferAnswerHints(params.question);
+    const listingSet = new Set<string>(listingTypes);
+    if (questionHints.requestHint) {
+      listingSet.add('request');
+    }
+    if (questionHints.traceHint) {
+      listingSet.add('trace_span');
+    }
+    if (questionHints.actionHint) {
+      listingSet.add('action');
+    }
+    if (questionHints.changeHint) {
+      listingSet.add('change');
+    }
+    const mergedListingTypes = Array.from(listingSet);
+    if (listingSet.size) {
+      const filtered = facts.filter((fact) => listingSet.has(fact.nodeType));
       if (filtered.length) {
         const maxHits = Math.max(
           5,
@@ -607,6 +642,7 @@ export class SessionGraphService {
             score: 1 - idx * 0.001,
           })),
           questionCapabilities,
+          listingTypes: mergedListingTypes,
         };
       }
     }
@@ -634,7 +670,11 @@ export class SessionGraphService {
       Math.max(5, Math.min(params.limit ?? FACT_RESULT_LIMIT, FACT_RESULT_LIMIT)),
     );
 
-    return { hits: limited, questionCapabilities };
+    return {
+      hits: limited,
+      questionCapabilities,
+      listingTypes: Array.from(listingTypes),
+    };
   }
 
   async answerQuestion(params: {
@@ -683,6 +723,7 @@ export class SessionGraphService {
     }
 
     const searchResult = await this.searchFacts(params);
+    const questionHints = this.inferAnswerHints(params.question);
     const hits = searchResult.hits;
     const nodeIds = hits.map((hit) => hit.fact.nodeId);
     const graph = await this.expandGraph(params.sessionId, nodeIds, 2);
@@ -693,12 +734,28 @@ export class SessionGraphService {
       hit.node = nodeMap.get(hit.fact.nodeId);
     });
 
+    const sessionCounts = await this.countSessionCollections(
+      params.sessionId,
+      sessionDoc.tenantId,
+    );
+    const listingPreviews = searchResult.listingTypes.length
+      ? await this.buildListingPreviews(
+          params.sessionId,
+          searchResult.listingTypes,
+          sessionDoc.tenantId,
+        )
+      : undefined;
+
     const answer = await this.generateAnswer({
       session: sessionDoc,
       question: params.question,
       hits,
       graph,
       questionCapabilities: searchResult.questionCapabilities,
+      listingTypes: searchResult.listingTypes,
+      sessionCounts,
+      listingPreviews,
+      questionHints,
     });
 
     return {
@@ -969,6 +1026,10 @@ export class SessionGraphService {
     hits: GraphSearchHit[];
     graph: { nodes: SessionGraphNode[]; edges: SessionGraphEdge[] };
     questionCapabilities: string[];
+    listingTypes: string[];
+    sessionCounts: Record<string, number>;
+    listingPreviews?: Record<string, any[]>;
+    questionHints: AnswerHints;
   }): Promise<ReproAiAnswer> {
     const systemPrompt = [
       'You are Repro AI, an expert assistant for a SINGLE debugging session.',
@@ -978,9 +1039,13 @@ export class SessionGraphService {
       '- Each document may include a nodeId that maps back to the internal session graph—use that nodeId in evidence when present.',
       '- Do not assume any other nodes or relationships beyond what appears in the provided documents.',
       '- When helpful, link related documents via shared identifiers (actionId ↔ requests/changes, requestRid ↔ traces, entryPoint.fn/file/line ↔ traces).',
+      '- The request header may include `sessionCounts` for the total number of actions/requests/traces/changes in the session—treat these as exact for any "how many" or counting questions.',
+      '- The header may also include `listingPreviews` with concise rows for actions/requests/traces/changes—use these as the authoritative list when enumerating items or mapping endpoints to handlers.',
+      '- For endpoint handler questions, look at request entryPoint (fn/file/line) and any trace spans for the same requestRid.',
       '',
       'GENERAL BEHAVIOR',
       '- Use only the provided documents to answer.',
+      '- When counting items (e.g., requests), prefer sessionCounts/listingPreviews over partial excerpts.',
       '- Prefer precise, concrete answers rooted in request payloads, trace arguments/returns, DB changes, and action metadata.',
       '- If the question refers to a “value”, “payload”, “body”, “argument”, “JSON”, “config”, “key”, or “secret”, treat this as a DATA LOOKUP task and quote the exact value(s) from the documents.',
       '- NEVER invent JSON payloads or specific scalar values (IDs, keys, amounts) that are not present in the documents.',
@@ -1046,6 +1111,9 @@ export class SessionGraphService {
       sessionId: payload.session._id,
       hits: payload.hits,
       graph: payload.graph,
+      listingTypes: payload.listingTypes,
+      tenantId: payload.session.tenantId,
+      questionHints: payload.questionHints,
     });
     const toonData = this.collectionsToToon(context.collections);
     const header = {
@@ -1054,7 +1122,16 @@ export class SessionGraphService {
       targetCapabilities: payload.questionCapabilities,
       dataFormat: 'TOON',
       resultCounts: this.countCollections(context.collections),
+      sessionCounts: payload.sessionCounts,
+      listingTypes: payload.listingTypes,
+      listingPreviews: payload.listingPreviews,
     };
+    if (!payload.listingTypes?.length) {
+      delete (header as any).listingTypes;
+    }
+    if (!payload.listingPreviews || !Object.keys(payload.listingPreviews).length) {
+      delete (header as any).listingPreviews;
+    }
     const userContent = [
       JSON.stringify(header, null, 2),
       toonData
@@ -1080,10 +1157,8 @@ export class SessionGraphService {
         messages,
         max_tokens: 1100,
       });
-      // const completion = {} as any
       const raw = completion.choices?.[0]?.message?.content?.trim();
 
-      console.log('raw ---->', raw)
       const parsedFromSdk =
         (completion as any)?.choices?.[0]?.message?.parsed ??
         (completion as any)?.choices?.[0]?.message?.content?.parsed;
@@ -1103,84 +1178,286 @@ export class SessionGraphService {
     return this.buildFallbackAnswer(payload.question, factPayload);
   }
 
+  private async countSessionCollections(
+    sessionId: string,
+    tenantId?: string,
+  ): Promise<Record<string, number>> {
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+    const [actions, requests, traces, changes] = await Promise.all([
+      this.actions.countDocuments(filters).exec(),
+      this.requests.countDocuments(filters).exec(),
+      this.traceSummaries.countDocuments(filters).exec(),
+      this.changes.countDocuments(filters).exec(),
+    ]);
+    return { actions, requests, traces, changes };
+  }
+
+  private async buildListingPreviews(
+    sessionId: string,
+    listingTypes: string[],
+    tenantId?: string,
+  ): Promise<Record<string, any[]>> {
+    const requested = new Set(listingTypes.map((t) => t.toLowerCase()));
+    const previews: Record<string, any[]> = {};
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+
+    if (requested.has('request')) {
+      const docs = await this.requests
+        .find(filters)
+        .sort({ t: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      previews.requests = docs.map((doc) => {
+        const hydrated = hydrateRequestDoc(doc);
+        const rid = hydrated.rid ?? this.normalizeId(hydrated._id);
+        const entryPoint = hydrated.entryPoint
+          ? {
+              fn: hydrated.entryPoint.fn,
+              file: hydrated.entryPoint.file,
+              line: hydrated.entryPoint.line,
+            }
+          : undefined;
+        const codeRefs = Array.isArray(hydrated.codeRefs)
+          ? hydrated.codeRefs.slice(0, LISTING_CODE_REF_LIMIT).map((ref) => ({
+              fn: ref?.fn,
+              file: ref?.file,
+              line: ref?.line,
+              argsPreview: this.truncate(
+                ref?.argsPreview ? String(ref.argsPreview) : '',
+                LISTING_CODE_PREVIEW_LIMIT,
+              ),
+              resultPreview: this.truncate(
+                ref?.resultPreview ? String(ref.resultPreview) : '',
+                LISTING_CODE_PREVIEW_LIMIT,
+              ),
+            }))
+          : undefined;
+        return {
+          nodeId: rid ? `request:${rid}` : undefined,
+          id: this.normalizeId(hydrated._id),
+          rid,
+          method: hydrated.method,
+          url: this.truncate(
+            typeof hydrated.url === 'string' ? hydrated.url : String(hydrated.url ?? ''),
+            LISTING_PREVIEW_STRING_LIMIT,
+          ),
+          status: hydrated.status,
+          actionId: hydrated.actionId,
+          t: hydrated.t,
+          entryPoint,
+          codeRefs,
+        };
+      });
+    }
+
+    if (requested.has('action')) {
+      const docs = await this.actions
+        .find(filters)
+        .sort({ tStart: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      previews.actions = docs.map((doc) => {
+        const actionId = doc.actionId ?? this.normalizeId(doc._id);
+        return {
+          nodeId: actionId ? `action:${actionId}` : undefined,
+          actionId,
+          label: doc.label,
+          tStart: doc.tStart,
+          tEnd: doc.tEnd,
+          hasReq: doc.hasReq,
+          hasDb: doc.hasDb,
+          error: doc.error,
+        };
+      });
+    }
+
+    if (requested.has('change')) {
+      const docs = await this.changes
+        .find(filters)
+        .sort({ t: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      previews.changes = docs.map((doc) => {
+        const changeId = this.normalizeId(doc._id);
+        return {
+          nodeId: changeId ? `change:${changeId}` : undefined,
+          id: changeId,
+          collection: doc.collection,
+          op: doc.op,
+          actionId: doc.actionId,
+          t: doc.t,
+          pk: this.truncate(
+            typeof doc.pk === 'string' ? doc.pk : JSON.stringify(doc.pk ?? ''),
+            LISTING_PREVIEW_STRING_LIMIT,
+          ),
+        };
+      });
+    }
+
+    if (requested.has('trace_span')) {
+      const docs = await this.traceSummaries
+        .find(filters)
+        .sort({ segmentIndex: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      previews.traces = docs.map((doc) => {
+        const chunkId =
+          typeof doc.chunkId === 'string'
+            ? doc.chunkId
+            : typeof doc.segmentHash === 'string'
+              ? doc.segmentHash
+              : undefined;
+        const nodeId = chunkId ? `trace:${chunkId}` : undefined;
+        return {
+          nodeId,
+          chunkId,
+          functionName: doc.functionName,
+          filePath: doc.filePath,
+          requestRid: doc.requestRid,
+          segmentIndex: doc.segmentIndex,
+          summary: this.truncate(
+            typeof doc.summary === 'string' ? doc.summary : '',
+            LISTING_PREVIEW_STRING_LIMIT,
+          ),
+        };
+      });
+    }
+
+    return previews;
+  }
+
   private async buildAnswerCollections(payload: {
     sessionId: string;
     hits: GraphSearchHit[];
     graph: { nodes: SessionGraphNode[]; edges: SessionGraphEdge[] };
+    listingTypes?: string[];
+    tenantId?: string;
+    questionHints?: AnswerHints;
   }): Promise<{ collections: CoreCollections; selection: NodeSelection[] }> {
+    const listingTypeSet = new Set(
+      (payload.listingTypes ?? []).map((t) => t.toLowerCase()),
+    );
     const nodeMap = new Map<string, SessionGraphNode>(
       payload.graph.nodes.map((node) => [node._id, node] as const),
     );
     const selection: NodeSelection[] = [];
-    if (!nodeMap.size) {
+    if (!nodeMap.size && !listingTypeSet.size) {
       return { collections: {}, selection };
     }
 
     const candidateIds: string[] = [];
     const seen = new Set<string>();
-    const addCandidate = (nodeId?: string | null): boolean => {
-      if (!nodeId || !nodeMap.has(nodeId) || seen.has(nodeId)) {
-        return false;
-      }
-      if (seen.size >= ANSWER_NODE_LIMIT) {
-        return false;
-      }
-      seen.add(nodeId);
-      candidateIds.push(nodeId);
-      return true;
-    };
-
-    const seedHits = payload.hits.slice(0, ANSWER_PRIMARY_HIT_LIMIT);
-    seedHits.forEach((hit) => addCandidate(hit.fact.nodeId));
-
-    let neighborBudget = ANSWER_NEIGHBOR_LIMIT;
-    if (neighborBudget > 0 && payload.graph.edges?.length) {
-      const neighborSeen = new Set<string>();
-      const neighborPriority = (nodeId: string): number => {
-        const nodeType = nodeMap.get(nodeId)?.type;
-        switch (nodeType) {
-          case 'request':
-            return 0;
-          case 'change':
-            return 1;
-          case 'action':
-            return 2;
-          case 'trace_span':
-            return 3;
-          default:
-            return 4;
+    if (nodeMap.size) {
+      const addCandidate = (nodeId?: string | null): boolean => {
+        if (!nodeId || !nodeMap.has(nodeId) || seen.has(nodeId)) {
+          return false;
         }
-      };
-      const candidates: Array<{ nodeId: string; priority: number }> = [];
-      const pushNeighbor = (nodeId?: string | null) => {
-        if (!nodeId || seen.has(nodeId) || neighborSeen.has(nodeId)) {
-          return;
+        if (seen.size >= ANSWER_NODE_LIMIT) {
+          return false;
         }
-        const node = nodeMap.get(nodeId);
-        if (!node) {
-          return;
-        }
-        neighborSeen.add(nodeId);
-        candidates.push({ nodeId, priority: neighborPriority(nodeId) });
+        seen.add(nodeId);
+        candidateIds.push(nodeId);
+        return true;
       };
 
-      payload.graph.edges.forEach((edge) => {
-        if (seen.has(edge.fromNodeId)) {
-          pushNeighbor(edge.toNodeId);
-        }
-        if (edge.toNodeId && seen.has(edge.toNodeId)) {
-          pushNeighbor(edge.fromNodeId);
-        }
-      });
+      const seedHits = payload.hits.slice(0, ANSWER_PRIMARY_HIT_LIMIT);
+      seedHits.forEach((hit) => addCandidate(hit.fact.nodeId));
 
-      candidates.sort((a, b) => a.priority - b.priority);
-      for (const candidate of candidates) {
-        if (!neighborBudget) {
-          break;
+      let neighborBudget = ANSWER_NEIGHBOR_LIMIT;
+      if (neighborBudget > 0 && payload.graph.edges?.length) {
+        const neighborSeen = new Set<string>();
+        const neighborPriority = (nodeId: string): number => {
+          const nodeType = nodeMap.get(nodeId)?.type;
+          switch (nodeType) {
+            case 'request':
+              return 0;
+            case 'trace_span':
+              return payload.questionHints?.traceHint ? 0 : 3;
+            case 'change':
+              return 1;
+            case 'action':
+              return 2;
+            default:
+              return 4;
+          }
+        };
+        const candidates: Array<{ nodeId: string; priority: number }> = [];
+        const pushNeighbor = (nodeId?: string | null) => {
+          if (!nodeId || seen.has(nodeId) || neighborSeen.has(nodeId)) {
+            return;
+          }
+          const node = nodeMap.get(nodeId);
+          if (!node) {
+            return;
+          }
+          neighborSeen.add(nodeId);
+          candidates.push({ nodeId, priority: neighborPriority(nodeId) });
+        };
+
+        payload.graph.edges.forEach((edge) => {
+          if (seen.has(edge.fromNodeId)) {
+            pushNeighbor(edge.toNodeId);
+          }
+          if (edge.toNodeId && seen.has(edge.toNodeId)) {
+            pushNeighbor(edge.fromNodeId);
+          }
+        });
+
+        candidates.sort((a, b) => a.priority - b.priority);
+        for (const candidate of candidates) {
+          if (!neighborBudget) {
+            break;
+          }
+          if (addCandidate(candidate.nodeId)) {
+            neighborBudget -= 1;
+          }
         }
-        if (addCandidate(candidate.nodeId)) {
-          neighborBudget -= 1;
+      }
+
+      const ensureType = (type: string, limit = 3) => {
+        const currentCount = candidateIds.filter(
+          (id) => nodeMap.get(id)?.type === type,
+        ).length;
+        if (currentCount >= limit) {
+          return;
         }
+        for (const node of nodeMap.values()) {
+          if (node.type === type && addCandidate(node._id)) {
+            if (
+              candidateIds.filter((id) => nodeMap.get(id)?.type === type).length >=
+              limit
+            ) {
+              break;
+            }
+          }
+        }
+      };
+
+      if (payload.questionHints?.requestHint) {
+        ensureType('request', 3);
+      }
+
+      if (payload.questionHints?.traceHint) {
+        const requestIds = candidateIds.filter(
+          (id) => nodeMap.get(id)?.type === 'request',
+        );
+        if (requestIds.length) {
+          payload.graph.edges.forEach((edge) => {
+            if (requestIds.includes(edge.fromNodeId)) {
+              addCandidate(edge.toNodeId);
+            }
+            if (edge.toNodeId && requestIds.includes(edge.toNodeId)) {
+              addCandidate(edge.fromNodeId);
+            }
+          });
+        }
+        ensureType('trace_span', 3);
       }
     }
 
@@ -1216,11 +1493,88 @@ export class SessionGraphService {
       }
     });
 
+    const baseFilters = (() => {
+      const base = this.tenantFilter({ sessionId: payload.sessionId });
+      return payload.tenantId ? { ...base, tenantId: payload.tenantId } : base;
+    })();
+    if (listingTypeSet.has('action')) {
+      const docs = await this.actions
+        .find(baseFilters)
+        .select({ actionId: 1 })
+        .sort({ tStart: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      docs.forEach((doc) => {
+        const actionId = doc?.actionId ?? this.normalizeId(doc?._id);
+        if (actionId && !actionRefs.has(actionId)) {
+          actionRefs.set(actionId, `action:${actionId}`);
+        }
+      });
+    }
+
+    if (listingTypeSet.has('request')) {
+      const docs = await this.requests
+        .find(baseFilters)
+        .select({ rid: 1 })
+        .sort({ t: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      docs.forEach((doc) => {
+        const rid = doc?.rid ?? this.normalizeId(doc?._id);
+        if (rid && !requestRefs.has(rid)) {
+          requestRefs.set(rid, `request:${rid}`);
+        }
+      });
+    }
+
+    if (listingTypeSet.has('change')) {
+      const docs = await this.changes
+        .find(baseFilters)
+        .select({ _id: 1 })
+        .sort({ t: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      docs.forEach((doc) => {
+        const changeId = this.normalizeId(doc?._id);
+        if (changeId && !changeRefs.has(changeId)) {
+          changeRefs.set(changeId, `change:${changeId}`);
+        }
+      });
+    }
+
+    if (listingTypeSet.has('trace_span')) {
+      const docs = await this.traceSummaries
+        .find(baseFilters)
+        .select({ requestRid: 1, chunkId: 1, segmentHash: 1 })
+        .sort({ segmentIndex: 1, _id: 1 })
+        .limit(LISTING_COLLECTION_LIMIT)
+        .lean()
+        .exec();
+      docs.forEach((doc) => {
+        if (typeof doc?.requestRid === 'string' && doc.requestRid) {
+          if (!traceRequestRefs.has(doc.requestRid)) {
+            const chunkId =
+              typeof doc.chunkId === 'string'
+                ? doc.chunkId
+                : typeof doc.segmentHash === 'string'
+                  ? doc.segmentHash
+                  : doc.requestRid;
+            traceRequestRefs.set(doc.requestRid, `trace:${chunkId}`);
+          }
+        }
+      });
+    }
+
     const collections: CoreCollections = {};
     collections.actions = await this.loadActionsForIds(
       payload.sessionId,
       Array.from(actionRefs.keys()),
       actionRefs,
+      listingTypeSet.has('action') ? LISTING_COLLECTION_LIMIT : undefined,
+      payload.tenantId,
     );
     const requestIds = new Set<string>(requestRefs.keys());
     traceRequestRefs.forEach((_nodeId, rid) => {
@@ -1232,16 +1586,22 @@ export class SessionGraphService {
       payload.sessionId,
       Array.from(requestIds),
       requestRefs,
+      listingTypeSet.has('request') ? LISTING_COLLECTION_LIMIT : undefined,
+      payload.tenantId,
     );
     collections.changes = await this.loadChangesForIds(
       payload.sessionId,
       Array.from(changeRefs.keys()),
       changeRefs,
+      listingTypeSet.has('change') ? LISTING_COLLECTION_LIMIT : undefined,
+      payload.tenantId,
     );
     collections.traces = await this.loadTracesForIds(
       payload.sessionId,
       Array.from(traceRequestRefs.keys()),
       traceRequestRefs,
+      listingTypeSet.has('trace_span') ? LISTING_COLLECTION_LIMIT : undefined,
+      payload.tenantId,
     );
 
     return { collections, selection };
@@ -1251,19 +1611,29 @@ export class SessionGraphService {
     sessionId: string,
     actionIds: string[],
     nodeLookup: Map<string, string>,
+    limit = ANSWER_COLLECTION_LIMIT,
+    tenantId?: string,
   ): Promise<any[]> {
-    const limited = actionIds.slice(0, ANSWER_COLLECTION_LIMIT);
+    const limited = actionIds.slice(0, limit);
     if (!limited.length) {
       return [];
     }
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+    const objectIds = limited.filter((id) => Types.ObjectId.isValid(id));
     const docs = await this.actions
       .find(
-        this.tenantFilter({
-          sessionId,
-          actionId: { $in: limited },
-        }),
+        {
+          ...filters,
+          $or: [
+            { actionId: { $in: limited } },
+            ...(objectIds.length ? [{ _id: { $in: objectIds } }] : []),
+          ],
+        },
+        undefined,
+        { strict: false },
       )
-      .limit(ANSWER_COLLECTION_LIMIT)
+      .limit(limit)
       .lean()
       .exec();
 
@@ -1271,8 +1641,11 @@ export class SessionGraphService {
       const cleaned = this.sanitizeForAnswer(doc);
       const nodeId =
         typeof doc?.actionId === 'string'
-          ? nodeLookup.get(doc.actionId)
-          : undefined;
+          ? nodeLookup.get(doc.actionId) ?? `action:${doc.actionId}`
+          : (() => {
+              const id = this.normalizeId(doc?._id);
+              return id ? nodeLookup.get(id) ?? `action:${id}` : undefined;
+            })();
       if (nodeId) {
         (cleaned as Record<string, any>).nodeId = nodeId;
       }
@@ -1282,7 +1655,7 @@ export class SessionGraphService {
     return this.orderDocs(
       sanitized,
       limited,
-      (doc) => (doc as any)?.actionId ?? undefined,
+      (doc) => (doc as any)?.actionId ?? (doc as any)?.id ?? undefined,
     );
   }
 
@@ -1290,27 +1663,42 @@ export class SessionGraphService {
     sessionId: string,
     rids: string[],
     nodeLookup: Map<string, string>,
+    limit = ANSWER_COLLECTION_LIMIT,
+    tenantId?: string,
   ): Promise<any[]> {
-    const limited = rids.slice(0, ANSWER_COLLECTION_LIMIT);
+    const limited = rids.slice(0, limit);
     if (!limited.length) {
       return [];
     }
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+    const objectIds = limited.filter((id) => Types.ObjectId.isValid(id));
     const docs = await this.requests
       .find(
-        this.tenantFilter({
-          sessionId,
-          rid: { $in: limited },
-        }),
+        {
+          ...filters,
+          $or: [
+            { rid: { $in: limited } },
+            ...(objectIds.length ? [{ _id: { $in: objectIds } }] : []),
+          ],
+        },
+        undefined,
+        { strict: false },
       )
-      .limit(ANSWER_COLLECTION_LIMIT)
+      .limit(limit)
       .lean()
       .exec();
 
     const sanitized = docs.map((doc) => {
       const hydrated = hydrateRequestDoc(doc);
       const cleaned = this.sanitizeForAnswer(hydrated);
-      const nodeId =
-        typeof doc?.rid === 'string' ? nodeLookup.get(doc.rid) : undefined;
+      const requestKey =
+        typeof doc?.rid === 'string' && doc.rid
+          ? doc.rid
+          : this.normalizeId(doc?._id);
+      const nodeId = requestKey
+        ? nodeLookup.get(requestKey) ?? `request:${requestKey}`
+        : undefined;
       if (nodeId) {
         (cleaned as Record<string, any>).nodeId = nodeId;
       }
@@ -1320,7 +1708,7 @@ export class SessionGraphService {
     return this.orderDocs(
       sanitized,
       limited,
-      (doc) => (doc as any)?.rid ?? undefined,
+      (doc) => (doc as any)?.rid ?? (doc as any)?.id ?? undefined,
     );
   }
 
@@ -1328,19 +1716,22 @@ export class SessionGraphService {
     sessionId: string,
     changeIds: string[],
     nodeLookup: Map<string, string>,
+    limit = ANSWER_COLLECTION_LIMIT,
+    tenantId?: string,
   ): Promise<any[]> {
-    const limited = changeIds.slice(0, ANSWER_COLLECTION_LIMIT);
+    const limited = changeIds.slice(0, limit);
     if (!limited.length) {
       return [];
     }
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+    const objectIds = limited.filter((id) => Types.ObjectId.isValid(id));
     const docs = await this.changes
-      .find(
-        this.tenantFilter({
-          sessionId,
-          _id: { $in: limited },
-        }),
-      )
-      .limit(ANSWER_COLLECTION_LIMIT)
+      .find({
+        ...filters,
+        ...(objectIds.length ? { _id: { $in: objectIds } } : { _id: { $in: [] } }),
+      })
+      .limit(limit)
       .lean()
       .exec();
 
@@ -1348,7 +1739,9 @@ export class SessionGraphService {
       const hydrated = hydrateChangeDoc(doc);
       const cleaned = this.sanitizeForAnswer(hydrated);
       const changeId = this.normalizeId(doc?._id);
-      const nodeId = changeId ? nodeLookup.get(changeId) : undefined;
+      const nodeId = changeId
+        ? nodeLookup.get(changeId) ?? `change:${changeId}`
+        : undefined;
       if (nodeId) {
         (cleaned as Record<string, any>).nodeId = nodeId;
       }
@@ -1366,20 +1759,30 @@ export class SessionGraphService {
     sessionId: string,
     requestRids: string[],
     traceRequestRefs: Map<string, string>,
+    limit = ANSWER_COLLECTION_LIMIT,
+    tenantId?: string,
   ): Promise<any[]> {
-    const limitedRids = requestRids.slice(0, ANSWER_COLLECTION_LIMIT);
+    const limitedRids = requestRids.slice(0, limit);
     if (!limitedRids.length) {
       return [];
     }
 
+    const base = this.tenantFilter({ sessionId });
+    const filters = tenantId ? { ...base, tenantId } : base;
+    const objectIds = limitedRids.filter((id) => Types.ObjectId.isValid(id));
     const docs = await this.traces
       .find(
-        this.tenantFilter({
-          sessionId,
-          requestRid: { $in: limitedRids },
-        }),
+        {
+          ...filters,
+          $or: [
+            { requestRid: { $in: limitedRids } },
+            ...(objectIds.length ? [{ _id: { $in: objectIds } }] : []),
+          ],
+        },
+        undefined,
+        { strict: false },
       )
-      .limit(ANSWER_COLLECTION_LIMIT)
+      .limit(limit)
       .lean()
       .exec();
 
@@ -1389,7 +1792,9 @@ export class SessionGraphService {
         delete (cleaned as Record<string, any>).data;
       }
       const nodeId =
-        doc.requestRid && traceRequestRefs.get(String(doc.requestRid));
+        doc.requestRid &&
+        (traceRequestRefs.get(String(doc.requestRid)) ??
+          `trace:${String(doc.requestRid)}`);
       if (nodeId) {
         (cleaned as Record<string, any>).nodeId = nodeId;
       }
@@ -1496,18 +1901,35 @@ export class SessionGraphService {
     return undefined;
   }
 
-  private sanitizeForAnswer<T>(doc: T): T {
-    if (Array.isArray(doc)) {
-      return doc.map((item) => this.sanitizeForAnswer(item)) as unknown as T;
+  private sanitizeForAnswer<T>(doc: T, depth = 0): T {
+    if (typeof doc === 'string') {
+      return this.truncate(doc, ANSWER_VALUE_CHAR_LIMIT) as unknown as T;
+    }
+    if (Buffer.isBuffer(doc)) {
+      return this.truncate(
+        doc.toString('utf8'),
+        ANSWER_VALUE_CHAR_LIMIT,
+      ) as unknown as T;
+    }
+    if (doc instanceof Date) {
+      return doc.toISOString() as unknown as T;
     }
     if (!doc || typeof doc !== 'object') {
       return doc;
     }
-    if (Buffer.isBuffer(doc)) {
-      return doc.toString('utf8') as unknown as T;
+    if (depth >= ANSWER_OBJECT_DEPTH_LIMIT) {
+      return '[truncated]' as unknown as T;
     }
-    if (doc instanceof Date) {
-      return doc.toISOString() as unknown as T;
+    if (Array.isArray(doc)) {
+      const limited = doc.slice(0, ANSWER_ARRAY_LIMIT).map((item) =>
+        this.sanitizeForAnswer(item, depth + 1),
+      );
+      if (doc.length > ANSWER_ARRAY_LIMIT) {
+        limited.push(
+          `[+${doc.length - ANSWER_ARRAY_LIMIT} more items]` as unknown as T,
+        );
+      }
+      return limited as unknown as T;
     }
     const cloned: Record<string, any> = {};
     Object.entries(doc as Record<string, any>).forEach(([key, value]) => {
@@ -1518,8 +1940,12 @@ export class SessionGraphService {
         cloned.id = this.normalizeId(value);
         return;
       }
-      const sanitized = this.sanitizeForAnswer(value);
-      cloned[key] = sanitized;
+      const sanitized = this.sanitizeForAnswer(value, depth + 1);
+      if (typeof sanitized === 'string') {
+        cloned[key] = this.truncate(sanitized, ANSWER_VALUE_CHAR_LIMIT);
+      } else {
+        cloned[key] = sanitized;
+      }
     });
     return cloned as T;
   }
@@ -2006,6 +2432,30 @@ export class SessionGraphService {
     return this.tryParseJson<ReproAiAnswer>(trimmed);
   }
 
+  private inferAnswerHints(question: string): AnswerHints {
+    const normalized = question.toLowerCase();
+    const requestHint = /\b(request|endpoint|route|url|api|call|http)\b/.test(
+      normalized,
+    );
+    const traceHint = /\b(trace|span|function|fn|handler|file|line|code|controller|service|stack)\b/.test(
+      normalized,
+    );
+    const actionHint = /\b(action|ui|button|click|step|event)\b/.test(
+      normalized,
+    );
+    const changeHint = /\b(change|db|database|insert|update|delete|write|query|mongo|sql|table|collection)\b/.test(
+      normalized,
+    );
+    return {
+      requestHint,
+      traceHint,
+      actionHint,
+      changeHint,
+      codeHint: traceHint,
+      dbHint: changeHint,
+    };
+  }
+
   private inferListingTypes(
     question: string,
     nodeTypes?: string[],
@@ -2014,34 +2464,46 @@ export class SessionGraphService {
     const listingHint = /\b(list|show|display|enumerate|all|every|full|complete)\b/.test(
       normalized,
     );
-    if (!listingHint) {
-      return new Set();
-    }
-
+    const countHint = /\b(how many|count|number of|total)\b/.test(normalized);
     const requested = new Set<string>();
     const add = (type: string) => requested.add(type);
     const hasToken = (pattern: RegExp) => pattern.test(normalized);
 
     nodeTypes?.forEach((type) => add(type));
 
-    if (hasToken(/\b(request|endpoint|endpoints|api|call|route)s?\b/)) {
+    const requestHint = hasToken(
+      /\b(request|endpoint|endpoints|api|call|route|http|url)s?\b/,
+    );
+    const changeHint = hasToken(
+      /\b(change|db|database|write|insert|update|delete|query|mutation)\b/,
+    );
+    const traceHint = hasToken(/\b(trace|span|function|stack|code)\b/);
+    const actionHint = hasToken(/\b(action|step|event|ui)\b/);
+
+    if (listingHint || countHint) {
+      if (requestHint) {
+        add('request');
+      }
+      if (changeHint) {
+        add('change');
+      }
+      if (traceHint) {
+        add('trace_span');
+      }
+      if (actionHint) {
+        add('action');
+      }
+    }
+
+    if (!requested.size && listingHint && hasToken(/\ball\b/)) {
       add('request');
-    }
-    if (hasToken(/\b(change|db|database|write|insert|update|delete|query)\b/)) {
       add('change');
-    }
-    if (hasToken(/\b(trace|span|function|stack|code)\b/)) {
       add('trace_span');
-    }
-    if (hasToken(/\b(action|step|event|ui)\b/)) {
       add('action');
     }
 
-    if (!requested.size && hasToken(/\ball\b/)) {
+    if (!requested.size && countHint && requestHint) {
       add('request');
-      add('change');
-      add('trace_span');
-      add('action');
     }
 
     return requested;
