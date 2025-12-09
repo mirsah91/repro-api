@@ -7,6 +7,7 @@ import { SdkModule } from './sdk/sdk.module';
 import { SessionsModule } from './sessions/sessions.module';
 import { ViewerModule } from './viewer/viewer.module';
 import { ChatModule } from './chat/chat.module';
+import { ChatTestModule } from './chat-test/chat-test.module';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { ChatModule } from './chat/chat.module';
     SessionsModule,
     ViewerModule,
     ChatModule,
+    ChatTestModule,
   ],
 })
 export class AppModule {}
