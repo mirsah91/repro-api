@@ -63,7 +63,10 @@ export class ViewerController {
   @ApiOkResponse({ type: FullResponseDto })
   full(
     @Param('sid') sid: string,
-    @Query('include') include?: string, // e.g., "rrweb,respdiffs"
+    @Query('include') include?: string, // e.g., "rrweb,respdiffs,traces"
+    @Query('includeRrweb') includeRrweb?: string,
+    @Query('includeRespDiffs') includeRespDiffs?: string,
+    @Query('includeTraces') includeTraces?: string,
     @Req() req?: any,
   ): Promise<FullResponseDto> {
     const inc = (include || '')
@@ -71,13 +74,19 @@ export class ViewerController {
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean);
 
+    const truthy = (v?: string) =>
+      typeof v === 'string' &&
+      ['1', 'true', 'yes', 'y', 'on'].includes(v.trim().toLowerCase());
+
     return this.svc.full(sid, {
       appId: req?.appId,
-      includeRrweb: inc.includes('rrweb'),
+      includeRrweb: inc.includes('rrweb') || truthy(includeRrweb),
       includeRespDiffs:
         inc.includes('respdiffs') ||
         inc.includes('resp-diffs') ||
-        inc.includes('responses'),
+        inc.includes('responses') ||
+        truthy(includeRespDiffs),
+      includeTraces: inc.includes('traces') || inc.includes('trace') || truthy(includeTraces),
     });
   }
 

@@ -96,6 +96,16 @@ export class BackendDbChangeDto {
   after?: Record<string, any> | null;
   @ApiProperty({ example: 'update', enum: ['insert', 'update', 'delete'] })
   op!: 'insert' | 'update' | 'delete';
+  @ApiPropertyOptional({
+    description: 'Trace/span context for correlating DB change to a function trace',
+    example: { traceId: 't1', spanId: 42, parentSpanId: 41, depth: 3 },
+  })
+  spanContext?: {
+    traceId?: string | null;
+    spanId?: string | number | null;
+    parentSpanId?: string | number | null;
+    depth?: number | null;
+  };
 }
 export class BackendTraceBatchDto {
   @ApiProperty({ example: 'R12' }) rid!: string;

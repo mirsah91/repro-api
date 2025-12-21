@@ -951,6 +951,7 @@ export class SessionsService {
             collection: d.collection,
             op: d.op ?? 'update',
             t: alignedTime,
+            spanContext: d.spanContext,
           };
 
           if (typeof d.pk !== 'undefined') {
@@ -974,6 +975,10 @@ export class SessionsService {
 
           if (typeof d.error !== 'undefined') {
             changePayload.error = encryptField(d.error ?? null);
+          }
+
+          if (typeof d.spanContext !== 'undefined') {
+            changePayload.spanContext = d.spanContext ?? null;
           }
 
           await this.changes.create(this.tenantDoc(changePayload));
