@@ -162,6 +162,13 @@ export class RequestEvtDto {
   })
   // eslint-disable-next-line @typescript-eslint/ban-types
   respBody?: any;
+
+  @ApiProperty({ required: false, type: () => [TimelineTraceDto] })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TimelineTraceDto)
+  traces?: TimelineTraceDto[];
 }
 
 export class DbPkDto {
@@ -233,6 +240,16 @@ export class DbChangeDto {
   @ApiProperty({ description: 'ms since epoch' })
   @IsNumber()
   t!: number;
+
+  @ApiProperty({
+    required: false,
+    description: 'Trace/span context for this DB change',
+    type: Object,
+    additionalProperties: true,
+  })
+  @IsOptional()
+  @IsObject()
+  spanContext?: Record<string, any>;
 }
 
 export class ActionWithDetailsDto extends ActionBaseDto {
@@ -394,12 +411,6 @@ export class TimelineTraceDto {
 }
 
 export class TimelineRequestDto extends RequestEvtDto {
-  @ApiProperty({ type: [TimelineTraceDto] })
-  @IsArray()
-  @ValidateNested({ each: true })
-  @Type(() => TimelineTraceDto)
-  traces!: TimelineTraceDto[];
-
   @ApiProperty({ type: [DbChangeDto] })
   @IsArray()
   @ValidateNested({ each: true })
@@ -531,8 +542,8 @@ export class FullResponseDto {
 export class FullQueryDto {
   @ApiProperty({
     required: false,
-    description: 'Comma-separated flags (rrweb,respdiffs)',
-    example: 'rrweb,respdiffs',
+    description: 'Comma-separated flags (rrweb,respdiffs,traces)',
+    example: 'rrweb,respdiffs,traces',
   })
   @IsOptional()
   @IsString()

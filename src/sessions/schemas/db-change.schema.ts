@@ -39,6 +39,14 @@ export class DbChange {
   @Prop({ type: SchemaTypes.Mixed }) error?: { message?: string; code?: any };
 
   @Prop() t: number;
+
+  @Prop({ type: SchemaTypes.Mixed })
+  spanContext?: {
+    traceId?: string | null;
+    spanId?: string | number | null;
+    parentSpanId?: string | number | null;
+    depth?: number | null;
+  };
 }
 
 export type DbChangeDocument = HydratedDocument<DbChange>;

@@ -32,6 +32,87 @@ export class ViewerService {
     private readonly tenant: TenantContext,
   ) {}
 
+  private normalizeSpanId(val: any): string | null {
+    if (val === null || typeof val === 'undefined') {
+      return null;
+    }
+    const str = String(val).trim();
+    return str ? str : null;
+  }
+
+  private attachDbChangeToTraceData(
+    payload: any,
+    dbChangeBySpanId: Map<string, any>,
+  ): any {
+    if (!payload) {
+      return payload;
+    }
+
+    if (Array.isArray(payload)) {
+      let changed = false;
+      const out = payload.map((event) => {
+        if (!event || typeof event !== 'object') {
+          return event;
+        }
+        const spanKey = this.normalizeSpanId((event as any).spanId);
+        if (!spanKey) {
+          return event;
+        }
+        const dbChange = dbChangeBySpanId.get(spanKey);
+        if (!dbChange) {
+          return event;
+        }
+        if (Object.prototype.hasOwnProperty.call(event, 'dbChange')) {
+          return event;
+        }
+        changed = true;
+        return { ...event, dbChange };
+      });
+      return changed ? out : payload;
+    }
+
+    if (typeof payload === 'string') {
+      const trimmed = payload.trim();
+      if (!trimmed) {
+        return payload;
+      }
+      try {
+        const parsed = JSON.parse(trimmed);
+        return this.attachDbChangeToTraceData(parsed, dbChangeBySpanId);
+      } catch {
+        return payload;
+      }
+    }
+
+    if (typeof payload === 'object') {
+      if (Object.prototype.hasOwnProperty.call(payload, 'events')) {
+        const events = (payload as any).events;
+        const enrichedEvents = this.attachDbChangeToTraceData(
+          events,
+          dbChangeBySpanId,
+        );
+        if (enrichedEvents === events) {
+          return payload;
+        }
+        return { ...payload, events: enrichedEvents };
+      }
+
+      if (Object.prototype.hasOwnProperty.call(payload, 'data')) {
+        const data = (payload as any).data;
+        const enrichedData = this.attachDbChangeToTraceData(
+          data,
+          dbChangeBySpanId,
+        );
+        if (enrichedData === data) {
+          return payload;
+        }
+        return { ...payload, data: enrichedData };
+      }
+    }
+
+    return payload;
+  }
+
   /** ---- tiny JSON diff helper (MVP) ---- */
   private isObjectLike(v: any) {
     return v !== null && typeof v === 'object';
@@ -211,17 +292,27 @@ export class ViewerService {
     ]);
 
     const changeByAction = new Map<string, any[]>();
+    const dbChangeBySpanId = new Map<string, any>();
     changesRaw.forEach((change) => {
       const hydrated = this.sanitizeDoc(hydrateChangeDoc(change));
       const key = change.actionId ?? '';
       const list = changeByAction.get(key) ?? [];
       list.push(hydrated);
       changeByAction.set(key, list);
+
+      const spanKey = this.normalizeSpanId(hydrated?.spanContext?.spanId);
+      if (spanKey && !dbChangeBySpanId.has(spanKey)) {
+        dbChangeBySpanId.set(spanKey, hydrated);
+      }
     });
 
     const traceByRequest = new Map<string, any[]>();
     tracesRaw.forEach((trace) => {
       const cleaned = this.sanitizeDoc(trace);
+      cleaned.data = this.attachDbChangeToTraceData(
+        cleaned.data,
+        dbChangeBySpanId,
+      );
       const rid = trace.requestRid ?? '';
       const list = traceByRequest.get(rid) ?? [];
       list.push(cleaned);
@@ -302,6 +393,7 @@ export class ViewerService {
       appId?: string;
       includeRrweb?: boolean;
       includeRespDiffs?: boolean;
+      includeTraces?: boolean;
     },
   ): Promise<FullResponseDto> {
     const appId = opts?.appId;
@@ -311,7 +403,7 @@ export class ViewerService {
       .lean();
     if (!s) throw new NotFoundException('Session not found');
 
-    const [acts, reqDocs, dbDocs, mailDocs] = await Promise.all([
+    const [acts, reqDocs, dbDocs, mailDocs, traceDocs] = await Promise.all([
       this.actions
         .find(this.tenantFilter({ sessionId }))
         .sort({ tStart: 1 })
@@ -322,10 +414,46 @@ export class ViewerService {
         .lean(),
       this.changes.find(this.tenantFilter({ sessionId })).sort({ t: 1 }).lean(),
       this.emails.find(this.tenantFilter({ sessionId })).sort({ t: 1 }).lean(), // <-- new
+      opts?.includeTraces
+        ? this.traces
+            .find(this.tenantFilter({ sessionId }))
+            .sort({ requestRid: 1, batchIndex: 1 })
+            .lean()
+        : Promise.resolve([]),
     ]);
     const reqs = reqDocs.map((doc) => hydrateRequestDoc(doc));
     const dbs = dbDocs.map((doc) => hydrateChangeDoc(doc));
     const mails = mailDocs.map((doc) => hydrateEmailDoc(doc));
+
+    if (opts?.includeTraces) {
+      const dbChangeBySpanId = new Map<string, any>();
+      for (const change of dbs) {
+        const spanKey = this.normalizeSpanId(change?.spanContext?.spanId);
+        if (!spanKey) continue;
+        if (!dbChangeBySpanId.has(spanKey)) {
+          dbChangeBySpanId.set(spanKey, change);
+        }
+      }
+
+      const tracesByRid: Record<string, any[]> = {};
+      for (const trace of traceDocs ?? []) {
+        const rid = trace?.requestRid;
+        if (!rid) continue;
+
+        const enriched = {
+          ...trace,
+          data: this.attachDbChangeToTraceData(trace.data, dbChangeBySpanId),
+        };
+        (tracesByRid[rid] ||= []).push(enriched);
+      }
+      Object.values(tracesByRid).forEach((list) =>
+        list.sort((a, b) => (a.batchIndex ?? 0) - (b.batchIndex ?? 0)),
+      );
+
+      for (const req of reqs) {
+        (req as any).traces = tracesByRid[req.rid] ?? [];
+      }
+    }
 
     const mailBy: Record<string, any[]> = {};
     for (const m of mails) (mailBy[m.actionId || ''] ||= []).push(m);
