@@ -51,6 +51,20 @@ class SecureLogger implements LoggerService {
   }
 
   error(message: any, trace?: string, context?: string) {
+    if (message instanceof Error) {
+      const details = formatErrorDetails(message);
+      const resolvedTrace = trace || details.trace;
+      writeEncryptedLog('error', {
+        context,
+        message: details.text,
+        trace: resolvedTrace,
+      });
+      console.error(
+        formatConsole('error', context, details.text),
+        resolvedTrace || '',
+      );
+      return;
+    }
     const text = stringify(message);
     writeEncryptedLog('error', { context, message: text, trace });
     console.error(formatConsole('error', context, text), trace || '');
@@ -81,10 +95,65 @@ class SecureLogger implements LoggerService {
 
 function stringify(value: any): string {
   if (typeof value === 'string') return value;
+  if (value instanceof Error) {
+    return formatErrorDetails(value).text;
+  }
   try {
-    return JSON.stringify(value);
+    return safeStringify(value);
   } catch {
     return String(value);
+  }
+}
+
+function safeStringify(value: any): string {
+  const seen = new WeakSet();
+  return JSON.stringify(value, (key, val) => {
+    if (val instanceof Error) {
+      return serializeError(val);
+    }
+    if (typeof val === 'bigint') {
+      return val.toString();
+    }
+    if (typeof val === 'object' && val !== null) {
+      if (seen.has(val)) return '[Circular]';
+      seen.add(val);
+    }
+    return val;
+  });
+}
+
+function formatErrorDetails(error: Error): { text: string; trace?: string } {
+  const name = error.name || 'Error';
+  const message = error.message ? `${name}: ${error.message}` : name;
+  const cause = formatCause((error as { cause?: unknown }).cause);
+  const text = cause ? `${message} | cause: ${cause}` : message;
+  const trace = typeof error.stack === 'string' ? error.stack : undefined;
+  return { text, trace };
+}
+
+function serializeError(error: Error): Record<string, string> {
+  const name = error.name || 'Error';
+  const message = error.message || '';
+  const stack = typeof error.stack === 'string' ? error.stack : undefined;
+  const cause = formatCause((error as { cause?: unknown }).cause);
+  const payload: Record<string, string> = { name, message };
+  if (stack) payload.stack = stack;
+  if (cause) payload.cause = cause;
+  return payload;
+}
+
+function formatCause(cause: unknown): string | undefined {
+  if (!cause) return undefined;
+  if (cause instanceof Error) {
+    const name = cause.name || 'Error';
+    const message = cause.message ? `: ${cause.message}` : '';
+    return `${name}${message}`;
+  }
+  if (typeof cause === 'string') return cause;
+  try {
+    return safeStringify(cause);
+  } catch {
+    return String(cause);
   }
 }
 

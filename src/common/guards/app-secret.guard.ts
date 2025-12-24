@@ -11,11 +11,9 @@ export class AppSecretGuard implements CanActivate {
     const req = ctx.switchToHttp().getRequest();
     const appId = req.headers['x-app-id'] as string;
     const secret = req.headers['x-app-secret'] as string;
-    const tenantId = extractHeader(req.headers['x-tenant-id']);
-    if (!appId || !secret || !tenantId) return false;
+    if (!appId || !secret) return false;
     const app = await this.appModel
       .findOne({
-        tenantId,
         appId,
         appSecretHash: hashSecret(secret),
         enabled: true,
@@ -23,7 +21,7 @@ export class AppSecretGuard implements CanActivate {
       .lean();
     if (!app) return false;
     req.appId = appId;
-    req.tenantId = tenantId;
+    req.tenantId = app.tenantId;
     return true;
   }
 }
