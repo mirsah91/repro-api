@@ -1,9 +1,4 @@
-import {
-  ApiBearerAuth,
-  ApiHeader,
-  ApiOkResponse,
-  ApiTags,
-} from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOkResponse, ApiTags } from '@nestjs/swagger';
 import {
   CreateAppDto,
   AppKeysDto,
@@ -39,11 +34,6 @@ export class AppsController {
 
   @ApiOkResponse({ type: AppDto, isArray: true })
   @ApiBearerAuth('appUser')
-  @ApiHeader({
-    name: 'X-Tenant-Id',
-    description: 'Tenant identifier for the workspace.',
-    required: true,
-  })
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @Get()
@@ -53,11 +43,6 @@ export class AppsController {
 
   @ApiOkResponse({ type: AppDetailDto })
   @ApiBearerAuth('appUser')
-  @ApiHeader({
-    name: 'X-Tenant-Id',
-    description: 'Tenant identifier for the workspace.',
-    required: true,
-  })
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @Get(':appId')
@@ -67,11 +52,6 @@ export class AppsController {
 
   @ApiOkResponse({ type: AppDetailDto })
   @ApiBearerAuth('appUser')
-  @ApiHeader({
-    name: 'X-Tenant-Id',
-    description: 'Tenant identifier for the workspace.',
-    required: true,
-  })
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @Patch(':appId')
@@ -81,11 +61,6 @@ export class AppsController {
 
   @ApiOkResponse({ schema: { example: { deleted: true } } })
   @ApiBearerAuth('appUser')
-  @ApiHeader({
-    name: 'X-Tenant-Id',
-    description: 'Tenant identifier for the workspace.',
-    required: true,
-  })
   @UseGuards(AppUserTokenGuard)
   @AppUserRoles(AppUserRole.Admin)
   @Delete(':appId')

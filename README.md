@@ -4,7 +4,7 @@ This service powers multi-tenant session capture and analytics for the Repro pla
 
 ## Key Capabilities
 
-- **Tenant isolation** – every document stored in MongoDB is tagged with a `tenantId`. Guards resolve the tenant from request headers and the `TenantContext` wiring ensures services never have to pass tenant identifiers by hand.
+- **Tenant isolation** – every document stored in MongoDB is tagged with a `tenantId`. Guards resolve the tenant from app credentials/tokens and the `TenantContext` wiring ensures services never have to pass tenant identifiers by hand.
 - **Encrypted secrets** – app secrets, SDK tokens, and app user tokens are persisted as HMAC digests plus AES-256-GCM ciphertext. Log files are written with the same cipher (
   see `common/security/secure-logger.ts`).
 - **TLS everywhere** – the Nest HTTP server can terminate TLS and the MongoDB driver negotiates TLS connections by default. Plain HTTP and non-TLS drivers are supported for local development but not recommended for production.
@@ -82,15 +82,14 @@ flowchart TD
 
 ## Request Headers
 
-All requests that interact with tenant data must include `X-Tenant-Id`. Other guards continue to enforce the existing headers (`Authorization`, `X-App-Id`, `X-App-Secret`, `X-App-User-Token`, etc.).
+Requests resolve the tenant from the app credentials (SDK token, app secret, or app user token). Other guards continue to enforce the existing headers (`Authorization`, `X-App-Id`, `X-App-Secret`, `X-App-User-Token`, etc.).
 
 ```
-X-Tenant-Id: TENANT_...
 Authorization: Bearer <sdk-token>
 X-App-User-Token: <workspace password>
 ```
 
-Admin operations now rely on the same workspace credential flow: supply the admin user's `X-App-User-Token` (the generated password) together with `X-Tenant-Id` to manage apps, rotate keys, and invite teammates.
+Admin operations now rely on the same workspace credential flow: supply the admin user's `X-App-User-Token` (the generated password) to manage apps, rotate keys, and invite teammates.
 
 ## Client Registration Flow
 
@@ -99,7 +98,7 @@ Admin operations now rely on the same workspace credential flow: supply the admi
    - `appSecret` (plain text, returned once)
    - `encryptionKey` (per-tenant data key managed by the API)
    - An initial admin user that reuses the password you supplied (or a generated one when omitted)
-2. The tenant id must be stored by the client and attached to every future Repro SDK call via the `X-Tenant-Id` header.
+2. Store the `appId` and use it for SDK bootstrap calls; the API derives the tenant from the app and issues SDK tokens for subsequent requests.
 
 ## Data Storage Changes
 
@@ -147,7 +146,7 @@ npm install
 npm run start:dev
 ```
 
-Ensure your SDKs (React, Nest, Node) attach the tenant header – refer to their READMEs for configuration details.
+Ensure your SDKs (React, Nest, Node) send the app id for bootstrap and the issued SDK token for subsequent requests.
 
 ## Repro AI Graph
 

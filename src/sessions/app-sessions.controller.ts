@@ -12,7 +12,6 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
-  ApiHeader,
   ApiOkResponse,
   ApiParam,
   ApiQuery,
@@ -30,11 +29,6 @@ import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from '../apps/schemas/app-user.schema';
 
 @ApiTags('app-sessions')
-@ApiHeader({
-  name: 'X-Tenant-Id',
-  description: 'Tenant identifier for the workspace.',
-  required: true,
-})
 @ApiBearerAuth('appUser')
 @UseGuards(AppUserTokenGuard)
 @AppUserRoles(AppUserRole.Admin)

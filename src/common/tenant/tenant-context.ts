@@ -20,7 +20,7 @@ export class TenantContext {
   get tenantId(): string {
     const existing = this.tryGetTenantId();
     if (!existing) {
-      throw new BadRequestException('Missing tenant id (x-tenant-id header)');
+      throw new BadRequestException('Missing tenant id');
     }
     return existing;
   }

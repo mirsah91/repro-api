@@ -1,6 +1,7 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { App, AppDocument } from '../../apps/schemas/app.schema';
 import { SdkToken, SdkTokenDocument } from '../../sdk/schemas/sdk-token.schema';
 import { hashSecret } from '../security/encryption.util';
 
@@ -8,24 +9,28 @@ import { hashSecret } from '../security/encryption.util';
 export class SdkTokenGuard implements CanActivate {
   constructor(
     @InjectModel(SdkToken.name) private tokenModel: Model<SdkTokenDocument>,
+    @InjectModel(App.name) private appModel: Model<AppDocument>,
   ) {}
   async canActivate(ctx: ExecutionContext) {
     const req = ctx.switchToHttp().getRequest();
     const headerToken = extractHeader(req.headers['x-sdk-token']);
     const bearerToken = extractBearer(req.headers['authorization']);
     const auth = headerToken ?? bearerToken;
-    const tenantId = extractHeader(req.headers['x-tenant-id']);
-    if (!auth || !tenantId) return false;
+    if (!auth) return false;
     const tok = await this.tokenModel
       .findOne({
-        tenantId,
         tokenHash: hashSecret(auth),
         exp: { $gt: new Date() },
       })
       .lean();
     if (!tok) return false;
+    const app = await this.appModel.findOne({ appId: tok.appId }).lean();
+    if (!app) return false;
+    if (tok.tenantId && app.tenantId !== tok.tenantId) {
+      return false;
+    }
     req.appId = tok.appId;
-    req.tenantId = tenantId;
+    req.tenantId = app.tenantId;
     return true;
   }
 }

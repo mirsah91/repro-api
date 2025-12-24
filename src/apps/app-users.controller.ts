@@ -11,7 +11,6 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
-  ApiHeader,
   ApiOkResponse,
   ApiParam,
   ApiTags,
@@ -28,11 +27,6 @@ import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from './schemas/app-user.schema';
 
 @ApiTags('app-users')
-@ApiHeader({
-  name: 'X-Tenant-Id',
-  description: 'Tenant identifier for the current workspace.',
-  required: true,
-})
 @Controller('v1/apps/:appId/users')
 export class AppUsersController {
   constructor(private readonly users: AppUsersService) {}

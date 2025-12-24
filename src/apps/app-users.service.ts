@@ -147,6 +147,7 @@ export class AppUsersService {
     email: string,
     password: string,
   ): Promise<AppUserDtoShape> {
+    await this.setTenantFromApp(appId);
     return this.validateCredentials(appId, email, password);
   }
 
@@ -156,6 +157,7 @@ export class AppUsersService {
     password: string,
   ): Promise<AppUserDtoShape> {
     try {
+      await this.setTenantFromApp(appId);
       const { user } = await this.loginByCredentials(email, password);
       if (user.appId !== appId) {
         throw new NotFoundException('Invalid credentials');
@@ -407,6 +409,14 @@ export class AppUsersService {
 
   private normalizeEmail(email: string) {
     return email.trim().toLowerCase();
+  }
+
+  private async setTenantFromApp(appId: string): Promise<void> {
+    const app = await this.apps.findOne({ appId }).lean<{ tenantId: string }>();
+    if (!app?.tenantId) {
+      throw new NotFoundException('Invalid credentials');
+    }
+    this.tenant.setTenantId(app.tenantId);
   }
 
   private async validateCredentials(

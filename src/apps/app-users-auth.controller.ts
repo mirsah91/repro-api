@@ -9,7 +9,6 @@ import {
 } from '@nestjs/common';
 import {
   ApiBearerAuth,
-  ApiHeader,
   ApiOkResponse,
   ApiTags,
 } from '@nestjs/swagger';
@@ -48,11 +47,6 @@ export class AppUsersAuthController {
   }
 
   @ApiOkResponse({ type: AppUserProfileResponseDto })
-  @ApiHeader({
-    name: 'X-Tenant-Id',
-    description: 'Tenant identifier for the workspace.',
-    required: true,
-  })
   @ApiBearerAuth('appUser')
   @UseGuards(AppUserTokenGuard)
   @Patch('me')

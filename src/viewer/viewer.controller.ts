@@ -1,6 +1,5 @@
 import {
   ApiBearerAuth,
-  ApiHeader,
   ApiOkResponse,
   ApiParam,
   ApiSecurity,
@@ -19,11 +18,6 @@ import { AppUserRoles } from '../common/decorators/app-user-roles.decorator';
 import { AppUserRole } from '../apps/schemas/app-user.schema';
 
 @ApiTags('viewer')
-@ApiHeader({
-  name: 'X-Tenant-Id',
-  description: 'Tenant identifier for the workspace.',
-  required: true,
-})
 @Controller('v1')
 export class ViewerController {
   constructor(private svc: ViewerService) {}
