@@ -29,6 +29,17 @@ export class SdkTokenGuard implements CanActivate {
     if (tok.tenantId && app.tenantId !== tok.tenantId) {
       return false;
     }
+    const appName = extractHeader(req.headers['x-app-name']);
+    if (appName && appName !== app.name) {
+      try {
+        await this.appModel.updateOne(
+          { _id: app._id },
+          { $set: { name: appName, updatedAt: new Date() } },
+        );
+      } catch {
+        // Ignore name update failures so auth isn't blocked.
+      }
+    }
     req.appId = tok.appId;
     req.tenantId = app.tenantId;
     return true;

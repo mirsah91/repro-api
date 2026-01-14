@@ -1,11 +1,12 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
+import { APP_MAX_COUNT } from '../app-user.constants';
 
 @Schema({ timestamps: true, collection: 'apps' })
 export class App {
   @Prop({ unique: true }) tenantId: string;
   @Prop({ unique: true }) appId: string;
-  @Prop() name: string;
+  @Prop() name: string; // todo - rename to project name
   @Prop() appSecretHash: string;
   @Prop() appSecretEnc: string;
   @Prop({ required: true }) encryptionKeyEnc: string;
@@ -13,6 +14,9 @@ export class App {
   @Prop() adminEmail?: string;
   @Prop({ default: true }) chatEnabled?: boolean;
   @Prop({ default: 0 }) chatUsageCount?: number;
+  @Prop({ type: Number, default: APP_MAX_COUNT })
+  maxUserCount?: number;
+  // todo - add multitenancy and then add app name from the header
 }
 export type AppDocument = HydratedDocument<App>;
 export const AppSchema = SchemaFactory.createForClass(App);

@@ -21,7 +21,7 @@ import {
   hashSecret,
 } from '../common/security/encryption.util';
 import { TenantContext } from '../common/tenant/tenant-context';
-import { computeChatQuota } from './app-user.constants';
+import { computeChatQuota, resolveAppUserMaxCount } from './app-user.constants';
 
 type StoredAppUser = {
   _id: AppUserDocument['_id'];
@@ -70,6 +70,7 @@ export interface AppSummaryShape {
   chatUsageCount: number;
   chatQuotaRemaining: number;
   chatQuotaLimit: number;
+  maxUserCount: number;
 }
 
 @Injectable()
@@ -102,6 +103,21 @@ export class AppUsersService {
     },
   ): Promise<AppUserDtoShape> {
     const email = this.normalizeEmail(dto.email);
+    const app = await this.apps
+      .findOne(this.withTenantFilter({ appId }))
+      .lean<{ maxUserCount?: number } | null>();
+    if (!app) {
+      throw new NotFoundException('App not found');
+    }
+    const maxUsers = resolveAppUserMaxCount(app.maxUserCount);
+    const existingCount = await this.users.countDocuments(
+      this.withTenantFilter({ appId }),
+    );
+    if (existingCount >= maxUsers) {
+      throw new ConflictException(
+        `User limit reached (max ${maxUsers} per organization).`,
+      );
+    }
     const password = randomUUID();
     const role = dto.role ?? AppUserRole.Viewer;
     const enabled = dto.enabled ?? true;
@@ -198,6 +214,7 @@ export class AppUsersService {
         createdAt?: Date;
         updatedAt?: Date;
         appSecretEnc?: string;
+        maxUserCount?: number;
       } | null>();
     const app = appDoc
       ? this.toAppDto(appDoc, user.role === AppUserRole.Admin)
@@ -239,6 +256,7 @@ export class AppUsersService {
         appSecretEnc?: string;
         chatEnabled?: boolean;
         chatUsageCount?: number;
+        maxUserCount?: number;
       } | null>();
 
     const app = appDoc
@@ -488,6 +506,7 @@ export class AppUsersService {
       appSecretEnc?: string;
       chatEnabled?: boolean;
       chatUsageCount?: number;
+      maxUserCount?: number;
     },
     includeSecret: boolean,
   ): AppSummaryShape {
@@ -508,6 +527,7 @@ export class AppUsersService {
       chatUsageCount: usage,
       chatQuotaRemaining: chat.remaining,
       chatQuotaLimit: chat.limit,
+      maxUserCount: resolveAppUserMaxCount(doc.maxUserCount),
     };
     if (includeSecret) {
       return {
@@ -529,6 +549,7 @@ export class AppUsersService {
       chatUsageCount: 0,
       chatQuotaRemaining: chat.remaining,
       chatQuotaLimit: chat.limit,
+      maxUserCount: resolveAppUserMaxCount(undefined),
     };
   }
 

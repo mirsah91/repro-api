@@ -16,15 +16,23 @@ import { AppUsersService } from './app-users.service';
 import {
   AppUserLoginDto,
   AppUserLoginResponseDto,
+  AppUserForgotPasswordRequestDto,
+  AppUserForgotPasswordResponseDto,
+  AppUserResetPasswordRequestDto,
+  AppUserResetPasswordResponseDto,
   AppUserProfileResponseDto,
   UpdateAppUserProfileDto,
 } from '../docs/dto/apps.dto';
 import { AppUserTokenGuard } from '../common/guards/app-user-token.guard';
+import { AppUserPasswordResetService } from './app-user-password-reset.service';
 
 @ApiTags('app-users')
 @Controller('v1/app-users')
 export class AppUsersAuthController {
-  constructor(private readonly users: AppUsersService) {}
+  constructor(
+    private readonly users: AppUsersService,
+    private readonly resets: AppUserPasswordResetService,
+  ) {}
 
   @ApiOkResponse({ type: AppUserLoginResponseDto })
   @Post('login')
@@ -61,5 +69,23 @@ export class AppUsersAuthController {
     }
     const updated = await this.users.updateProfile(appId, userId, body);
     return { user: updated };
+  }
+
+  @ApiOkResponse({ type: AppUserForgotPasswordResponseDto })
+  @Post('forgot-password')
+  async forgotPassword(
+    @Body() body: AppUserForgotPasswordRequestDto,
+  ): Promise<AppUserForgotPasswordResponseDto> {
+    await this.resets.requestReset(body.appId, body.email);
+    return { ok: true };
+  }
+
+  @ApiOkResponse({ type: AppUserResetPasswordResponseDto })
+  @Post('reset-password')
+  async resetPassword(
+    @Body() body: AppUserResetPasswordRequestDto,
+  ): Promise<AppUserResetPasswordResponseDto> {
+    await this.resets.resetPassword(body.appId, body.token, body.newPassword);
+    return { ok: true };
   }
 }

@@ -18,7 +18,7 @@ import {
   hashSecret,
 } from '../common/security/encryption.util';
 import { TenantContext } from '../common/tenant/tenant-context';
-import { computeChatQuota } from './app-user.constants';
+import { computeChatQuota, resolveAppUserMaxCount } from './app-user.constants';
 
 @Injectable()
 export class AppsService {
@@ -32,6 +32,7 @@ export class AppsService {
     name: string | undefined,
     adminEmail: string,
     adminPassword?: string,
+    maxUserCount?: number,
   ) {
     const tenantId = 'TENANT_' + randomUUID();
     const appId = 'APP_' + randomUUID();
@@ -40,6 +41,7 @@ export class AppsService {
     const normalizedName = typeof name === 'string' ? name.trim() : undefined;
     const dataEncryptionKey = randomBytes(32).toString('base64');
 
+    const normalizedMaxUserCount = resolveAppUserMaxCount(maxUserCount);
     const createdApp = await this.model.create({
       tenantId,
       appId,
@@ -51,6 +53,7 @@ export class AppsService {
       adminEmail: normalizedEmail,
       chatEnabled: true,
       chatUsageCount: 0,
+      maxUserCount: normalizedMaxUserCount,
     });
 
     const candidatePassword =
@@ -84,6 +87,7 @@ export class AppsService {
       name: createdApp.name,
       enabled: createdApp.enabled,
       adminEmail: normalizedEmail,
+      maxUserCount: resolveAppUserMaxCount(createdApp.maxUserCount),
       ...this.buildChatFields(createdApp.toObject()),
       admin: this.toUserDto(adminUser.toObject(), adminSecret),
       encryptionKey: dataEncryptionKey,
@@ -106,11 +110,17 @@ export class AppsService {
     return this.toAppDetailDto(app);
   }
 
-  async updateApp(appId: string, update: { name?: string; enabled?: boolean }) {
+  async updateApp(
+    appId: string,
+    update: { name?: string; enabled?: boolean; maxUserCount?: number },
+  ) {
     const app = await this.model.findOne(this.withTenantFilter({ appId }));
     if (!app) throw new NotFoundException('App not found');
     if (typeof update.name !== 'undefined') app.name = update.name;
     if (typeof update.enabled !== 'undefined') app.enabled = update.enabled;
+    if (typeof update.maxUserCount !== 'undefined') {
+      app.maxUserCount = resolveAppUserMaxCount(update.maxUserCount);
+    }
     await app.save();
     return this.toAppDetailDto(app.toObject());
   }
@@ -131,6 +141,7 @@ export class AppsService {
       adminEmail: doc.adminEmail,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
+      maxUserCount: resolveAppUserMaxCount(doc.maxUserCount),
       ...this.buildChatFields(doc),
     };
   }

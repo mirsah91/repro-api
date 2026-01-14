@@ -1,5 +1,12 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsString, ValidateNested } from 'class-validator';
+import {
+  IsEmail,
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
 import { Type } from 'class-transformer';
 import { AppUserRole } from '../../apps/schemas/app-user.schema';
 
@@ -17,6 +24,12 @@ export class CreateAppDto {
       'Optional. Supply to set an explicit initial admin password instead of receiving a generated one.',
   })
   adminPassword?: string;
+
+  @ApiPropertyOptional({
+    example: 4,
+    description: 'Maximum number of users allowed for the app.',
+  })
+  maxUserCount?: number;
 }
 
 export class InitWorkspaceDto {
@@ -40,6 +53,12 @@ export class UpdateAppDto {
 
   @ApiPropertyOptional({ example: true })
   enabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: 4,
+    description: 'Maximum number of users allowed for the app.',
+  })
+  maxUserCount?: number;
 }
 
 export class AppDto {
@@ -63,6 +82,9 @@ export class AppDto {
 
   @ApiPropertyOptional({ example: '2024-03-16T15:30:00.000Z' })
   updatedAt?: Date;
+
+  @ApiProperty({ example: 4 })
+  maxUserCount!: number;
 
   @ApiProperty({ example: false })
   chatEnabled!: boolean;
@@ -204,6 +226,45 @@ export class AppUserLoginResponseDto {
 
   @ApiProperty({ type: AppSummaryDto })
   app!: AppSummaryDto;
+}
+
+export class AppUserForgotPasswordRequestDto {
+  @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  @IsString()
+  @IsNotEmpty()
+  appId!: string;
+
+  @ApiProperty({ example: 'user@example.com' })
+  @IsEmail()
+  @IsNotEmpty()
+  email!: string;
+}
+
+export class AppUserForgotPasswordResponseDto {
+  @ApiProperty({ example: true })
+  ok!: boolean;
+}
+
+export class AppUserResetPasswordRequestDto {
+  @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  @IsString()
+  @IsNotEmpty()
+  appId!: string;
+
+  @ApiProperty({ example: 'reset-token-from-email' })
+  @IsString()
+  @IsNotEmpty()
+  token!: string;
+
+  @ApiProperty({ example: 'Str0ng-and-unique!' })
+  @IsString()
+  @IsNotEmpty()
+  newPassword!: string;
+}
+
+export class AppUserResetPasswordResponseDto {
+  @ApiProperty({ example: true })
+  ok!: boolean;
 }
 
 export class UpdateAppUserProfileDto {

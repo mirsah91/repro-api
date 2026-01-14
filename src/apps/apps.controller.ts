@@ -29,7 +29,12 @@ export class AppsController {
   @ApiOkResponse({ type: AppKeysDto })
   @Post()
   async create(@Body() body: CreateAppDto) {
-    return this.svc.createApp(body?.name, body.adminEmail, body.adminPassword);
+    return this.svc.createApp(
+      body?.name,
+      body.adminEmail,
+      body.adminPassword,
+      body.maxUserCount,
+    );
   }
 
   @ApiOkResponse({ type: AppDto, isArray: true })
