@@ -1,5 +1,6 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { HydratedDocument } from 'mongoose';
+import { APP_MAX_COUNT } from '../app-user.constants';
 
 @Schema({ timestamps: true, collection: 'apps' })
 export class App {
@@ -13,6 +14,8 @@ export class App {
   @Prop() adminEmail?: string;
   @Prop({ default: true }) chatEnabled?: boolean;
   @Prop({ default: 0 }) chatUsageCount?: number;
+  @Prop({ type: Number, default: APP_MAX_COUNT })
+  maxUserCount?: number;
 }
 export type AppDocument = HydratedDocument<App>;
 export const AppSchema = SchemaFactory.createForClass(App);

@@ -17,6 +17,12 @@ export class CreateAppDto {
       'Optional. Supply to set an explicit initial admin password instead of receiving a generated one.',
   })
   adminPassword?: string;
+
+  @ApiPropertyOptional({
+    example: 4,
+    description: 'Maximum number of users allowed for the app.',
+  })
+  maxUserCount?: number;
 }
 
 export class InitWorkspaceDto {
@@ -40,6 +46,12 @@ export class UpdateAppDto {
 
   @ApiPropertyOptional({ example: true })
   enabled?: boolean;
+
+  @ApiPropertyOptional({
+    example: 4,
+    description: 'Maximum number of users allowed for the app.',
+  })
+  maxUserCount?: number;
 }
 
 export class AppDto {
@@ -63,6 +75,9 @@ export class AppDto {
 
   @ApiPropertyOptional({ example: '2024-03-16T15:30:00.000Z' })
   updatedAt?: Date;
+
+  @ApiProperty({ example: 4 })
+  maxUserCount!: number;
 
   @ApiProperty({ example: false })
   chatEnabled!: boolean;
