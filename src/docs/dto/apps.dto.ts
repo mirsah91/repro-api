@@ -1,5 +1,12 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsString, ValidateNested } from 'class-validator';
+import {
+  IsEmail,
+  IsIn,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
 import { Type } from 'class-transformer';
 import { AppUserRole } from '../../apps/schemas/app-user.schema';
 
@@ -219,6 +226,45 @@ export class AppUserLoginResponseDto {
 
   @ApiProperty({ type: AppSummaryDto })
   app!: AppSummaryDto;
+}
+
+export class AppUserForgotPasswordRequestDto {
+  @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  @IsString()
+  @IsNotEmpty()
+  appId!: string;
+
+  @ApiProperty({ example: 'user@example.com' })
+  @IsEmail()
+  @IsNotEmpty()
+  email!: string;
+}
+
+export class AppUserForgotPasswordResponseDto {
+  @ApiProperty({ example: true })
+  ok!: boolean;
+}
+
+export class AppUserResetPasswordRequestDto {
+  @ApiProperty({ example: 'APP_3b3f8b2b-8c8e-4c7d-8a8a-83b6d2' })
+  @IsString()
+  @IsNotEmpty()
+  appId!: string;
+
+  @ApiProperty({ example: 'reset-token-from-email' })
+  @IsString()
+  @IsNotEmpty()
+  token!: string;
+
+  @ApiProperty({ example: 'Str0ng-and-unique!' })
+  @IsString()
+  @IsNotEmpty()
+  newPassword!: string;
+}
+
+export class AppUserResetPasswordResponseDto {
+  @ApiProperty({ example: true })
+  ok!: boolean;
 }
 
 export class UpdateAppUserProfileDto {
